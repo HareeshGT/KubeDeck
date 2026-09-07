@@ -12,5 +12,11 @@ paramiko>=3.0
 SpeechRecognition>=3.10,<4
 PyAudio>=0.2.13
 
+# ── Ops Mind spoken status narration (k8s_ai_ops.py) ──
+# Offline, on-device text-to-speech — NOT a cloud/AI voice API. pyobjc is
+# only needed on macOS, where pyttsx3 speaks through NSSpeechSynthesizer.
+pyttsx3>=2.90
+pyobjc; sys_platform == "darwin"
+
 # ── Optional: only needed to build the macOS .app bundle ──
 pyinstaller>=6.0

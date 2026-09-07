@@ -16,6 +16,7 @@ Scale operations support two modes:
 """
 
 import json
+import queue
 import re
 import threading
 import time
@@ -56,6 +57,19 @@ try:
 except ImportError:
     sr = None
     _VOICE_AVAILABLE = False
+
+# Offline, on-device text-to-speech through pyttsx3, used to speak Ops
+# Mind's step-by-step status narration ("Processing…", "Scaling up
+# deployment my-app.", "Scale up completed.") aloud as each step happens.
+# Deliberately NOT a cloud/AI voice API — every phrase spoken is a fixed,
+# locally-generated status string (the same ones already written to the
+# output log), never AI-generated speech.
+try:
+    import pyttsx3
+    _TTS_AVAILABLE = True
+except ImportError:
+    pyttsx3 = None
+    _TTS_AVAILABLE = False
 
 GOOGLE_STT_LANGUAGE = "en-IN"
 VOICE_MAX_SECONDS = 90
@@ -146,6 +160,33 @@ def is_protected_namespace(namespace: str) -> bool:
     if not ns:
         return False
     return any(pattern in ns for pattern in get_protected_namespaces())
+
+
+# ---------------------------------------------------------------------------
+# Spoken status narration (on/off)
+# ---------------------------------------------------------------------------
+
+VOICE_FEEDBACK_SETTINGS_KEY = "k8s_ops_voice_feedback"
+
+
+def get_voice_feedback_enabled() -> bool:
+    """Whether Ops Mind should speak its step-by-step status updates aloud.
+    Defaults to enabled (when pyttsx3 is installed); persisted the same
+    way as the other Ops Mind settings above."""
+    try:
+        stored = load_settings().get(VOICE_FEEDBACK_SETTINGS_KEY)
+        if stored is None:
+            return True
+        return bool(stored)
+    except Exception:
+        return True
+
+
+def save_voice_feedback_enabled(enabled: bool):
+    try:
+        save_settings(**{VOICE_FEEDBACK_SETTINGS_KEY: bool(enabled)})
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -927,6 +968,62 @@ class K8sGoogleSpeechWorker(QThread):
             self.error.emit(f"Voice input failed: {exc}")
 
 
+class _NarrationThread(QThread):
+    """Speaks queued Ops Mind status phrases aloud, one at a time, off the
+    UI thread.
+
+    Owns a single pyttsx3 engine for its whole lifetime — repeatedly
+    calling pyttsx3.init() from different threads is unreliable, especially
+    on macOS — and drains an internal queue with engine.say()/
+    runAndWait() so that two phrases queued in quick succession (e.g.
+    "Command build completed." immediately followed by "Scaling up
+    deployment my-app.") are spoken in full, one after another, instead of
+    cutting each other off. One instance is created lazily per
+    K8sAIOpsWidget the first time it has something to say, and lives for
+    as long as that widget does; stop() lets it drain and exit cleanly.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._queue = queue.Queue()
+
+    def speak(self, text: str):
+        if text:
+            self._queue.put(text)
+
+    def stop(self):
+        """Ask the loop to exit after anything already queued. Called from
+        the widget's closeEvent, and when the user mutes narration."""
+        self._queue.put(None)
+
+    def run(self):
+        try:
+            engine = pyttsx3.init()
+        except Exception:
+            return
+        try:
+            engine.setProperty("rate", 175)
+        except Exception:
+            pass
+
+        while True:
+            text = self._queue.get()
+            if text is None:
+                break
+            try:
+                engine.say(text)
+                engine.runAndWait()
+            except Exception:
+                # A single unsupported/bad phrase shouldn't silence
+                # narration for the rest of the session.
+                continue
+
+        try:
+            engine.stop()
+        except Exception:
+            pass
+
+
 def validate_action(data: dict):
     if not isinstance(data, dict):
         raise ValueError("The AI returned an invalid operation object.")
@@ -1100,6 +1197,67 @@ def operation_description(action: dict) -> str:
     return f"{operation} {resource}/{name}"
 
 
+def _spoken_scale_direction(action: dict):
+    """"up"/"down" for a scale that started life as a relative request
+    ("scale up by 2"), else None. Read from the "_scale_direction" stashed
+    by _execute_action, since by the time an operation finishes, relative
+    scales have already been resolved to an absolute replica count and the
+    original delta/mode are gone (see _on_previous_replicas_result)."""
+    direction = action.get("_scale_direction")
+    if direction:
+        return direction
+    if action.get("mode") == "relative":
+        return "up" if action.get("delta", 0) >= 0 else "down"
+    return None
+
+
+def _spoken_start_phrase(action: dict) -> str:
+    """Short phrase spoken right before kubectl actually runs."""
+    operation = action["action"]
+    resource = action["resource"]
+    name = action["name"]
+
+    if operation == "scale":
+        direction = _spoken_scale_direction(action)
+        if direction:
+            return f"Scaling {direction} {resource} {name}."
+        return f"Scaling {resource} {name} to {action.get('replicas')} replicas."
+    if operation == "restart":
+        return f"Restarting {resource} {name}."
+    if operation == "delete":
+        return f"Deleting {resource} {name}."
+    if operation == "get":
+        return f"Getting {resource} {name}."
+    if operation == "describe":
+        return f"Describing {resource} {name}."
+    if operation == "rollout_status":
+        return f"Checking rollout status of {resource} {name}."
+    return f"Running {operation} on {resource} {name}."
+
+
+def _spoken_done_phrase(action: dict, success: bool) -> str:
+    """Short phrase spoken once kubectl finishes, matching the verb used
+    in _spoken_start_phrase (e.g. "Scaling up…" → "Scale up completed.")."""
+    operation = action["action"] if action else None
+
+    if operation == "scale":
+        direction = _spoken_scale_direction(action)
+        verb = f"Scale {direction}" if direction else "Scale"
+    elif operation == "restart":
+        verb = "Restart"
+    elif operation == "delete":
+        verb = "Delete"
+    elif operation == "get":
+        verb = "Get"
+    elif operation == "describe":
+        verb = "Describe"
+    elif operation == "rollout_status":
+        verb = "Rollout status check"
+    else:
+        verb = "Operation"
+    return f"{verb} completed." if success else f"{verb} failed."
+
+
 class K8sAIOpsWidget(QWidget):
     """Natural-language Kubernetes operations panel with persistent history."""
 
@@ -1124,6 +1282,8 @@ class K8sAIOpsWidget(QWidget):
         self._pending_scale_action = None
         self._voice_worker = None
         self._voice_recording = False
+        self._narrator = None
+        self._voice_feedback_enabled = _TTS_AVAILABLE and get_voice_feedback_enabled()
         self._busy = False
         self._history = _load_history()
         self._ai_access_allowed = False
@@ -1249,6 +1409,21 @@ class K8sAIOpsWidget(QWidget):
 
         btn_row.addWidget(self.mic_level_label)
         btn_row.addWidget(self.mic_level_bar)
+
+        self.speaker_btn = QPushButton(
+            "🔊  Speak" if self._voice_feedback_enabled else "🔇  Speak"
+        )
+        self.speaker_btn.setFixedHeight(34)
+        self.speaker_btn.setCheckable(True)
+        self.speaker_btn.setChecked(self._voice_feedback_enabled)
+        self.speaker_btn.setEnabled(_TTS_AVAILABLE)
+        self.speaker_btn.setToolTip(
+            "Speak Ops Mind's step-by-step status aloud as it works"
+            if _TTS_AVAILABLE else
+            "Voice narration needs the pyttsx3 package (pip install pyttsx3)"
+        )
+        self.speaker_btn.toggled.connect(self._toggle_voice_feedback)
+        btn_row.addWidget(self.speaker_btn)
 
         self.voice_shortcut = QShortcut(
             QKeySequence("Ctrl+Shift+Space"),
@@ -1472,6 +1647,26 @@ class K8sAIOpsWidget(QWidget):
             self.run_btn.setText("✨  Run with AI")
             self.status_lbl.setText("Ready")
 
+    def _toggle_voice_feedback(self, checked: bool):
+        self._voice_feedback_enabled = checked and _TTS_AVAILABLE
+        self.speaker_btn.setText("🔊  Speak" if self._voice_feedback_enabled else "🔇  Speak")
+        save_voice_feedback_enabled(self._voice_feedback_enabled)
+        if not self._voice_feedback_enabled and self._narrator is not None:
+            # Drop anything still queued so muting mid-operation doesn't
+            # leave stale narration to play later if it's re-enabled.
+            self._narrator.stop()
+            self._narrator = None
+
+    def _speak(self, text: str):
+        """Queue `text` to be spoken aloud, if narration is available and
+        currently enabled. Safe to call from any point in the flow — a
+        disabled/unavailable narrator just drops the phrase."""
+        if not self._voice_feedback_enabled or not _TTS_AVAILABLE:
+            return
+        if self._narrator is None:
+            self._narrator = _NarrationThread(self)
+            self._narrator.start()
+        self._narrator.speak(text)
 
     # ------------------------------------------------------------------
     # Voice input
@@ -1777,6 +1972,7 @@ class K8sAIOpsWidget(QWidget):
         )
 
         self._set_busy(True)
+        self._speak("Processing your request.")
 
         worker = K8sAIInterpretWorker(
             provider,
@@ -1800,15 +1996,18 @@ class K8sAIOpsWidget(QWidget):
             action = validate_action(raw_action)
         except Exception as exc:
             self._write_error(f"AI interpretation failed: {exc}")
+            self._speak("Sorry, I couldn't understand that request.")
             return
 
         if action["kind"] == "clarification":
             self._write_info("\nAI needs more information:\n" + action["reason"])
+            self._speak("I need more information to do that.")
             self.request_input.setFocus()
             return
 
         if action["kind"] == "unsupported":
             self._write_error("\n" + action["reason"])
+            self._speak("That operation isn't supported.")
             return
 
         self._execute_action(action)
@@ -1822,6 +2021,7 @@ class K8sAIOpsWidget(QWidget):
         self._write_error(
             f"\nAI error:\n{message}"
         )
+        self._speak("The AI request failed.")
 
         # Pick a useful title based on the error.
         lower = message.lower()
@@ -1881,6 +2081,12 @@ class K8sAIOpsWidget(QWidget):
         )
 
         if is_relative_scale:
+            # Stashed now, before the delta/mode get resolved away to an
+            # absolute replica count, so completion narration can still say
+            # "Scale up completed." / "Scale down completed." later.
+            action["_scale_direction"] = (
+                "up" if action.get("delta", 0) >= 0 else "down"
+            )
             # The exact target replica count is not known yet — it depends on
             # the current replica count, which is read from the cluster next.
             self.output.append(
@@ -1903,6 +2109,7 @@ class K8sAIOpsWidget(QWidget):
                 f'<span style="color:{T["TEXT_DIM"]}">'
                 f'Command: {self._escape_html(command)}</span>'
             )
+            self._speak("Command build completed.")
 
         namespace = action.get("namespace", "")
         protected = is_protected_namespace(namespace)
@@ -1954,6 +2161,7 @@ class K8sAIOpsWidget(QWidget):
             )
             if answer != QMessageBox.Yes:
                 self._write_info("\nOperation cancelled.")
+                self._speak("Operation cancelled.")
                 self._set_busy(False)
                 return
 
@@ -2004,6 +2212,7 @@ class K8sAIOpsWidget(QWidget):
                 "operation was not executed.\n"
                 + ((err or output or "Unknown error").strip())
             )
+            self._speak("Operation failed.")
             self._set_busy(False)
             return
 
@@ -2023,6 +2232,7 @@ class K8sAIOpsWidget(QWidget):
                     "\n✗ Could not determine the current replica count, so "
                     "the relative scale request could not be resolved."
                 )
+                self._speak("Operation failed.")
                 self._set_busy(False)
                 return
 
@@ -2049,6 +2259,7 @@ class K8sAIOpsWidget(QWidget):
             f'<span style="color:{T["TEXT_DIM"]}">'
             f'Command: {self._escape_html(command)}</span>'
         )
+        self._speak("Command build completed.")
 
         self._start_kubectl_operation(action, command)
 
@@ -2062,10 +2273,12 @@ class K8sAIOpsWidget(QWidget):
             "\n✗ Could not read the current replica count, so the scale "
             "operation was not executed.\n" + str(error)
         )
+        self._speak("Operation failed.")
         self._set_busy(False)
 
     def _start_kubectl_operation(self, action: dict, command: str):
         self.status_lbl.setText("Executing kubectl…")
+        self._speak(_spoken_start_phrase(action))
 
         worker = CommandWorker(self.ssh, command + " 2>&1")
         worker._k8s_action = action
@@ -2106,15 +2319,18 @@ class K8sAIOpsWidget(QWidget):
             self._write_error(
                 f"\n✗ Kubernetes operation failed (exit code {exit_code}):\n{combined}"
             )
+            self._speak(_spoken_done_phrase(action, success=False))
             return
 
         self._remember_operation(action, command, "success", output)
         self._write_success("\n✓ Kubernetes operation completed successfully.")
+        self._speak(_spoken_done_phrase(action, success=True))
         self.operation_finished.emit()
 
     def _on_operation_error(self, error: str):
         self._write_error("\n✗ Kubernetes operation failed:\n" + str(error))
 
+        action = None
         if self._operation_worker is not None:
             action = getattr(self._operation_worker, "_k8s_action", None)
             command = getattr(self._operation_worker, "_k8s_command", "")
@@ -2123,6 +2339,7 @@ class K8sAIOpsWidget(QWidget):
                 _append_audit(action, command, "failed", str(error),
                               getattr(self._operation_worker, "_k8s_confirmed", False),
                               _risk_level(action, action.get("context", ""), is_protected_namespace(action.get("namespace", ""))))
+        self._speak(_spoken_done_phrase(action, success=False) if action else "Operation failed.")
 
     def _on_operation_finished(self):
         self._operation_worker = None
@@ -2198,6 +2415,12 @@ class K8sAIOpsWidget(QWidget):
         if self._voice_worker is not None:
             try:
                 self._voice_worker.stop()
+            except Exception:
+                pass
+
+        if self._narrator is not None:
+            try:
+                self._narrator.stop()
             except Exception:
                 pass
 
