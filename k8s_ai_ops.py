@@ -38,6 +38,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QShortcut,
     QProgressBar,
+    QComboBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QKeySequence
@@ -185,6 +186,53 @@ def get_voice_feedback_enabled() -> bool:
 def save_voice_feedback_enabled(enabled: bool):
     try:
         save_settings(**{VOICE_FEEDBACK_SETTINGS_KEY: bool(enabled)})
+    except Exception:
+        pass
+
+
+VOICE_ID_SETTINGS_KEY = "k8s_ops_voice_id"
+
+
+def list_voices() -> list:
+    """The system's installed TTS voices, as [{"id": str, "name": str}, …].
+
+    Spins up a throwaway pyttsx3 engine purely to read its `voices`
+    property and immediately disposes of it — this engine is never used
+    to speak. Returns [] if pyttsx3 isn't installed or enumeration fails
+    for any reason (e.g. no speech synthesis available on this machine),
+    so callers can always fall back to "System Default" cleanly.
+    """
+    if not _TTS_AVAILABLE:
+        return []
+    try:
+        engine = pyttsx3.init()
+        try:
+            voices = engine.getProperty("voices") or []
+            return [
+                {"id": v.id, "name": (getattr(v, "name", "") or v.id)}
+                for v in voices
+            ]
+        finally:
+            try:
+                engine.stop()
+            except Exception:
+                pass
+    except Exception:
+        return []
+
+
+def get_voice_id() -> str:
+    """The persisted TTS voice id, or "" for the system default voice."""
+    try:
+        stored = load_settings().get(VOICE_ID_SETTINGS_KEY)
+        return str(stored).strip() if stored else ""
+    except Exception:
+        return ""
+
+
+def save_voice_id(voice_id: str):
+    try:
+        save_settings(**{VOICE_ID_SETTINGS_KEY: (voice_id or "").strip()})
     except Exception:
         pass
 
@@ -981,11 +1029,17 @@ class _NarrationThread(QThread):
     cutting each other off. One instance is created lazily per
     K8sAIOpsWidget the first time it has something to say, and lives for
     as long as that widget does; stop() lets it drain and exit cleanly.
+
+    `voice_id` is fixed for the life of the thread (pyttsx3 voices are set
+    once on the engine, not per-utterance) — the widget picks up a changed
+    voice selection by stopping the current thread and letting the next
+    _speak() call spin up a fresh one with the newly-selected voice.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, voice_id: str = "", parent=None):
         super().__init__(parent)
         self._queue = queue.Queue()
+        self._voice_id = voice_id
 
     def speak(self, text: str):
         if text:
@@ -993,7 +1047,8 @@ class _NarrationThread(QThread):
 
     def stop(self):
         """Ask the loop to exit after anything already queued. Called from
-        the widget's closeEvent, and when the user mutes narration."""
+        the widget's closeEvent, and when the user mutes narration or
+        changes the selected voice."""
         self._queue.put(None)
 
     def run(self):
@@ -1005,6 +1060,14 @@ class _NarrationThread(QThread):
             engine.setProperty("rate", 175)
         except Exception:
             pass
+        if self._voice_id:
+            try:
+                engine.setProperty("voice", self._voice_id)
+            except Exception:
+                # An unrecognized/stale voice id (e.g. settings carried
+                # over from a different machine) just falls back to
+                # whatever voice pyttsx3 already defaulted to above.
+                pass
 
         while True:
             text = self._queue.get()
@@ -1284,6 +1347,7 @@ class K8sAIOpsWidget(QWidget):
         self._voice_recording = False
         self._narrator = None
         self._voice_feedback_enabled = _TTS_AVAILABLE and get_voice_feedback_enabled()
+        self._voice_id = get_voice_id() if _TTS_AVAILABLE else ""
         self._busy = False
         self._history = _load_history()
         self._ai_access_allowed = False
@@ -1424,6 +1488,28 @@ class K8sAIOpsWidget(QWidget):
         )
         self.speaker_btn.toggled.connect(self._toggle_voice_feedback)
         btn_row.addWidget(self.speaker_btn)
+
+        self.voice_combo = QComboBox()
+        self.voice_combo.setFixedWidth(170)
+        self.voice_combo.setFixedHeight(34)
+        self.voice_combo.setEnabled(_TTS_AVAILABLE)
+        self.voice_combo.setToolTip(
+            "Which system voice reads Ops Mind's status narration aloud"
+            if _TTS_AVAILABLE else
+            "Voice narration needs the pyttsx3 package (pip install pyttsx3)"
+        )
+        self._populate_voice_combo()
+        self.voice_combo.currentIndexChanged.connect(self._on_voice_combo_changed)
+        btn_row.addWidget(self.voice_combo)
+
+        self.voice_test_btn = QPushButton("🔈")
+        self.voice_test_btn.setFixedSize(34, 34)
+        self.voice_test_btn.setEnabled(_TTS_AVAILABLE)
+        self.voice_test_btn.setToolTip("Preview the selected voice")
+        self.voice_test_btn.clicked.connect(
+            lambda: self._speak("This is how I'll sound when Ops Mind narrates status updates.")
+        )
+        btn_row.addWidget(self.voice_test_btn)
 
         self.voice_shortcut = QShortcut(
             QKeySequence("Ctrl+Shift+Space"),
@@ -1657,6 +1743,34 @@ class K8sAIOpsWidget(QWidget):
             self._narrator.stop()
             self._narrator = None
 
+    def _populate_voice_combo(self):
+        """Fill the voice picker from the system's installed TTS voices,
+        selecting whichever one is currently persisted. Falls back to
+        "System Default" if nothing is persisted, or if a persisted voice
+        id no longer matches an installed voice (e.g. settings carried
+        over from a different machine)."""
+        self.voice_combo.blockSignals(True)
+        self.voice_combo.clear()
+        self.voice_combo.addItem("System Default", "")
+        for voice in list_voices():
+            self.voice_combo.addItem(voice["name"], voice["id"])
+        idx = self.voice_combo.findData(self._voice_id)
+        self.voice_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.voice_combo.blockSignals(False)
+
+    def _on_voice_combo_changed(self, index: int):
+        voice_id = self.voice_combo.itemData(index) or ""
+        if voice_id == self._voice_id:
+            return
+        self._voice_id = voice_id
+        save_voice_id(voice_id)
+        if self._narrator is not None:
+            # pyttsx3 sets its voice once at engine start-up, not per
+            # utterance — retire the current narrator so the next _speak()
+            # call spins up a fresh one bound to the newly-picked voice.
+            self._narrator.stop()
+            self._narrator = None
+
     def _speak(self, text: str):
         """Queue `text` to be spoken aloud, if narration is available and
         currently enabled. Safe to call from any point in the flow — a
@@ -1664,7 +1778,7 @@ class K8sAIOpsWidget(QWidget):
         if not self._voice_feedback_enabled or not _TTS_AVAILABLE:
             return
         if self._narrator is None:
-            self._narrator = _NarrationThread(self)
+            self._narrator = _NarrationThread(voice_id=self._voice_id, parent=self)
             self._narrator.start()
         self._narrator.speak(text)
 
