@@ -500,6 +500,21 @@ def save_ai_settings(provider: str, api_keys: dict, models: dict):
 
 
 # ─── Prompt construction ───────────────────────────────────────
+# Shared formatting rules appended to every prompt so the response renders
+# with real structure in the QTextBrowser (see AIExplainDialog in dialogs.py)
+# instead of coming back as one wall of run-on text. Markdown headings,
+# lists, and fenced code blocks are the constructs that dialog actually
+# styles distinctly — plain "1. **bold**" numbering renders as flat text.
+_FORMAT_INSTRUCTIONS = (
+    "Format the reply in Markdown so it renders with visual structure:\n"
+    "- Use `###` headings for section titles (not numbered/bold text).\n"
+    "- Use `-` bullet lists for multiple related points, not run-on sentences.\n"
+    "- Put any command, log line, or file path in a fenced code block "
+    "(``` ```) or inline `code`, never as plain prose.\n"
+    "- Keep paragraphs short — a couple of sentences at most."
+)
+
+
 def _build_prompt(pod: str, namespace: str, container: str, log_text: str) -> str:
     log_text = (log_text or "").strip()
     if len(log_text) > MAX_CONTEXT_CHARS:
@@ -515,13 +530,16 @@ def _build_prompt(pod: str, namespace: str, container: str, log_text: str) -> st
         f"You are helping a DevOps engineer diagnose a Kubernetes issue for "
         f"{where}. Below is the raw log output.\n\n"
         f"Log output:\n```\n{log_text}\n```\n\n"
-        f"Reply concisely in three short sections:\n"
-        f"1. **Likely cause** — one or two sentences.\n"
-        f"\n"
-        f"2. **Evidence** — the specific line(s) that point to it.\n"
-        f"\n"
-        f"3. **Suggested fix** — concrete next step(s), including a "
-        f"kubectl command to investigate further if useful.\n\n"
+        f"{_FORMAT_INSTRUCTIONS}\n\n"
+        f"Use exactly these three section headings, in this order:\n"
+        f"### Likely cause\n"
+        f"One or two sentences.\n\n"
+        f"### Evidence\n"
+        f"The specific line(s) that point to it, as a short quoted/code block "
+        f"or bullet list.\n\n"
+        f"### Suggested fix\n"
+        f"Concrete next step(s) as a bullet list. Put any kubectl command to "
+        f"investigate further in its own fenced code block.\n\n"
         f"If the log doesn't show an obvious problem, say so plainly "
         f"instead of guessing."
     )
@@ -555,13 +573,16 @@ def _build_command_prompt(command: str, exit_code, stderr_text: str, stdout_text
         f"Command:\n```\n{command}\n```\n\n"
         f"Exit code: {exit_str}\n\n"
         f"Output:\n```\n{output}\n```\n\n"
-        f"Reply concisely in three short sections:\n"
-        f"1. **Likely cause** — one or two sentences.\n"
-        f"\n"
-        f"2. **Evidence** — the specific line(s) that point to it.\n"
-        f"\n"
-        f"3. **Suggested fix** — concrete next step(s), including a "
-        f"corrected command if the issue is with the command itself.\n\n"
+        f"{_FORMAT_INSTRUCTIONS}\n\n"
+        f"Use exactly these three section headings, in this order:\n"
+        f"### Likely cause\n"
+        f"One or two sentences.\n\n"
+        f"### Evidence\n"
+        f"The specific line(s) that point to it, as a short quoted/code block "
+        f"or bullet list.\n\n"
+        f"### Suggested fix\n"
+        f"Concrete next step(s) as a bullet list. Put a corrected command, if "
+        f"the issue is with the command itself, in its own fenced code block.\n\n"
         f"If the output doesn't show an obvious problem, say so plainly "
         f"instead of guessing."
     )
@@ -683,8 +704,8 @@ class AIConversationWorker(QThread):
             "pretend that you ran commands or inspected the cluster. If the "
             "user asks to check something live, clearly say what command or "
             "check should be performed rather than claiming it was performed. "
-            "Do not invent facts. Keep the answer concise but useful. Markdown "
-            "is allowed.\n\n"
+            "Do not invent facts. Keep the answer concise but useful.\n\n"
+            f"{_FORMAT_INSTRUCTIONS}\n\n"
             "Original evidence/context:\n"
             f"{evidence or '(no raw evidence supplied)'}\n\n"
             "Conversation:\n"

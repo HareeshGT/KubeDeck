@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
     QScrollArea, QStackedWidget, QCompleter,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QUrl
-from PyQt5.QtGui import QFont, QColor, QTextCursor, QTextCharFormat, QKeySequence, QIntValidator
+from PyQt5.QtGui import QFont, QColor, QTextCursor, QTextCharFormat, QTextBlockFormat, QKeySequence, QIntValidator
 
 from themes import T, apply_qss_to
 from utils import load_recent_instances, size_fmt, append_terminal_html, append_terminal_text, html_escape, monospace_font
@@ -515,15 +515,21 @@ class AIExplainDialog(QDialog):
 
         self.body = QTextBrowser()
         self.body.setOpenExternalLinks(True)
+        # font-family/font-size are set explicitly here (not left to the
+        # app-wide QSS) because build_qss() in themes.py has a blanket
+        # `QTextEdit { font-family: 'Cascadia Code'...; font-size: 12px; }`
+        # rule — QTextBrowser is a QTextEdit subclass, so it inherits that
+        # monospace terminal font unless overridden per-widget like this.
+        # A widget's own setStyleSheet() takes priority over the app-level
+        # one for the properties it sets, so this is enough to opt out.
+        ui_font = "'Segoe UI', 'SF Pro Display', 'Inter', Arial, sans-serif"
         self.body.setStyleSheet(
             f"background: {T['BG_ITEM']}; color: {T['TEXT_PRIMARY']}; "
-            f"border: 1px solid {T['BORDER']}; border-radius: 8px; padding: 12px;"
-        )
-        self.body.document().setDefaultStyleSheet(
-            "h1, h2, h3 { margin-top: 14px; margin-bottom: 6px; }"
-            "p, ul, ol { margin-top: 4px; margin-bottom: 4px; }"
+            f"border: 1px solid {T['BORDER']}; border-radius: 8px; padding: 12px; "
+            f"font-family: {ui_font}; font-size: 13px;"
         )
         layout.addWidget(self.body, 1)
+
 
         quick_row = QHBoxLayout()
         quick_row.setSpacing(6)
@@ -620,6 +626,7 @@ class AIExplainDialog(QDialog):
         if self._typed_position >= len(self._response_text):
             self._typing_timer.stop()
             self.body.setMarkdown(self._response_text)
+            self._restyle_headings()
             self._diagnosis = self._response_text
             self._conversation = [{"role": "assistant", "content": self._response_text}]
             self._enable_followups()
@@ -630,6 +637,51 @@ class AIExplainDialog(QDialog):
         self._typed_position = next_position
         scrollbar = self.body.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def _restyle_headings(self):
+        """QTextDocument.setMarkdown() builds heading blocks directly via
+        QTextBlockFormat.setHeadingLevel() rather than emitting real HTML
+        <h1>-<h6> tags — so document().setDefaultStyleSheet()'s h1/h2/h3
+        rules (which only apply to content set via setHtml()) never touch
+        them. Headings still come out *slightly* bigger and bold from Qt's
+        own built-in heading scale, but not enough to read as a section
+        break next to 13px body text. This walks the document after every
+        setMarkdown() call and applies size/weight/color/spacing directly
+        via QTextCursor, which is the only reliable way to style them.
+        """
+        doc = self.body.document()
+        # Hardcoded rather than read from self.body.font(): the widget's
+        # font-size is set via QSS as a *pixel* size (font-size: 13px),
+        # which Qt stores as pixelSize — font().pointSizeF() on a
+        # pixel-sized font returns -1, not the value it looks like, so
+        # deriving base_pt from the widget silently produced ~2pt headings.
+        base_pt = 13.0
+        heading_sizes = {1: base_pt + 7, 2: base_pt + 5, 3: base_pt + 3}
+        accent = QColor(T["ACCENT"])
+
+        block = doc.begin()
+        while block.isValid():
+            level = block.blockFormat().headingLevel()
+            if level:
+                next_block = block.next()  # grab before this block's format changes
+
+                char_cursor = QTextCursor(block)
+                char_cursor.select(QTextCursor.BlockUnderCursor)
+                char_fmt = QTextCharFormat()
+                char_fmt.setFontPointSize(heading_sizes.get(level, base_pt + 2))
+                char_fmt.setFontWeight(QFont.Bold)
+                char_fmt.setForeground(accent)
+                char_cursor.setCharFormat(char_fmt)
+
+                block_cursor = QTextCursor(block)
+                block_fmt = QTextBlockFormat()
+                block_fmt.setTopMargin(18)
+                block_fmt.setBottomMargin(8)
+                block_cursor.setBlockFormat(block_fmt)
+
+                block = next_block
+                continue
+            block = block.next()
 
     def _enable_followups(self):
         self._followup_enabled = True
@@ -706,6 +758,7 @@ class AIExplainDialog(QDialog):
             else:
                 parts.append(f"### 🤖 AI\n\n{content}")
         self.body.setMarkdown("\n\n---\n\n".join(parts))
+        self._restyle_headings()
         self.body.verticalScrollBar().setValue(self.body.verticalScrollBar().maximum())
 
     def append_followup(self, question: str, answer: str):
