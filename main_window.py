@@ -3,6 +3,7 @@
 import os
 import re
 import stat
+import codecs
 from typing import Optional
 
 import paramiko
@@ -25,7 +26,7 @@ import themes as _themes
 from themes import T, THEMES, apply_theme_vars, build_qss, apply_qss_to, save_settings
 from utils import classify, icon_for, size_fmt, add_recent_instance, monospace_font
 from sudo_fs import SudoFS
-from workers import CommandWorker, ConnectWorker, ConnectionHealthWorker, track_worker
+from workers import CommandWorker, ConnectWorker, ConnectionHealthWorker, FileStreamReadWorker, track_worker
 from dialogs import ConnectDialog, FileTransferDialog, FileEditorDialog, FileExecDialog, SearchDialog, ConnectingDialog, MediaPlayerDialog, AIExplainDialog
 import ai_assist
 from sidebar import Sidebar
@@ -676,6 +677,7 @@ class EC2FileManager(QMainWindow):
         self.ssh           = None
         self.sftp          = None
         self._health_worker = None
+        self._preview_worker = None  # FileStreamReadWorker backing _fetch_preview
         self.current_path  = "/"
         self.history       = []
         self.future        = []
@@ -1759,6 +1761,26 @@ class EC2FileManager(QMainWindow):
                 )
                 self.status.showMessage("Downloaded {}".format(name))
 
+    def _cancel_preview_worker(self):
+        """Stop any in-flight preview read before starting a second read of
+        the same (or a different) remote file.
+
+        _fetch_preview runs on a background FileStreamReadWorker (see its
+        docstring), so a single click's preview fetch can still be running
+        when Edit/Play/Run is triggered a moment later — whether via
+        double-click (_open_file), the toolbar buttons (_edit_selected /
+        _run_selected), or a context-menu action. All of those funnel
+        through _edit_file/_play_media/_exec_file, so the guard lives there
+        rather than only in _open_file — a previous version of this guard
+        only covered the double-click path and missed the toolbar-button
+        route entirely. Two FileStreamReadWorkers hitting the sudo-cat
+        raw-channel path concurrently on the same SSH transport can desync
+        the packet stream ("Garbage packet received").
+        """
+        if self._preview_worker is not None:
+            self._preview_worker.cancel()
+            self._preview_worker = None
+
     # ── Edit helpers ──────────────────────────────────────────
     def _selected_meta(self):
         item = self.file_list.currentItem()
@@ -1769,6 +1791,7 @@ class EC2FileManager(QMainWindow):
     def _edit_file(self, meta):
         if not self.sftp:
             return
+        self._cancel_preview_worker()
         remote = self._current_remote(meta)
         FileEditorDialog.open_remote(
             self, self.sftp, self.ssh, remote,
@@ -1789,6 +1812,7 @@ class EC2FileManager(QMainWindow):
     def _play_media(self, meta):
         if not self.sftp:
             return
+        self._cancel_preview_worker()
         remote = self._current_remote(meta)
         MediaPlayerDialog.open_remote(
             self, self.sftp, self.ssh, remote, meta["kind"], sudo_user=self._sudo_user
@@ -1798,6 +1822,7 @@ class EC2FileManager(QMainWindow):
     def _exec_file(self, meta):
         if not self.ssh:
             return
+        self._cancel_preview_worker()
         remote = self._current_remote(meta)
         dlg = FileExecDialog(self, self.ssh, remote, sudo_user=self._sudo_user)
         dlg.exec_()
@@ -1821,28 +1846,84 @@ class EC2FileManager(QMainWindow):
 
     # ── Fetch / preview ───────────────────────────────────────
     def _fetch_preview(self, name, show_dialog=False):
+        """Loads (up to) the first 32KB of a remote file for the preview
+        pane or the 'View' dialog. Runs via FileStreamReadWorker on a
+        background QThread rather than the old direct
+        `self.sftp.open(remote, "r"); f.read(32768)` — that blocked the UI
+        thread on every click, and worse, under an active sudo user
+        SudoFS.open() pulls the *entire* remote file into memory via `cat`
+        before the 32KB read() cap ever applied, which is what turned
+        clicking a large file into a hang/crash rather than a bounded
+        preview. See FileStreamReadWorker's docstring in workers.py for
+        the full history — FileEditorDialog was already moved onto it;
+        this was the one remaining caller still using the old pattern.
+        """
         remote = self.current_path.rstrip("/") + "/" + name
-        try:
-            with self.sftp.open(remote, "r") as f:
-                content = f.read(32768).decode(errors="replace")
-            self.preview.show_text(content)
-            if show_dialog:
-                dlg = QDialog(self)
-                dlg.setWindowTitle("View: {}".format(name))
-                dlg.resize(760, 560)
-                apply_qss_to(dlg)
-                lay = QVBoxLayout(dlg)
-                te  = QTextEdit()
-                te.setReadOnly(True)
-                te.setPlainText(content)
-                te.setFont(monospace_font(11))
-                lay.addWidget(te)
-                bb = QDialogButtonBox(QDialogButtonBox.Close)
-                bb.rejected.connect(dlg.reject)
-                lay.addWidget(bb)
-                dlg.exec_()
-        except Exception:
-            self.preview.show_text("(binary or unreadable file)")
+
+        # Cancel any preview still loading so rapidly clicking through
+        # several files doesn't leave stale background workers racing to
+        # overwrite the (by-then-different) preview target.
+        self._cancel_preview_worker()
+
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        state = {"text": ""}
+
+        dlg = te = None
+        if show_dialog:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("View: {}".format(name))
+            dlg.resize(760, 560)
+            apply_qss_to(dlg)
+            lay = QVBoxLayout(dlg)
+            te = QTextEdit()
+            te.setReadOnly(True)
+            te.setFont(monospace_font(11))
+            te.setPlainText("Loading…")
+            lay.addWidget(te)
+            bb = QDialogButtonBox(QDialogButtonBox.Close)
+            bb.rejected.connect(dlg.reject)
+            lay.addWidget(bb)
+        else:
+            self.preview.show_text("Loading…")
+
+        def _on_chunk(chunk: bytes):
+            text = decoder.decode(chunk)
+            if not text:
+                return
+            state["text"] += text
+            if te is not None:
+                te.setPlainText(state["text"])
+            else:
+                self.preview.show_text(state["text"])
+
+        def _on_finished(_total_bytes):
+            decoder.decode(b"", final=True)
+            self._preview_worker = None
+
+        def _on_error(_err):
+            message = "(binary or unreadable file)"
+            if te is not None:
+                te.setPlainText(message)
+            else:
+                self.preview.show_text(message)
+            self._preview_worker = None
+
+        worker = FileStreamReadWorker(
+            self.sftp, self.ssh, remote,
+            sudo_user=self._sudo_user, max_bytes=32768,
+        )
+        worker.chunk_ready.connect(_on_chunk)
+        worker.finished_ok.connect(_on_finished)
+        worker.finished_err.connect(_on_error)
+        self._preview_worker = worker
+        worker.start()
+
+        if dlg is not None:
+            # Modal, but Qt's own event loop underneath exec_() keeps
+            # processing the worker's queued signals, so chunks still
+            # stream into `te` live while the dialog is open.
+            dlg.finished.connect(lambda _: worker.cancel())
+            dlg.exec_()
 
     def _current_remote(self, meta):
         return self.current_path.rstrip("/") + "/" + meta["name"]
