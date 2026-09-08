@@ -39,7 +39,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import (
     Qt, QTimer, pyqtSignal, QVariantAnimation, QEasingCurve, QEvent,
 )
-from PyQt5.QtGui import QColor, QPainter, QPen
+from PyQt5.QtGui import QColor, QPainter, QPen, QPainterPath
 
 from themes import T
 from workers import CommandWorker, track_worker
@@ -248,6 +248,142 @@ class HistoryChart(QWidget):
         p.setPen(QColor(_dashboard_text("muted")))
         p.drawText(left, self.height() - 6, self.points[0][0])
         p.drawText(max(left, self.width() - 55), self.height() - 6, self.points[-1][0])
+
+
+class Sparkline(QWidget):
+    """Tiny live-updating line chart for a ring's last ~60 seconds of
+    samples, at the dashboard's own 6s poll cadence (see REFRESH_MS) —
+    distinct from HistoryChart above, which plots the separate 1-sample-
+    per-minute, 500-sample-deep history log.
+
+    Each push() eases the whole line from its previous shape into the new
+    one over a short animation rather than hard-jumping, so a fresh
+    sample reads as a live update instead of a redraw. Points age one
+    slot to the left every push (a scrolling window), not by fixed pixel
+    position, so the animation always represents "the line just shifted
+    and gained a new point on the right."
+    """
+
+    MAX_POINTS = 10  # 6s cadence * 10 = last 60 seconds
+
+    def __init__(self, color: str = None, parent=None):
+        super().__init__(parent)
+        self._color = color or "#7aa2f7"
+        self._values = []       # committed rolling sample window
+        self._prev_shape = []   # normalized [0,1] y-fractions animating FROM
+        self._next_shape = []   # normalized [0,1] y-fractions animating TO
+        self._t = 1.0            # animation progress; 1.0 = settled on _next_shape
+        self.setFixedHeight(30)
+        self.setMinimumWidth(60)
+
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(280)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim.valueChanged.connect(self._on_step)
+
+    def set_color(self, color: str):
+        if color and color != self._color:
+            self._color = color
+            self.update()
+
+    def clear(self):
+        self._anim.stop()
+        self._values = []
+        self._prev_shape = []
+        self._next_shape = []
+        self._t = 1.0
+        self.update()
+
+    def push(self, value):
+        """Add one sample (e.g. this tick's cpu_pct/mem_pct) and animate
+        into the new shape. Skip calling this on a tick where the value is
+        unavailable — that freezes the sparkline on its last known shape
+        rather than plotting a misleading 0."""
+        if value is None:
+            return
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return
+
+        prev_norm = self._next_shape or self._normalized(self._values)
+        self._values.append(value)
+        self._values = self._values[-self.MAX_POINTS:]
+        next_norm = self._normalized(self._values)
+
+        # Both shapes must line up 1:1 by index for the frame-by-frame
+        # interpolation below. Pad the shorter one on the LEFT with None
+        # (skip-interpolate, just show the new value immediately at that
+        # slot) so alignment is always by "distance from the most recent
+        # sample," matching how a scrolling window actually reads.
+        n = len(next_norm)
+        if len(prev_norm) < n:
+            prev_norm = [None] * (n - len(prev_norm)) + list(prev_norm)
+        elif len(prev_norm) > n:
+            prev_norm = prev_norm[-n:]
+
+        self._prev_shape = prev_norm
+        self._next_shape = next_norm
+
+        self._anim.stop()
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.start()
+
+    @staticmethod
+    def _normalized(values):
+        if not values:
+            return []
+        lo, hi = min(values), max(values)
+        if hi == lo:
+            # A flat-line window (e.g. steady 0%) would otherwise divide by
+            # zero; draw it as a flat line at mid-height instead.
+            lo, hi = lo - 1.0, hi + 1.0
+        return [(v - lo) / (hi - lo) for v in values]
+
+    def _on_step(self, t):
+        self._t = t
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if len(self._next_shape) < 2:
+            return
+
+        w, h = self.width(), self.height()
+        pad_x, pad_y = 3, 4
+        n = len(self._next_shape)
+        color = QColor(self._color)
+
+        pts = []
+        for i in range(n):
+            nxt = self._next_shape[i]
+            prv = self._prev_shape[i] if i < len(self._prev_shape) else None
+            frac = nxt if prv is None else prv + (nxt - prv) * self._t
+            x = pad_x + (w - 2 * pad_x) * (i / (n - 1))
+            y = pad_y + (h - 2 * pad_y) * (1 - frac)
+            pts.append((x, y))
+
+        fill = QColor(color)
+        fill.setAlpha(40)
+        path = QPainterPath()
+        path.moveTo(pts[0][0], pts[0][1])
+        for x, y in pts[1:]:
+            path.lineTo(x, y)
+        path.lineTo(pts[-1][0], h - pad_y)
+        path.lineTo(pts[0][0], h - pad_y)
+        path.closeSubpath()
+        p.fillPath(path, fill)
+
+        p.setPen(QPen(color, 1.6))
+        for i in range(len(pts) - 1):
+            p.drawLine(int(pts[i][0]), int(pts[i][1]), int(pts[i + 1][0]), int(pts[i + 1][1]))
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(color)
+        lx, ly = pts[-1]
+        p.drawEllipse(int(lx) - 2, int(ly) - 2, 4, 4)
 
 
 def _split_sections(out: str) -> dict:
@@ -590,6 +726,7 @@ class NodeCard(QFrame):
         outer.addStretch(1)
 
         self.cpu_ring = self.mem_ring = None
+        self.cpu_spark = self.mem_spark = None
         self._ring_caps = []
 
         if is_bucket:
@@ -619,7 +756,12 @@ class NodeCard(QFrame):
             rings_row.setSpacing(32)
             self.cpu_ring = CircularProgress(size=112, thickness=11, show_text=True, font_size=18)
             self.mem_ring = CircularProgress(size=112, thickness=11, show_text=True, font_size=18)
-            for cap_text, ring in (("CPU", self.cpu_ring), ("Memory", self.mem_ring)):
+            self.cpu_spark = Sparkline()
+            self.mem_spark = Sparkline()
+            for cap_text, ring, spark in (
+                ("CPU", self.cpu_ring, self.cpu_spark),
+                ("Memory", self.mem_ring, self.mem_spark),
+            ):
                 col = QVBoxLayout()
                 col.setSpacing(6)
                 r_row = QHBoxLayout()
@@ -627,6 +769,12 @@ class NodeCard(QFrame):
                 r_row.addWidget(ring)
                 r_row.addStretch(1)
                 col.addLayout(r_row)
+                spark.setFixedWidth(96)
+                spark_row = QHBoxLayout()
+                spark_row.addStretch(1)
+                spark_row.addWidget(spark)
+                spark_row.addStretch(1)
+                col.addLayout(spark_row)
                 cap = QLabel(cap_text)
                 cap.setAlignment(Qt.AlignHCenter)
                 col.addWidget(cap)
@@ -732,6 +880,10 @@ class NodeCard(QFrame):
             self.cpu_ring.refresh_theme()
         if self.mem_ring is not None:
             self.mem_ring.refresh_theme()
+        if self.cpu_spark is not None:
+            self.cpu_spark.update()
+        if self.mem_spark is not None:
+            self.mem_spark.update()
 
     # ── Data ───────────────────────────────────────────────────
     def update_data(self, status: str, roles: str, cpu_pct, mem_pct,
@@ -773,12 +925,16 @@ class NodeCard(QFrame):
 
         if cpu_pct is not None:
             self.cpu_ring.setValue(cpu_pct, _pct_color(cpu_pct))
+            self.cpu_spark.set_color(_pct_color(cpu_pct))
+            self.cpu_spark.push(cpu_pct)
             self._cpu_detail = (cpu_tip or f"CPU usage: {cpu_pct:.1f}%").replace("\n", "  ")
         else:
             self.cpu_ring.setValue(0)
             self._cpu_detail = "CPU usage unavailable"
         if mem_pct is not None:
             self.mem_ring.setValue(mem_pct, _pct_color(mem_pct))
+            self.mem_spark.set_color(_pct_color(mem_pct))
+            self.mem_spark.push(mem_pct)
             self._mem_detail = (mem_tip or f"Memory usage: {mem_pct:.1f}%").replace("\n", "  ")
         else:
             self.mem_ring.setValue(0)
@@ -965,6 +1121,9 @@ class DashboardTab(QWidget):
         self.cpu_ring["ring"].refresh_theme()
         self.mem_ring["ring"].refresh_theme()
         self.storage_ring["ring"].refresh_theme()
+        self.cpu_ring["spark"].update()
+        self.mem_ring["spark"].update()
+        self.storage_ring["spark"].update()
         for card in self._node_cards.values():
             card.refresh_theme()
         for win in self._node_windows.values():
@@ -1258,12 +1417,20 @@ class DashboardTab(QWidget):
         ring_row.addStretch(1)
         col.addLayout(ring_row)
 
+        spark = Sparkline()
+        spark.setFixedWidth(120)
+        spark_row = QHBoxLayout()
+        spark_row.addStretch(1)
+        spark_row.addWidget(spark)
+        spark_row.addStretch(1)
+        col.addLayout(spark_row)
+
         val_lbl = QLabel("—")
         val_lbl.setAlignment(Qt.AlignHCenter)
         val_lbl.setStyleSheet(f"color: {_dashboard_text("dim")}; font-size: 12px;")
         col.addWidget(val_lbl)
 
-        return {"layout": col, "ring": ring, "val_lbl": val_lbl}
+        return {"layout": col, "ring": ring, "spark": spark, "val_lbl": val_lbl}
 
     def _style_tree(self, tree):
         tree.setFont(monospace_font(12))
@@ -1495,6 +1662,8 @@ class DashboardTab(QWidget):
                         pass
         if cpu_pct is not None:
             self._style_ring(self.cpu_ring["ring"], cpu_pct)
+            self.cpu_ring["spark"].set_color(_pct_color(cpu_pct))
+            self.cpu_ring["spark"].push(cpu_pct)
             self.cpu_ring["val_lbl"].setText(f"{cpu_pct:.0f}% busy")
             self.cpu_ring["ring"].setToolTip(
                 f"CPU usage: {cpu_pct:.1f}% busy\n"
@@ -1521,6 +1690,8 @@ class DashboardTab(QWidget):
                 used_mb = total_mb - free_mb
                 mem_pct = (used_mb / total_mb * 100.0) if total_mb else 0.0
                 self._style_ring(self.mem_ring["ring"], mem_pct)
+                self.mem_ring["spark"].set_color(_pct_color(mem_pct))
+                self.mem_ring["spark"].push(mem_pct)
                 self.mem_ring["val_lbl"].setText(
                     f"{used_mb/1024:.1f} / {total_mb/1024:.1f} GB"
                 )
@@ -1577,6 +1748,8 @@ class DashboardTab(QWidget):
         if total_bytes > 0:
             storage_pct = min(100.0, used_bytes / total_bytes * 100.0)
             self._style_ring(self.storage_ring["ring"], storage_pct)
+            self.storage_ring["spark"].set_color(_pct_color(storage_pct))
+            self.storage_ring["spark"].push(storage_pct)
             self.storage_ring["val_lbl"].setText(
                 f"{size_fmt(used_bytes)} / {size_fmt(total_bytes)}"
             )
