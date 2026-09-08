@@ -206,10 +206,42 @@ class HistoryChart(QWidget):
         self.title = title
         self.points = []
         self.setMinimumHeight(150)
+        # Hover state: index into self.points nearest the cursor, or None
+        # when the mouse isn't over the plot area. Painted as a marker dot
+        # + a small self-drawn label (not QToolTip — see the node-card
+        # detail strip elsewhere in this file: QToolTip is theme-blind and
+        # gets clipped at the widget edge, same reasoning applies here).
+        self._hover_i = None
+        self._plot_geom = None  # (left, top, w, h, lo, hi) from the last paint
+        self.setMouseTracking(True)
 
     def set_points(self, points):
         self.points = [(str(t), float(v)) for t, v in points if v is not None]
+        if self._hover_i is not None and self._hover_i >= len(self.points):
+            self._hover_i = None
         self.update()
+
+    def leaveEvent(self, event):
+        self._hover_i = None
+        self.update()
+        super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._plot_geom and len(self.points) > 1:
+            left, top, w, h, lo, hi = self._plot_geom
+            n = max(1, len(self.points) - 1)
+            # Invert the same left + w*i/n mapping paintEvent uses, then
+            # clamp + round to the nearest plotted sample.
+            rel = (event.x() - left) / w
+            i = round(rel * n)
+            i = max(0, min(n, i))
+            if i != self._hover_i:
+                self._hover_i = i
+                self.update()
+        elif self._hover_i is not None:
+            self._hover_i = None
+            self.update()
+        super().mouseMoveEvent(event)
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -218,6 +250,7 @@ class HistoryChart(QWidget):
         p.setPen(QColor(_dashboard_text("muted")))
         p.drawText(10, 20, self.title)
         if not self.points:
+            self._plot_geom = None
             p.drawText(10, 45, "Collecting data…")
             return
         left, top, right, bottom = 38, 30, 10, 24
@@ -228,6 +261,7 @@ class HistoryChart(QWidget):
         if hi == lo:
             pad = max(1, abs(hi) * .05)
             lo, hi = lo - pad, hi + pad
+        self._plot_geom = (left, top, w, h, lo, hi)
         p.setPen(QPen(QColor(T["BORDER"]), 1))
         for i in range(5):
             y = top + int(h * i / 4)
@@ -239,15 +273,51 @@ class HistoryChart(QWidget):
         p.setPen(pen)
         n = max(1, len(self.points) - 1)
         prev = None
+        hover_xy = None
         for i, (_, value) in enumerate(self.points):
             x = left + int(w * i / n)
             y = top + int((hi - value) / (hi - lo) * h)
             if prev:
                 p.drawLine(prev[0], prev[1], x, y)
             prev = (x, y)
+            if i == self._hover_i:
+                hover_xy = (x, y)
         p.setPen(QColor(_dashboard_text("muted")))
         p.drawText(left, self.height() - 6, self.points[0][0])
         p.drawText(max(left, self.width() - 55), self.height() - 6, self.points[-1][0])
+
+        if hover_xy is not None:
+            hx, hy = hover_xy
+            h_time, h_val = self.points[self._hover_i]
+
+            # Vertical guide line under the cursor's sample.
+            p.setPen(QPen(QColor(_dashboard_text("muted")), 1, Qt.DashLine))
+            p.drawLine(hx, top, hx, top + h)
+
+            # Marker dot on the line itself.
+            p.setPen(QPen(QColor(T["ACCENT"]), 2))
+            p.setBrush(QColor(T["BG_ITEM"]))
+            p.drawEllipse(hx - 4, hy - 4, 8, 8)
+
+            # Self-painted label (theme-aware, never clipped by the OS
+            # tooltip system) showing time + value, flipped to the left
+            # of the cursor once it would otherwise run off the right edge.
+            label = f"{h_time}   {h_val:.1f}"
+            fm = p.fontMetrics()
+            box_w = fm.horizontalAdvance(label) + 12
+            box_h = fm.height() + 8
+            bx = hx + 8
+            if bx + box_w > self.width():
+                bx = hx - 8 - box_w
+            by = max(2, hy - box_h - 8)
+
+            path = QPainterPath()
+            path.addRoundedRect(bx, by, box_w, box_h, 4, 4)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(T["BG_HOVER"]))
+            p.drawPath(path)
+            p.setPen(QColor(_dashboard_text("primary")))
+            p.drawText(bx + 6, by + box_h - 6, label)
 
 
 class Sparkline(QWidget):
@@ -1059,8 +1129,13 @@ class DashboardTab(QWidget):
         self._card_grid_pos = {}
 
         # Phase 7 history: one lightweight JSON file, sampled once per minute.
+        # Keyed per-connection (see set_ssh) so switching instances doesn't
+        # blend one machine's history into another's — the file on disk is
+        # {instance_key: [samples...]}, and self._history is always just
+        # the slice for whichever instance is currently connected.
         self._history_file = os.path.join(os.path.expanduser("~"), ".ec2_manager_dashboard_history.json")
-        self._history = self._load_history()
+        self._history_key = None
+        self._history = []
         self._last_history_time = 0
         self._history_cpu_limit = 85
         self._history_mem_limit = 85
@@ -1086,6 +1161,10 @@ class DashboardTab(QWidget):
 
     def set_ssh(self, ssh):
         self.ssh = ssh
+        self._history_key = self._derive_history_key(ssh)
+        self._history = self._load_history()
+        self._last_history_time = 0
+        self._render_history()
         if ssh:
             self._show_connected_placeholder()
             if self._active:
@@ -1097,6 +1176,19 @@ class DashboardTab(QWidget):
             self._show_disconnected()
             for win in list(self._node_windows.values()):
                 win.close()  # triggers closeEvent -> _on_node_window_closed -> dict pop
+
+    @staticmethod
+    def _derive_history_key(ssh):
+        """Identify 'which instance' for history separation as ip:port off
+        the live SSH transport, so dev/test/prod never share one history
+        line just because they were connected to in the same session."""
+        if ssh is None:
+            return None
+        try:
+            peer = ssh.get_transport().getpeername()
+            return f"{peer[0]}:{peer[1]}"
+        except Exception:
+            return None
 
     def set_active(self, active: bool):
         """Called by main_window whenever this tab becomes the visible
@@ -2157,19 +2249,41 @@ class DashboardTab(QWidget):
         self._node_windows.pop(node_name, None)
 
     # ── Phase 7: historical monitoring ─────────────────────────
-    def _load_history(self):
+    def _load_all_history(self):
+        """Read the whole on-disk store: {instance_key: [samples...]}.
+        Tolerates the old pre-keying format (a bare list) by folding it
+        into a "_legacy" bucket instead of discarding it outright."""
         try:
             with open(self._history_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data[-500:] if isinstance(data, list) else []
         except (OSError, ValueError, TypeError):
+            return {}
+        if isinstance(data, list):
+            return {"_legacy": data[-500:]} if data else {}
+        if isinstance(data, dict):
+            return data
+        return {}
+
+    def _load_history(self):
+        """Load just the current instance's slice of history."""
+        if not self._history_key:
             return []
+        all_history = self._load_all_history()
+        data = all_history.get(self._history_key, [])
+        return data[-500:] if isinstance(data, list) else []
 
     def _save_history(self):
+        if not self._history_key:
+            return
         try:
+            # Read-modify-write against the full store so saving this
+            # instance's history never clobbers any other instance's data
+            # that another connection/session already wrote to the file.
+            all_history = self._load_all_history()
+            all_history[self._history_key] = self._history[-500:]
             tmp = self._history_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._history[-500:], f, separators=(",", ":"))
+                json.dump(all_history, f, separators=(",", ":"))
             os.replace(tmp, self._history_file)
         except OSError:
             pass
