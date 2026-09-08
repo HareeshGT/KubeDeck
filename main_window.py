@@ -718,7 +718,7 @@ class EC2FileManager(QMainWindow):
         self._current_tab_idx    = -1
         self._tab_slide_ready    = False
 
-        self.setWindowTitle("Deckhand")
+        self.setWindowTitle("KubeDeck")
         self.resize(1260, 740)
         apply_qss_to(self)
         self._build_ui()
@@ -1644,7 +1644,7 @@ class EC2FileManager(QMainWindow):
             self.progress.hide()
 
         self.addr_bar.setText(self.current_path)
-        self.setWindowTitle("Deckhand — {}".format(self.current_path))
+        self.setWindowTitle("KubeDeck — {}".format(self.current_path))
         n = len(self._items)
         self.status.showMessage("{} item{} in {}".format(
             n, "s" if n != 1 else "", self.current_path))

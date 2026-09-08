@@ -1,4 +1,4 @@
-"""main.py — Application entry point for Deckhand.
+"""main.py — Application entry point for KubeDeck.
 
 Imports:
     themes      — theme palette definitions, QSS builder, apply helpers
@@ -47,7 +47,7 @@ def _build_palette() -> QPalette:
 def main() -> int:
     # ── Qt application ────────────────────────────────────────
     app = QApplication(sys.argv)
-    app.setApplicationName("Deckhand")
+    app.setApplicationName("KubeDeck")
     app.setOrganizationName("EC2Manager")
 
     # On macOS, Qt's native 'macos' style renders combo-box and menu popups

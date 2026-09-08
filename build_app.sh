@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="https://github.com/HareeshGT/VM-Visualizer.git"
+REPO="https://github.com/HareeshGT/KubeDeck.git"
 DIR="VM-Visualizer"
 
 OS="$(uname -s)"
@@ -369,12 +369,12 @@ echo
 echo "Cleaning previous PyInstaller build..."
 
 rm -rf build
-rm -rf "dist/Deckhand.app"
-rm -rf "dist/Deckhand"
+rm -rf "dist/KubeDeck.app"
+rm -rf "dist/KubeDeck"
 
 # Remove stale spec so the generated build always reflects
 # the current project state.
-rm -f "Deckhand.spec"
+rm -f "KubeDeck.spec"
 
 # --------------------------------------------------
 # Build
@@ -390,7 +390,7 @@ CMD=(
     --windowed
     --onedir
     --name
-    "Deckhand"
+    "KubeDeck"
     --osx-bundle-identifier
     "com.hareeshgt.ec2manager"
 
@@ -428,7 +428,7 @@ fi
 
 if [[ "$OS" == "Darwin" ]]; then
 
-    APP_PATH="dist/Deckhand.app"
+    APP_PATH="dist/KubeDeck.app"
     APP_PLIST="$APP_PATH/Contents/Info.plist"
 
     # Finder-launched apps need an explicit microphone usage description.
@@ -447,7 +447,7 @@ if [[ "$OS" == "Darwin" ]]; then
 
     /usr/libexec/PlistBuddy         -c "Delete :NSMicrophoneUsageDescription"         "$APP_PLIST" 2>/dev/null || true
 
-    /usr/libexec/PlistBuddy         -c "Add :NSMicrophoneUsageDescription string 'Deckhand uses the microphone for Kubernetes voice commands.'"         "$APP_PLIST"
+    /usr/libexec/PlistBuddy         -c "Add :NSMicrophoneUsageDescription string 'KubeDeck uses the microphone for Kubernetes voice commands.'"         "$APP_PLIST"
 
     # Give the application a stable bundle identifier.
     /usr/libexec/PlistBuddy         -c "Delete :CFBundleIdentifier"         "$APP_PLIST" 2>/dev/null || true
@@ -510,7 +510,7 @@ Darwin)
     echo
     echo "Installing on macOS..."
 
-    APP_PATH="dist/Deckhand.app"
+    APP_PATH="dist/KubeDeck.app"
 
     if [ ! -d "$APP_PATH" ]; then
         echo
@@ -519,12 +519,12 @@ Darwin)
         exit 1
     fi
 
-    sudo rm -rf "/Applications/Deckhand.app"
+    sudo rm -rf "/Applications/KubeDeck.app"
     sudo cp -R "$APP_PATH" "/Applications/"
 
     echo
     echo "Installed:"
-    echo "/Applications/Deckhand.app"
+    echo "/Applications/KubeDeck.app"
     ;;
 
 Linux)
@@ -532,20 +532,20 @@ Linux)
     echo
     echo "Installing on Linux..."
 
-    if [ ! -d "dist/Deckhand" ]; then
+    if [ ! -d "dist/KubeDeck" ]; then
         echo
         echo "ERROR: PyInstaller did not create:"
-        echo "dist/Deckhand"
+        echo "dist/KubeDeck"
         exit 1
     fi
 
-    sudo rm -rf "/opt/Deckhand"
-    sudo mkdir -p "/opt/Deckhand"
-    sudo cp -R "dist/Deckhand/." "/opt/Deckhand/"
+    sudo rm -rf "/opt/KubeDeck"
+    sudo mkdir -p "/opt/KubeDeck"
+    sudo cp -R "dist/KubeDeck/." "/opt/KubeDeck/"
 
     echo
     echo "Installed:"
-    echo "/opt/Deckhand"
+    echo "/opt/KubeDeck"
     ;;
 
 MINGW*|MSYS*|CYGWIN*)
@@ -553,19 +553,19 @@ MINGW*|MSYS*|CYGWIN*)
     echo
     echo "Installing on Windows..."
 
-    INSTALL_DIR="/c/Program Files/Deckhand"
+    INSTALL_DIR="/c/Program Files/KubeDeck"
 
-    if [ ! -d "dist/Deckhand" ]; then
+    if [ ! -d "dist/KubeDeck" ]; then
         echo
         echo "ERROR: PyInstaller did not create:"
-        echo "dist/Deckhand"
+        echo "dist/KubeDeck"
         exit 1
     fi
 
     rm -rf "$INSTALL_DIR"
     mkdir -p "$INSTALL_DIR"
 
-    cp -R "dist/Deckhand/." "$INSTALL_DIR/"
+    cp -R "dist/KubeDeck/." "$INSTALL_DIR/"
 
     echo
     echo "Installed to:"
@@ -592,7 +592,7 @@ rm -rf "$DIR"
 
 echo
 echo "=========================================="
-echo "Deckhand installed successfully!"
+echo "KubeDeck installed successfully!"
 echo "=========================================="
 echo
 echo "Included:"
