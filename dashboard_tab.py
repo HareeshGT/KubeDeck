@@ -47,7 +47,7 @@ from utils import monospace_font, size_fmt
 from progress_ring import CircularProgress
 
 
-REFRESH_MS = 6000  # live-dashboard cadence while the tab is visible
+REFRESH_MS = 3000  # live-dashboard cadence; never overlaps an in-flight refresh
 
 
 def _is_light_background():
@@ -146,35 +146,37 @@ _K8S_CMD = r"""
 if ! command -v kubectl >/dev/null 2>&1; then
   echo __NODES__
   echo "kubectl: not found"
-  echo __COND__
-  echo __NODEINFO__
+  echo __NODEDETAILS__
   echo __TOP__
   echo __PODS__
   echo __PODTOP__
   echo __WORKLOADS__
-  echo __SERVICES__
+  echo __SERVICES_ENDPOINTS__
   echo __EVENTS__
 else
   echo __NODES__
   kubectl get nodes -o wide --no-headers 2>/dev/null
-  echo __COND__
-  kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="MemoryPressure")].status}|{.status.conditions[?(@.type=="DiskPressure")].status}|{.status.conditions[?(@.type=="PIDPressure")].status}{"\n"}{end}' 2>/dev/null
-  echo __NODEINFO__
-  kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}|{.status.nodeInfo.kubeletVersion}|{.status.nodeInfo.osImage}|{.status.nodeInfo.kernelVersion}|{.status.nodeInfo.containerRuntimeVersion}|{.status.addresses[?(@.type=="InternalIP")].address}|{.status.capacity.cpu}|{.status.capacity.memory}|{.status.capacity.pods}|{.status.allocatable.cpu}|{.status.allocatable.memory}|{.status.allocatable.pods}{"\n"}{end}' 2>/dev/null
+
+  echo __NODEDETAILS__
+  # Conditions and node metadata/capacity in one API request.
+  kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="MemoryPressure")].status}|{.status.conditions[?(@.type=="DiskPressure")].status}|{.status.conditions[?(@.type=="PIDPressure")].status}|{.status.nodeInfo.kubeletVersion}|{.status.nodeInfo.osImage}|{.status.nodeInfo.kernelVersion}|{.status.nodeInfo.containerRuntimeVersion}|{.status.addresses[?(@.type=="InternalIP")].address}|{.status.capacity.cpu}|{.status.capacity.memory}|{.status.capacity.pods}|{.status.allocatable.cpu}|{.status.allocatable.memory}|{.status.allocatable.pods}{"\n"}{end}' 2>/dev/null
+
   echo __TOP__
   kubectl top nodes --no-headers 2>/dev/null
+
   echo __PODS__
   kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}|{.metadata.name}|{.status.phase}|{.spec.nodeName}|{range .status.containerStatuses[*]}{.restartCount}{","}{end}|{range .status.containerStatuses[*]}{.ready}{","}{end}|{.status.reason}|{.status.message}|{.status.podIP}|{.status.hostIP}|{.status.qosClass}|{.metadata.creationTimestamp}|{range .metadata.ownerReferences[0]}{.kind}{"/"}{.name}{end}|{range .status.containerStatuses[*]}{.name}={.state.waiting.reason},{.state.waiting.message}{";"}{end}{"\n"}{end}' 2>/dev/null
+
   echo __PODTOP__
   kubectl top pods --all-namespaces --no-headers 2>/dev/null
+
   echo __WORKLOADS__
-  kubectl get deployments --all-namespaces -o jsonpath='{range .items[*]}Deployment|{.metadata.namespace}|{.metadata.name}|{.metadata.creationTimestamp}|{.status.replicas}|{.status.readyReplicas}|{.status.availableReplicas}|{.status.updatedReplicas}|{.status.unavailableReplicas}|{.spec.replicas}{"\n"}{end}' 2>/dev/null
-  kubectl get statefulsets --all-namespaces -o jsonpath='{range .items[*]}StatefulSet|{.metadata.namespace}|{.metadata.name}|{.metadata.creationTimestamp}|{.status.replicas}|{.status.readyReplicas}|{.status.currentReplicas}|{.status.updatedReplicas}|{.status.readyReplicas}|{.spec.replicas}{"\n"}{end}' 2>/dev/null
-  kubectl get daemonsets --all-namespaces -o jsonpath='{range .items[*]}DaemonSet|{.metadata.namespace}|{.metadata.name}|{.metadata.creationTimestamp}|{.status.desiredNumberScheduled}|{.status.numberReady}|{.status.numberAvailable}|{.status.updatedNumberScheduled}|{.status.numberUnavailable}|{.status.desiredNumberScheduled}{"\n"}{end}' 2>/dev/null
-  echo __SERVICES__
-  kubectl get services --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}|{.metadata.name}|{.spec.type}|{.spec.clusterIP}|{.status.loadBalancer.ingress[0].ip}|{.status.loadBalancer.ingress[0].hostname}|{range .spec.ports[*]}{.name}:{.port}/{.protocol}:{.nodePort}{","}{end}|{.metadata.creationTimestamp}{"\n"}{end}' 2>/dev/null
-  echo __ENDPOINTS__
-  kubectl get endpoints --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}|{.metadata.name}|{range .subsets[*].addresses[*]}1{";"}{end}|{range .subsets[*].notReadyAddresses[*]}1{";"}{end}{"\n"}{end}' 2>/dev/null
+  # Deployment/StatefulSet/DaemonSet data in one API request.
+  kubectl get deployments,statefulsets,daemonsets --all-namespaces -o jsonpath='{range .items[*]}{.kind}|{.metadata.namespace}|{.metadata.name}|{.metadata.creationTimestamp}|{.status.replicas}|{.status.readyReplicas}|{.status.availableReplicas}|{.status.currentReplicas}|{.status.updatedReplicas}|{.status.unavailableReplicas}|{.spec.replicas}|{.status.desiredNumberScheduled}|{.status.numberReady}|{.status.numberAvailable}|{.status.updatedNumberScheduled}|{.status.numberUnavailable}{"\n"}{end}' 2>/dev/null
+
+  echo __SERVICES_ENDPOINTS__
+  # Service and Endpoints data in one API request.
+  kubectl get services,endpoints --all-namespaces -o jsonpath='{range .items[*]}{.kind}|{.metadata.namespace}|{.metadata.name}|{.spec.type}|{.spec.clusterIP}|{.status.loadBalancer.ingress[0].ip}|{.status.loadBalancer.ingress[0].hostname}|{range .spec.ports[*]}{.name}:{.port}/{.protocol}:{.nodePort}{","}{end}|{.metadata.creationTimestamp}|{range .subsets[*].addresses[*]}1{";"}{end}|{range .subsets[*].notReadyAddresses[*]}1{";"}{end}{"\n"}{end}' 2>/dev/null
 
   echo __EVENTS__
   kubectl get events --all-namespaces --sort-by=.lastTimestamp -o jsonpath='{range .items[*]}{.lastTimestamp}|{.type}|{.reason}|{.involvedObject.kind}|{.involvedObject.namespace}|{.involvedObject.name}|{.message}{"\n"}{end}' 2>/dev/null
@@ -322,7 +324,7 @@ class HistoryChart(QWidget):
 
 class Sparkline(QWidget):
     """Tiny live-updating line chart for a ring's last ~60 seconds of
-    samples, at the dashboard's own 6s poll cadence (see REFRESH_MS) —
+    samples, at the dashboard's own poll cadence (see REFRESH_MS) —
     distinct from HistoryChart above, which plots the separate 1-sample-
     per-minute, 500-sample-deep history log.
 
@@ -1106,6 +1108,15 @@ class DashboardTab(QWidget):
         self._kube_context = ""
         self._active  = False
         self._busy    = False
+        self._host_done = False
+        self._k8s_done = False
+        self._refresh_started_at = 0.0
+        # Keep each collection cycle isolated.  Workers only fill these
+        # buffers; the UI is updated once BOTH snapshots belong to the same
+        # cycle.  This prevents mixed-time host/Kubernetes data.
+        self._host_snapshot = None
+        self._k8s_snapshot = None
+        self._snapshot_generation = 0
         self._workers = []
 
         # Latest per-node pod snapshot, keyed by the exact string shown in
@@ -1160,6 +1171,10 @@ class DashboardTab(QWidget):
             self._refresh()
 
     def set_ssh(self, ssh):
+        # Invalidate callbacks from any in-flight collection belonging to the
+        # previous SSH connection.
+        self._snapshot_generation += 1
+        self._busy = False
         self.ssh = ssh
         self._history_key = self._derive_history_key(ssh)
         self._history = self._load_history()
@@ -1173,6 +1188,8 @@ class DashboardTab(QWidget):
         else:
             self._timer.stop()
             self._busy = False
+            self._host_snapshot = None
+            self._k8s_snapshot = None
             self._show_disconnected()
             for win in list(self._node_windows.values()):
                 win.close()  # triggers closeEvent -> _on_node_window_closed -> dict pop
@@ -1199,6 +1216,10 @@ class DashboardTab(QWidget):
             self._timer.start(REFRESH_MS)
         else:
             self._timer.stop()
+            # Invalidate a cycle when leaving the tab so late worker signals
+            # cannot publish data after the dashboard has been paused.
+            self._snapshot_generation += 1
+            self._busy = False
 
     def changeEvent(self, event):
         # Theme changes update the QApplication palette. Re-apply all of the
@@ -1689,29 +1710,94 @@ class DashboardTab(QWidget):
         return re.sub(r"(^\s*)kubectl(?=\s)", lambda m: m.group(1) + "kubectl " + flag, _K8S_CMD, flags=re.MULTILINE)
 
     def _refresh(self):
-        if not self.ssh or self._busy:
+        """Start one dashboard collection cycle.
+
+        Host and Kubernetes collection run in parallel, but a new cycle is
+        blocked until BOTH workers have finished. This prevents a slow
+        kubectl snapshot from overlapping the next timer tick.
+        """
+        if not self.ssh or not self._active or self._busy:
             return
+
         self._busy = True
+        self._host_done = False
+        self._k8s_done = False
+        self._host_snapshot = None
+        self._k8s_snapshot = None
+        self._snapshot_generation += 1
+        generation = self._snapshot_generation
+        self._refresh_started_at = time.monotonic()
         self._update_live_label()
 
         host_worker = CommandWorker(self.ssh, _HOST_CMD)
-        host_worker.done.connect(self._on_host_stats)
-        host_worker.error.connect(self._on_host_error)
+        host_worker.done.connect(lambda out, g=generation: self._on_host_stats(out) if g == self._snapshot_generation else None)
+        host_worker.error.connect(lambda err, g=generation: self._on_host_error(err) if g == self._snapshot_generation else None)
         track_worker(self._workers, host_worker)
         host_worker.start()
 
         k8s_worker = CommandWorker(self.ssh, self._contextual_k8s_command())
-        k8s_worker.done.connect(self._on_k8s_stats)
-        k8s_worker.error.connect(self._on_k8s_error)
+        k8s_worker.done.connect(lambda out, g=generation: self._on_k8s_stats(out) if g == self._snapshot_generation else None)
+        k8s_worker.error.connect(lambda err, g=generation: self._on_k8s_error(err) if g == self._snapshot_generation else None)
         track_worker(self._workers, k8s_worker)
         k8s_worker.start()
 
-    def _mark_updated(self):
-        self.updated_lbl.setText("Updated " + time.strftime("%H:%M:%S"))
+    def _worker_finished(self, worker_name: str):
+        """Finish one side of the current cycle and atomically publish both."""
+        if worker_name == "host":
+            self._host_done = True
+        elif worker_name == "k8s":
+            self._k8s_done = True
+
+        if not (self._host_done and self._k8s_done):
+            return
+
+        # Both outputs now belong to exactly this refresh generation.
+        elapsed = (
+            time.monotonic() - self._refresh_started_at
+            if self._refresh_started_at else 0.0
+        )
+        host_out = self._host_snapshot
+        k8s_out = self._k8s_snapshot
+        k8s_error = getattr(self, "_k8s_error", None)
+        self._k8s_error = None
+
+        # Render as one transaction.  No visible dashboard section is changed
+        # until the complete cycle has been collected.
+        if host_out is not None:
+            self._render_host_stats(host_out)
+        else:
+            self._on_host_render_error()
+
+        if k8s_out is not None:
+            self._render_k8s_stats(k8s_out)
+        else:
+            self._render_k8s_error(k8s_error or "snapshot collection failed")
+
+        self.updated_lbl.setText(
+            f"Updated {time.strftime('%H:%M:%S')}  ·  snapshot {elapsed:.1f}s"
+        )
         self._busy = False
+        self._update_live_label()
+        self.status_msg.emit("Dashboard updated")
+
+    def _on_host_render_error(self):
+        # Keep the previous visible host values on a failed cycle.  The cycle
+        # is still considered complete, so the next live refresh can proceed.
+        pass
+
+    def _render_k8s_error(self, err: str):
+        self._clear_node_grid()
+        self.k8s_note.setText(f"Kubernetes data unavailable: {err}")
+        self.k8s_note.show()
 
     # ── Host stats ────────────────────────────────────────────
     def _on_host_stats(self, out: str):
+        # Collection callback: do not touch visible widgets yet.  The host
+        # snapshot is committed only when the matching K8s snapshot arrives.
+        self._host_snapshot = out
+        self._worker_finished("host")
+
+    def _render_host_stats(self, out: str):
         sec = _split_sections(out)
 
         def first(key, default=""):
@@ -1722,7 +1808,17 @@ class DashboardTab(QWidget):
         self._vm_fields["os"].setText(first("OS", "Unknown"))
         self._vm_fields["kernel"].setText(first("KERNEL", "—"))
         self._vm_fields["uptime"].setText(first("UPTIME", "—"))
-        self._vm_fields["load"].setText(first("LOAD", "—"))
+        # /proc/loadavg contains: 1m 5m 15m runnable/total last-pid.
+        # Show only the actual load averages in the dashboard; the trailing
+        # scheduler/PID fields are not load-average values.
+        load_raw = first("LOAD", "")
+        load_parts = load_raw.split()
+        if len(load_parts) >= 3:
+            self._vm_fields["load"].setText(
+                f"{load_parts[0]} {load_parts[1]} {load_parts[2]}"
+            )
+        else:
+            self._vm_fields["load"].setText(load_raw or "—")
 
         cpu_lines = [l for l in sec.get("CPU", []) if l.strip()]
         cores = cpu_lines[0].strip() if cpu_lines else "?"
@@ -1770,16 +1866,18 @@ class DashboardTab(QWidget):
             self.cpu_ring["val_lbl"].setText("unavailable")
             self.cpu_ring["ring"].setToolTip("CPU usage unavailable")
 
-        # Memory — a "Mem: total used free shared buff/cache available"
-        # line, same shape whether it came from Linux `free -m` or the
-        # macOS branch of _HOST_CMD (which computes the equivalent from
-        # `sysctl hw.memsize`/`vm_stat` and prints it in the same layout).
+        # Memory — Linux `free -m` is:
+        #   Mem: total used free shared buff/cache available
+        # The previous parser accidentally treated `used` as `free`, which
+        # inflated the displayed usage (e.g. ~96% instead of ~58%).  Parse
+        # the actual used column directly.
         mem_line = first("MEM", "")
         if mem_line:
             parts = mem_line.split()
             try:
-                total_mb, free_mb = float(parts[1]), float(parts[3])
-                used_mb = total_mb - free_mb
+                total_mb = float(parts[1])
+                used_mb = float(parts[2])
+                free_mb = float(parts[3])
                 mem_pct = (used_mb / total_mb * 100.0) if total_mb else 0.0
                 self._style_ring(self.mem_ring["ring"], mem_pct)
                 self.mem_ring["spark"].set_color(_pct_color(mem_pct))
@@ -1858,15 +1956,21 @@ class DashboardTab(QWidget):
             self.storage_ring["val_lbl"].setText("unavailable")
             self.storage_ring["ring"].setToolTip("Storage usage unavailable")
 
-        self._mark_updated()
         self.status_msg.emit("Dashboard updated")
 
     def _on_host_error(self, err: str):
-        self._busy = False
+        self._host_snapshot = None
         self.status_msg.emit(f"Dashboard: host stats error — {err}")
+        self._worker_finished("host")
 
     # ── Kubernetes stats ──────────────────────────────────────
     def _on_k8s_stats(self, out: str):
+        # Collection callback: hold the raw snapshot until the host snapshot
+        # for this same cycle is also complete.
+        self._k8s_snapshot = out
+        self._worker_finished("k8s")
+
+    def _render_k8s_stats(self, out: str):
         sec = _split_sections(out)
 
         raw_node_lines = [l for l in sec.get("NODES", []) if l.strip()]
@@ -1906,43 +2010,29 @@ class DashboardTab(QWidget):
         self.k8s_note.hide()
         self.k8s_summary_card["frame"].show()
 
-        # Pressure conditions, keyed by node name
+        # Conditions + node metadata come from one API request.
         cond = {}
-        for line in sec.get("COND", []):
+        node_info = {}
+        for line in sec.get("NODEDETAILS", []):
             if "|" not in line:
                 continue
             bits = line.split("|")
-            bits += [""] * (5 - len(bits))
-            name, ready, mem_p, disk_p, pid_p = bits[:5]
-            cond[name.strip()] = {
+            bits += [""] * (16 - len(bits))
+            (name, ready, mem_p, disk_p, pid_p, kubelet, os_image, kernel,
+             runtime, ip, cpu_capacity, mem_capacity, pod_capacity,
+             cpu_allocatable, mem_allocatable, pod_allocatable) = bits[:16]
+            name = name.strip()
+            if not name:
+                continue
+            cond[name] = {
                 "ready": ready.strip(), "mem": mem_p.strip(),
                 "disk": disk_p.strip(), "pid": pid_p.strip(),
             }
-
-        # Node capacity/allocatable and runtime metadata, keyed by node name.
-        # This comes from the Kubernetes API rather than the human-oriented
-        # `kubectl get nodes -o wide` table, so resource quantities remain
-        # stable across kubectl versions.
-        node_info = {}
-        for line in sec.get("NODEINFO", []):
-            if "|" not in line:
-                continue
-            bits = line.split("|")
-            bits += [""] * (12 - len(bits))
-            (name, kubelet, os_image, kernel, runtime, ip, cpu_capacity,
-             mem_capacity, pod_capacity, cpu_allocatable, mem_allocatable,
-             pod_allocatable) = bits[:12]
-            if not name.strip():
-                continue
-            node_info[name.strip()] = {
-                "kubelet": kubelet.strip(),
-                "os": os_image.strip(),
-                "kernel": kernel.strip(),
-                "runtime": runtime.strip(),
-                "ip": ip.strip(),
-                "cpu_capacity": cpu_capacity.strip(),
-                "mem_capacity": mem_capacity.strip(),
-                "pod_capacity": pod_capacity.strip(),
+            node_info[name] = {
+                "kubelet": kubelet.strip(), "os": os_image.strip(),
+                "kernel": kernel.strip(), "runtime": runtime.strip(),
+                "ip": ip.strip(), "cpu_capacity": cpu_capacity.strip(),
+                "mem_capacity": mem_capacity.strip(), "pod_capacity": pod_capacity.strip(),
                 "cpu_allocatable": cpu_allocatable.strip(),
                 "mem_allocatable": mem_allocatable.strip(),
                 "pod_allocatable": pod_allocatable.strip(),
@@ -2002,56 +2092,64 @@ class DashboardTab(QWidget):
             if len(parts) >= 4 and _CPU_VAL_RE.match(parts[2]) and _MEM_VAL_RE.match(parts[3]):
                 pod_usage[(parts[0], parts[1])] = {"cpu": parts[2], "mem": parts[3]}
 
-        # ── Phase 2: workloads ──────────────────────────────
+        # ── Phase 2: workloads/services/endpoints ───────────
         workloads = []
         for line in sec.get("WORKLOADS", []):
             if "|" not in line:
                 continue
             bits = line.split("|")
-            if len(bits) < 10:
+            bits += [""] * (16 - len(bits))
+            (kind, ns, name, created, replicas, ready, available, current,
+             updated, unavailable, desired, ds_desired, ds_ready, ds_available,
+             ds_updated, ds_unavailable) = bits[:16]
+            kind, ns, name = kind.strip(), ns.strip(), name.strip()
+            if not name:
                 continue
-            kind, ns, name, created, replicas, ready, available, updated, unavailable, desired = bits[:10]
-            if not name.strip():
-                continue
+            if kind == "DaemonSet":
+                replicas, ready, available = ds_desired, ds_ready, ds_available
+                updated, unavailable, desired = ds_updated, ds_unavailable, ds_desired
+            elif kind == "StatefulSet":
+                # Preserve the original dashboard mapping exactly.
+                available = current
+                unavailable = ready
             workloads.append({
-                "kind": kind.strip(), "namespace": ns.strip(), "name": name.strip(),
+                "kind": kind, "namespace": ns, "name": name,
                 "created": created.strip(), "replicas": replicas.strip() or "0",
                 "ready": ready.strip() or "0", "available": available.strip() or "0",
                 "updated": updated.strip() or "0", "unavailable": unavailable.strip() or "0",
                 "desired": desired.strip() or replicas.strip() or "0",
             })
 
-        # ── Phase 2: services/endpoints ────────────────────
         endpoint_counts = {}
-        for line in sec.get("ENDPOINTS", []):
-            bits = line.split("|")
-            if len(bits) < 3:
-                continue
-            ns, name = bits[0].strip(), bits[1].strip()
-            ready_count = sum(1 for x in bits[2].split(";") if x.strip())
-            not_ready_count = sum(1 for x in (bits[3] if len(bits) > 3 else "").split(";") if x.strip())
-            endpoint_counts[(ns, name)] = (ready_count, not_ready_count)
-
         services = []
-        for line in sec.get("SERVICES", []):
+        for line in sec.get("SERVICES_ENDPOINTS", []):
             if "|" not in line:
                 continue
             bits = line.split("|")
-            bits += [""] * (8 - len(bits))
-            ns, name, svc_type, cluster_ip, ext_ip, ext_host, ports, created = bits[:8]
-            if not name.strip():
+            bits += [""] * (11 - len(bits))
+            kind, ns, name, svc_type, cluster_ip, ext_ip, ext_host, ports, created, ready_csv, notready_csv = bits[:11]
+            kind, ns, name = kind.strip(), ns.strip(), name.strip()
+            if not name:
                 continue
-            external = ext_ip.strip() or ext_host.strip() or "—"
-            ep_ready, ep_notready = endpoint_counts.get((ns.strip(), name.strip()), (0, 0))
-            services.append({
-                "namespace": ns.strip(), "name": name.strip(),
-                "type": svc_type.strip() or "ClusterIP",
-                "cluster_ip": cluster_ip.strip() or "—",
-                "external": external,
-                "ports": ports.strip().rstrip(",") or "—",
-                "endpoints": f"{ep_ready}" + (f" (+{ep_notready} not ready)" if ep_notready else ""),
-                "created": created.strip(),
-            })
+            if kind == "Endpoints":
+                endpoint_counts[(ns, name)] = (
+                    sum(1 for x in ready_csv.split(";") if x.strip()),
+                    sum(1 for x in notready_csv.split(";") if x.strip()),
+                )
+            elif kind == "Service":
+                services.append({
+                    "namespace": ns, "name": name,
+                    "type": svc_type or "ClusterIP",
+                    "cluster_ip": cluster_ip or "—",
+                    "external": ext_ip.strip() or ext_host.strip() or "—",
+                    "ports": ports.strip().rstrip(",") or "—",
+                    "endpoints": "0",
+                    "created": created.strip(),
+                })
+
+        for svc in services:
+            ready_n, notready_n = endpoint_counts.get((svc["namespace"], svc["name"]), (0, 0))
+            svc["endpoints"] = f"{ready_n}" + (f" (+{notready_n} not ready)" if notready_n else "")
 
         # ── Phase 2: recent events ─────────────────────────
         events = []
@@ -2227,7 +2325,7 @@ class DashboardTab(QWidget):
         for node_name, win in self._node_windows.items():
             win.update_pods(self._pods_by_node_cache.get(node_name, []), self._pod_usage_cache)
 
-        self._mark_updated()
+
         self.status_msg.emit("Dashboard updated")
 
     # ── Node detail window ──────────────────────────────────────
@@ -2368,7 +2466,6 @@ class DashboardTab(QWidget):
             )
 
     def _on_k8s_error(self, err: str):
-        self._busy = False
-        self._clear_node_grid()
-        self.k8s_note.setText(f"Kubernetes data unavailable: {err}")
-        self.k8s_note.show()
+        self._k8s_snapshot = None
+        self._k8s_error = err
+        self._worker_finished("k8s")
