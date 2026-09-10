@@ -161,7 +161,7 @@ class KubernetesTab(QWidget):
             self.health_lbl.setStyleSheet(f"color: {T['WARNING']}; font-size: 12px;")
             return
 
-        self.health_lbl.setText(f"● Checking: {self._current_context}")
+        self.health_lbl.setText(f"● Checking")
         self.health_lbl.setStyleSheet(f"color: {T['WARNING']}; font-size: 12px;")
         self._check_cluster_health()
 
@@ -180,7 +180,7 @@ class KubernetesTab(QWidget):
         self.ns_combo.clear()
         self.ns_combo.addItem("Loading…")
         self.ns_combo.blockSignals(False)
-        self.health_lbl.setText(f"● Checking: {context}")
+        self.health_lbl.setText(f"● Checking")
         self.health_lbl.setStyleSheet(f"color: {T['WARNING']}; font-size: 12px;")
         self._check_cluster_health()
 
