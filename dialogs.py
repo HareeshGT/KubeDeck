@@ -24,7 +24,7 @@ from PyQt5.QtGui import QFont, QColor, QTextCursor, QTextCharFormat, QTextBlockF
 
 from themes import T, apply_qss_to
 from utils import load_recent_instances, size_fmt, append_terminal_html, append_terminal_text, html_escape, monospace_font
-from workers import CommandWorker, _TransferWorker, ScpTransferWorker, track_worker, FileStreamReadWorker, MediaStreamServer, _StreamServerStartWorker
+from workers import CommandWorker, _TransferWorker, ScpTransferWorker, track_worker, FileStreamReadWorker, MediaStreamServer, _StreamServerStartWorker, managed_exec_command, open_managed_session, close_managed_session
 from editor_widgets import CodeEditor, make_highlighter, LANG_LABEL
 import ai_assist
 
@@ -2404,38 +2404,17 @@ class _ExecStreamWorker(QThread):
             pass
 
     def run(self):
+        channel = None
         try:
-            # A PTY is allocated below (channel.get_pty()), which means the
-            # remote process's stdout is a real tty as far as it's concerned.
-            # bash, python3, and virtually everything else auto-switch to
-            # line-buffered stdout the moment isatty(stdout) is true, so no
-            # extra buffering trick is needed for normal output.
-            #
-            # (Previously this wrapped the command in
-            # "stdbuf -oL -eL {cmd} || unbuffer {cmd} || {cmd}", but stdbuf
-            # tries to exec {cmd} as a single program — it chokes instantly
-            # on anything starting with a shell builtin like "cd ... &&
-            # bash script.sh" ("failed to run command 'cd'"), and unbuffer
-            # isn't installed on most hosts. Both fallbacks silently leaked
-            # their error text into the output before finally landing on
-            # the last, unbuffered variant — which is what made output look
-            # delayed/batched in the first place.)
-            channel = self._ssh.get_transport().open_session()
+            channel = open_managed_session(self._ssh)
             channel.get_pty()
             channel.settimeout(0.5)
             channel.exec_command(self._cmd)
-            # PTY is allocated up front, so stdin is writable as soon as the
-            # channel exists — expose it immediately rather than waiting for
-            # the command to finish setting up.
             self._channel = channel
-
-            buf = b""
 
             while True:
                 if self._stop:
-                    channel.close()
-                    break
-
+                    return
                 try:
                     if channel.recv_ready():
                         chunk = channel.recv(4096)
@@ -2444,20 +2423,18 @@ class _ExecStreamWorker(QThread):
                         continue
                 except Exception:
                     pass
-
                 if channel.exit_status_ready() and not channel.recv_ready():
                     break
-
                 self.msleep(50)
-
-            if buf:
-                self.line.emit(buf.decode("utf-8", errors="replace"))
 
             code = channel.recv_exit_status() if not self._stop else -1
             self.finished.emit(code)
         except Exception as e:
             self.error.emit(str(e))
             self.finished.emit(-1)
+        finally:
+            self._channel = None
+            close_managed_session(channel)
 
 
 class FileExecDialog(QDialog):
@@ -3605,8 +3582,8 @@ class ManageTunnelServicesDialog(QDialog):
         # already-expanded absolute path.
         csv_path = self.csv_path
         if csv_path.startswith("~"):
-            _, _home_out, _ = self.ssh.exec_command("echo $HOME")
-            home = _home_out.read().decode(errors="replace").strip()
+            with managed_exec_command(self.ssh, "echo $HOME") as (_stdin, _home_out, _stderr):
+                home = _home_out.read().decode(errors="replace").strip()
             if home:
                 csv_path = home + csv_path[1:]
 

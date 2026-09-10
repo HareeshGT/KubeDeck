@@ -5,6 +5,7 @@ import mimetypes
 import os
 import stat
 from PyQt5.QtGui import QTextCursor, QFont, QFontDatabase, QFontInfo, QTextCharFormat
+from workers import managed_exec_command
 # ─── Paths ───────────────────────────────────────────────────
 APP_DIR     = os.path.join(os.path.expanduser("~"), ".vm_visualizer")
 RECENT_FILE = os.path.join(APP_DIR, "recent.csv")
@@ -232,8 +233,8 @@ def load_tunnel_services(ssh, path: str = None) -> list:
     if ssh is None:
         return services
     try:
-        _, stdout, _ = ssh.exec_command("cat {} 2>/dev/null".format(path))
-        raw = stdout.read().decode(errors="replace")
+        with managed_exec_command(ssh, "cat {} 2>/dev/null".format(path)) as (_stdin, stdout, _stderr):
+            raw = stdout.read().decode(errors="replace")
     except Exception:
         return services
 

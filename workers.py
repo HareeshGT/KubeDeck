@@ -11,6 +11,98 @@ from typing import Optional
 from PyQt5.QtCore import QThread, pyqtSignal
 
 
+
+# SSH session-channel guard. Paramiko allows many channels on one Transport,
+# but the remote sshd commonly limits MaxSessions and a burst of QThreads can
+# otherwise produce "Secsh channel N open FAILED: Connect failed". Keep a hard
+# client-side bound and release every slot when the channel is closed.
+_SSH_MAX_CONCURRENT_CHANNELS = 8
+_SSH_GUARD_ATTR = "_kdb_channel_guard"
+
+def _ssh_guard(ssh):
+    guard = getattr(ssh, _SSH_GUARD_ATTR, None)
+    if guard is None:
+        guard = {
+            "sem": threading.BoundedSemaphore(_SSH_MAX_CONCURRENT_CHANNELS),
+            "lock": threading.RLock(),
+        }
+        try:
+            setattr(ssh, _SSH_GUARD_ATTR, guard)
+        except Exception:
+            pass
+    return guard
+
+
+def open_managed_session(ssh, timeout=None):
+    """Open a bounded Paramiko session channel. Caller must close it with
+    close_managed_session(), which releases the concurrency slot."""
+    if ssh is None:
+        raise RuntimeError("SSH connection is not available")
+    transport = ssh.get_transport()
+    if transport is None or not transport.is_active():
+        raise RuntimeError("SSH transport is not active")
+    guard = _ssh_guard(ssh)
+    acquired = guard["sem"].acquire(timeout=timeout) if timeout is not None else guard["sem"].acquire()
+    if not acquired:
+        raise RuntimeError("SSH is busy; no session channel is currently available")
+    channel = None
+    try:
+        channel = transport.open_session()
+        channel._kdb_channel_slot = guard["sem"]
+        return channel
+    except Exception:
+        guard["sem"].release()
+        raise
+
+
+def close_managed_session(channel):
+    if channel is None:
+        return
+    sem = getattr(channel, "_kdb_channel_slot", None)
+    try:
+        channel.close()
+    except Exception:
+        pass
+    finally:
+        if sem is not None:
+            try:
+                delattr(channel, "_kdb_channel_slot")
+            except Exception:
+                pass
+            try:
+                sem.release()
+            except Exception:
+                pass
+
+
+from contextlib import contextmanager
+
+@contextmanager
+def managed_exec_command(ssh, command, **kwargs):
+    """Execute a command while reserving one bounded SSH session channel.
+    stdout/stderr/stdin and the underlying channel are always closed."""
+    channel = open_managed_session(ssh, timeout=kwargs.pop("channel_timeout", None))
+    stdin = stdout = stderr = None
+    try:
+        if "get_pty" in kwargs and kwargs.pop("get_pty"):
+            channel.get_pty()
+        if "environment" in kwargs and kwargs["environment"]:
+            channel.update_environment(kwargs["environment"])
+        channel.exec_command(command)
+        stdin = channel.makefile_stdin("wb", -1)
+        stdout = channel.makefile("rb", -1)
+        stderr = channel.makefile_stderr("rb", -1)
+        yield stdin, stdout, stderr
+    finally:
+        for stream in (stdin, stdout, stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+        close_managed_session(channel)
+
+
 def track_worker(pool: list, worker: QThread) -> QThread:
     """Register *worker* in *pool* and auto-remove it once it finishes.
 
@@ -72,51 +164,7 @@ class ConnectWorker(QThread):
                 kw["look_for_keys"] = False
                 kw["allow_agent"]   = False
             elif self.pem:
-                # NOTE: deliberately NOT using kw["key_filename"] = self.pem
-                # here. When given a key_filename, paramiko's SSHClient
-                # blindly loops over RSAKey -> ECDSAKey -> Ed25519Key,
-                # trying to parse the SAME file as each type in turn
-                # (client.py:_auth). If the real key (say, RSA) parses fine
-                # but the server then rejects the auth attempt for an
-                # unrelated reason (wrong key, key not authorized, etc.),
-                # paramiko swallows that real AuthenticationException and
-                # keeps looping — ECDSAKey and Ed25519Key then predictably
-                # fail to parse an RSA-formatted file, and it's the LAST of
-                # those parse failures that gets raised at the end. That's
-                # exactly the misleading "encountered RSA key, expected
-                # OPENSSH key" (or similar) error: it names a completely
-                # unrelated key class and hides the actual problem.
-                #
-                # Loading the key explicitly up front and passing it as
-                # pkey= instead makes paramiko try only that one real key,
-                # so if auth fails the genuine SSHException/
-                # AuthenticationException surfaces instead of being masked.
-                try:
-                    pkey = paramiko.PKey.from_path(self.pem)
-                except AttributeError:
-                    # paramiko < 3.2 doesn't have PKey.from_path(). Fall
-                    # back to the old behavior; less reliable error
-                    # messages, but keeps this working on older installs.
-                    kw["key_filename"] = self.pem
-                except paramiko.ssh_exception.PasswordRequiredException:
-                    self.error.emit(
-                        "The key file '{}' is passphrase-protected. "
-                        "EC2 Manager doesn't currently support "
-                        "passphrase-protected keys — use an unencrypted "
-                        "copy of the key.".format(self.pem)
-                    )
-                    return
-                except Exception as key_err:
-                    self.error.emit(
-                        "Could not read key file '{}': {}".format(
-                            self.pem, key_err
-                        )
-                    )
-                    return
-                else:
-                    kw["pkey"]           = pkey
-                    kw["look_for_keys"]  = False
-                    kw["allow_agent"]    = False
+                kw["key_filename"] = self.pem
             elif self.host in ["127.0.0.1", "localhost"]:
                 # "Connect to Localhost" quick-button with no password/pem
                 # entered — leave look_for_keys/allow_agent at their
@@ -188,10 +236,17 @@ class ConnectWorker(QThread):
                 pass
 
             sftp = ssh.open_sftp()
-            _, stdout, _ = ssh.exec_command("echo $HOME")
-            home = stdout.read().decode().strip()
+            with managed_exec_command(ssh, "echo $HOME") as (_stdin, stdout, _stderr):
+                home = stdout.read().decode().strip()
             self.connected.emit(ssh, sftp, home)
         except Exception as e:
+            try:
+                if 'sftp' in locals() and sftp:
+                    sftp.close()
+                if 'ssh' in locals() and ssh:
+                    ssh.close()
+            except Exception:
+                pass
             self.error.emit(str(e))
 
 
@@ -295,58 +350,40 @@ class CommandWorker(QThread):
 
     def run(self):
         try:
-            if self.sudo_user:
-                _, stdout, _ = self.ssh.exec_command(
-                    "sudo -u {} sh -c 'echo $HOME'".format(self.sudo_user)
-                )
-            else:
-                _, stdout, _ = self.ssh.exec_command("echo $HOME")
-            home = stdout.read().decode().strip()
+            home_cmd = (
+                "sudo -u {} sh -c 'echo $HOME'".format(self.sudo_user)
+                if self.sudo_user else "echo $HOME"
+            )
+            with managed_exec_command(self.ssh, home_cmd) as (_stdin, stdout, _stderr):
+                home = stdout.read().decode(errors="replace").strip()
 
             prefix = "cd {} 2>/dev/null; ".format(self.cwd) if self.cwd else ""
             inner = (
                 "export PATH={h}:{h}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH;".format(h=home)
-                + prefix
-                + self.cmd
+                + prefix + self.cmd
             )
-
             if self.sudo_user:
                 safe_inner = inner.replace("'", "'\\''")
                 cmd = "sudo -u {} sh -c '{}'".format(self.sudo_user, safe_inner)
             else:
                 cmd = inner
 
-            _, stdout, stderr = self.ssh.exec_command(cmd)
-            stdout.channel.settimeout(self.timeout)
-            try:
-                out = stdout.read().decode(errors="replace")
-                err = stderr.read().decode(errors="replace")
-            except Exception as read_err:
-                # Most likely socket.timeout: the command is still running
-                # and hasn't produced EOF within the timeout window.
+            with managed_exec_command(self.ssh, cmd) as (_stdin, stdout, stderr):
+                stdout.channel.settimeout(self.timeout)
                 try:
-                    stdout.channel.close()
+                    out = stdout.read().decode(errors="replace")
+                    err = stderr.read().decode(errors="replace")
+                except Exception as read_err:
+                    self.error.emit(
+                        "Command is still running after {}s with no output — it looks like it's "
+                        "blocking in the foreground rather than exiting (raw error: {})."
+                        .format(self.timeout, read_err)
+                    )
+                    return
+                try:
+                    exit_code = stdout.channel.recv_exit_status()
                 except Exception:
-                    pass
-                self.error.emit(
-                    "Command is still running after {}s with no output — it looks like it's "
-                    "blocking in the foreground rather than exiting (this terminal waits for a "
-                    "command to fully finish before showing its result).\n"
-                    "If it's meant to keep running (a server, a port-forward, 'tail -f', etc.), "
-                    "start it backgrounded instead, e.g.:\n"
-                    "    nohup {} > /tmp/out.log 2>&1 &\n"
-                    "(raw error: {})".format(self.timeout, self.cmd, read_err)
-                )
-                return
-            # recv_exit_status() reflects self.cmd's own exit status even
-            # through the "export PATH=...; cd ...; <self.cmd>" and/or
-            # "sudo -u user sh -c '...'" wrapping above, since self.cmd is
-            # always the last command in the ';'-joined chain and a
-            # shell's own exit status is that of its last command.
-            try:
-                exit_code = stdout.channel.recv_exit_status()
-            except Exception:
-                exit_code = -1
+                    exit_code = -1
             self.result.emit(out, err, exit_code)
             self.done.emit(out + ("\n[stderr]\n{}".format(err) if err else ""))
         except Exception as e:
@@ -442,36 +479,34 @@ class FileStreamReadWorker(QThread):
             total = 0
 
         prefix = getattr(self._sftp, "_sudo_prefix", "")
-        sq     = getattr(self._sftp, "_sq", lambda p: "'" + p.replace("'", "'\\''") + "'")
-        cmd    = "{}cat {} 2>/dev/null".format(prefix, sq(self._remote))
-
-        channel = self._ssh.get_transport().open_session()
-        channel.settimeout(0.5)
-        channel.exec_command(cmd)
-
-        done   = 0
-        while True:
-            if self._cancelled:
-                channel.close()
-                return
-            try:
-                if channel.recv_ready():
-                    buf = channel.recv(self.CHUNK_SIZE)
-                    if buf:
-                        done += len(buf)
-                        self.chunk_ready.emit(buf)
-                        self.progress.emit(done, total)
-                        if self._max_bytes and done >= self._max_bytes:
-                            channel.close()
-                            break
-                        continue
-            except Exception:
-                pass
-            if channel.exit_status_ready() and not channel.recv_ready():
-                break
-            self.msleep(30)
-
-        self.finished_ok.emit(done)
+        sq = getattr(self._sftp, "_sq", lambda p: "'" + p.replace("'", "'\\''") + "'")
+        cmd = "{}cat {} 2>/dev/null".format(prefix, sq(self._remote))
+        channel = open_managed_session(self._ssh)
+        try:
+            channel.settimeout(0.5)
+            channel.exec_command(cmd)
+            done = 0
+            while True:
+                if self._cancelled:
+                    return
+                try:
+                    if channel.recv_ready():
+                        buf = channel.recv(self.CHUNK_SIZE)
+                        if buf:
+                            done += len(buf)
+                            self.chunk_ready.emit(buf)
+                            self.progress.emit(done, total)
+                            if self._max_bytes and done >= self._max_bytes:
+                                return
+                            continue
+                except Exception:
+                    pass
+                if channel.exit_status_ready() and not channel.recv_ready():
+                    break
+                self.msleep(30)
+            self.finished_ok.emit(done)
+        finally:
+            close_managed_session(channel)
 
 
 class _TransferWorker(QThread):
@@ -940,10 +975,8 @@ class _ChannelReader:
                 return b""
 
     def close(self):
-        try:
-            self._channel.close()
-        except Exception:
-            pass
+        close_managed_session(self._channel)
+        self._channel = None
 
 
 class _RangeHTTPRequestHandler(BaseHTTPRequestHandler):
@@ -1084,7 +1117,7 @@ class MediaStreamServer:
             ssh    = self._ssh
 
             def open_reader(_start):
-                channel = ssh.get_transport().open_session()
+                channel = open_managed_session(ssh)
                 channel.exec_command(cmd)
                 return _ChannelReader(channel)
 
