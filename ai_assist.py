@@ -442,12 +442,12 @@ PROVIDERS = {
         # specific ids (get a key at openrouter.ai/keys). Non-":free"
         # model ids also work here if a key has paid credits.
         "model_samples": [
-            "meta-llama/llama-3.3-70b-instruct:free",
-            "deepseek/deepseek-r1:free",
-            "deepseek/deepseek-chat-v3.1:free",
-            "google/gemini-2.0-flash-exp:free",
-            "qwen/qwen3-235b-a22b:free",
-            "mistralai/mistral-small-3.2-24b-instruct:free",
+            "openrouter/free",
+            "nvidia/nemotron-3-ultra:free",
+            "minimax/minimax-m3:free",
+            "poolside/laguna-s-2.1:free",
+            "openai/gpt-oss-20b:free",
+            "nvidia/ling-3.0-flash:free",
         ],
         "default_model": "meta-llama/llama-3.3-70b-instruct:free",
     },
