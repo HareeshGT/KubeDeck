@@ -241,23 +241,32 @@ def _deepseek_truncated(data):
 
 
 def _groq_request(prompt, api_key, model):
-    # Groq's API is OpenAI-compatible (same /chat/completions shape, same
-    # "Authorization: Bearer" header) running on Groq's own LPU hardware —
-    # just a different host/model catalog. Groq has a permanently-free
-    # tier (no credit card) with generous daily request limits, and
-    # accepts the plain "max_tokens" field across its whole catalog, so
-    # this mirrors _deepseek_request rather than _openai_request (no
-    # reasoning_effort / max_completion_tokens juggling needed).
     url = "https://api.groq.com/openai/v1/chat/completions"
+
     headers = {
         "Content-Type": "application/json",
+        "Accept": "application/json",
         "Authorization": f"Bearer {api_key}",
+        # Avoid the default Python-urllib User-Agent being treated as a
+        # non-browser/automated client by the edge layer.
+        "User-Agent": "Deckhand/1.0",
     }
+
     body = json.dumps({
         "model": model,
-        "max_tokens": MAX_TOKENS,
-        "messages": [{"role": "user", "content": prompt}],
+        # max_tokens is deprecated by Groq; use the current field.
+        "max_completion_tokens": MAX_TOKENS,
+        # GPT-OSS supports low/medium/high. Low keeps more of the token
+        # budget available for the visible diagnosis.
+        "reasoning_effort": "low",
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
     }).encode("utf-8")
+
     return url, headers, body
 
 
@@ -269,7 +278,17 @@ def _groq_parse(data):
 
 
 def _groq_error(detail, code):
-    return detail.get("error", {}).get("message") if isinstance(detail, dict) else None
+    if isinstance(detail, dict):
+        err = detail.get("error")
+        if isinstance(err, dict):
+            return err.get("message")
+        if isinstance(err, str):
+            return err
+
+    if isinstance(detail, str):
+        return detail.strip() or None
+
+    return None
 
 
 def _groq_truncated(data):
@@ -403,18 +422,13 @@ PROVIDERS = {
         "parse_response": _groq_parse,
         "parse_error": _groq_error,
         "was_truncated": _groq_truncated,
-        # Groq has a permanent no-credit-card free tier (get a key at
-        # console.groq.com/keys). Small/fast → larger, roughly ordered by
-        # daily rate limit (generous → tighter).
+
         "model_samples": [
-            "llama-3.1-8b-instant",
-            "llama-3.3-70b-versatile",
-            "openai/gpt-oss-120b",
             "openai/gpt-oss-20b",
-            "deepseek-r1-distill-llama-70b",
-            "gemma2-9b-it",
+            "openai/gpt-oss-120b",
         ],
-        "default_model": "llama-3.3-70b-versatile",
+
+        "default_model": "openai/gpt-oss-120b",
     },
     "openrouter": {
         "label": "OpenRouter (free models)",
@@ -614,7 +628,9 @@ def _call_provider(provider_id: str, api_key: str, model: str, prompt: str):
             detail = json.loads(raw)
         except Exception:
             detail = raw
-        msg = provider["parse_error"](detail, e.code) or (raw.strip() or str(e))
+        msg = provider["parse_error"](detail, e.code)
+        if not msg:
+            msg = raw.strip() or e.reason or str(e)
         return None, f"API error ({e.code}): {msg}"
     except urllib.error.URLError as e:
         return None, f"Network error: {e.reason}"

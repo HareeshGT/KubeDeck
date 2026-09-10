@@ -1502,7 +1502,7 @@ class K8sAIOpsWidget(QWidget):
         self.voice_combo.currentIndexChanged.connect(self._on_voice_combo_changed)
         btn_row.addWidget(self.voice_combo)
 
-        self.voice_test_btn = QPushButton("🔈")
+        self.voice_test_btn = QPushButton("🔊")
         self.voice_test_btn.setFixedSize(34, 34)
         self.voice_test_btn.setEnabled(_TTS_AVAILABLE)
         self.voice_test_btn.setToolTip("Preview the selected voice")
