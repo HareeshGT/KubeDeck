@@ -26,7 +26,7 @@ import themes as _themes
 from themes import T, THEMES, apply_theme_vars, build_qss, apply_qss_to, save_settings
 from utils import classify, icon_for, size_fmt, add_recent_instance, monospace_font
 from sudo_fs import SudoFS
-from workers import CommandWorker, ConnectWorker, ConnectionHealthWorker, FileStreamReadWorker, track_worker, managed_exec_command
+from workers import CommandWorker, ConnectWorker, ConnectionHealthWorker, FileStreamReadWorker, track_worker, managed_exec_command, close_ssh_connection_pool
 from dialogs import ConnectDialog, FileTransferDialog, FileEditorDialog, FileExecDialog, SearchDialog, ConnectingDialog, MediaPlayerDialog, AIExplainDialog
 import ai_assist
 from sidebar import Sidebar

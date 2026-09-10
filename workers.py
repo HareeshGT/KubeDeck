@@ -5,6 +5,7 @@ import re
 import signal
 import mimetypes
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
@@ -12,18 +13,227 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 
 
-# SSH session-channel guard. Paramiko allows many channels on one Transport,
-# but the remote sshd commonly limits MaxSessions and a burst of QThreads can
-# otherwise produce "Secsh channel N open FAILED: Connect failed". Keep a hard
-# client-side bound and release every slot when the channel is closed.
-_SSH_MAX_CONCURRENT_CHANNELS = 8
+# SSH execution connection pool.
+#
+# The main SSH connection is kept for SFTP and connection health checks.
+# Short-lived command/stream work is spread across a small number of
+# additional SSH TCP connections so one sshd MaxSessions limit cannot be
+# exhausted by every worker sharing a single Transport.
+_SSH_POOL_MAX_CONNECTIONS = 3      # secondary SSH connections (lazy)
+_SSH_MAX_CHANNELS_PER_CONNECTION = 6
 _SSH_GUARD_ATTR = "_kdb_channel_guard"
+_SSH_POOL_ATTR = "_kdb_connection_pool"
+
+
+def _configure_transport(ssh):
+    """Apply the same transport tuning used by the primary connection."""
+    try:
+        transport = ssh.get_transport()
+        if transport is None:
+            return
+        transport.default_window_size = 64 * 1024 * 1024
+        try:
+            transport.packetizer.REKEY_BYTES = pow(2, 40)
+            transport.packetizer.REKEY_PACKETS = pow(2, 40)
+        except Exception:
+            pass
+        transport.set_keepalive(15)
+    except Exception:
+        pass
+
+
+class _SSHPoolSlot:
+    """One secondary SSH connection and its session-channel limiter."""
+
+    def __init__(self, ssh):
+        self.ssh = ssh
+        self.sem = threading.BoundedSemaphore(_SSH_MAX_CHANNELS_PER_CONNECTION)
+
+
+class SSHConnectionPool:
+    """Lazily creates a small pool of secondary SSH connections.
+
+    The original/main ``SSHClient`` remains the owner's primary connection
+    (SFTP + heartbeat). This pool is used only by short-lived exec/stream
+    channels. Each secondary connection is independently capped below a
+    typical sshd ``MaxSessions`` value, and every channel releases its slot
+    when closed.
+    """
+
+    def __init__(self, host, port, user, pem="", password="", max_connections=_SSH_POOL_MAX_CONNECTIONS):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.pem = pem or ""
+        self.password = password or ""
+        self.max_connections = max(1, int(max_connections))
+        self._slots = []
+        self._creating = False
+        self._closed = False
+        self._cond = threading.Condition(threading.RLock())
+
+    def _connect_secondary(self):
+        import paramiko
+
+        ssh = paramiko.SSHClient()
+        # Keep the same host-key behavior as the existing primary connection
+        # so introducing the pool does not change connection semantics.
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        kw = dict(
+            hostname=self.host,
+            port=self.port,
+            username=self.user,
+            timeout=10,
+            banner_timeout=10,
+            auth_timeout=10,
+        )
+        if self.password:
+            kw["password"] = self.password
+            kw["look_for_keys"] = False
+            kw["allow_agent"] = False
+        elif self.pem:
+            kw["key_filename"] = self.pem
+        elif self.host in ["127.0.0.1", "localhost"]:
+            pass
+        ssh.connect(**kw)
+        _configure_transport(ssh)
+        return ssh
+
+    def _find_slot_with_capacity(self):
+        for slot in self._slots:
+            if slot.sem.acquire(False):
+                return slot
+        return None
+
+    def acquire_channel(self, timeout=None):
+        """Return ``(secondary_ssh, channel)`` and reserve one channel slot."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            with self._cond:
+                if self._closed:
+                    raise RuntimeError("SSH connection pool is closed")
+
+                slot = self._find_slot_with_capacity()
+                if slot is not None:
+                    break
+
+                if len(self._slots) < self.max_connections and not self._creating:
+                    self._creating = True
+                    create = True
+                else:
+                    create = False
+                    remaining = None if deadline is None else max(0, deadline - time.monotonic())
+                    if remaining == 0:
+                        raise RuntimeError("SSH is busy; no pooled session channel is currently available")
+                    self._cond.wait(remaining)
+                    continue
+
+            if create:
+                new_slot = None
+                try:
+                    secondary = self._connect_secondary()
+                    new_slot = _SSHPoolSlot(secondary)
+                    # Reserve the first channel for this caller.
+                    new_slot.sem.acquire()
+                    with self._cond:
+                        if self._closed:
+                            try:
+                                secondary.close()
+                            except Exception:
+                                pass
+                            new_slot = None
+                        else:
+                            self._slots.append(new_slot)
+                            slot = new_slot
+                except Exception:
+                    if new_slot is not None:
+                        try:
+                            new_slot.ssh.close()
+                        except Exception:
+                            pass
+                    with self._cond:
+                        self._creating = False
+                        self._cond.notify_all()
+                    raise
+                finally:
+                    with self._cond:
+                        self._creating = False
+                        self._cond.notify_all()
+                if slot is not None:
+                    break
+
+        try:
+            channel = slot.ssh.get_transport().open_session()
+            channel._kdb_pool_slot = slot
+            channel._kdb_pool_owner = self
+            return slot.ssh, channel
+        except Exception:
+            try:
+                slot.sem.release()
+            except Exception:
+                pass
+            with self._cond:
+                self._cond.notify_all()
+            raise
+
+    def release_channel(self, channel):
+        slot = getattr(channel, "_kdb_pool_slot", None)
+        if slot is None:
+            return
+        try:
+            delattr(channel, "_kdb_pool_slot")
+        except Exception:
+            pass
+        try:
+            delattr(channel, "_kdb_pool_owner")
+        except Exception:
+            pass
+        try:
+            slot.sem.release()
+        except Exception:
+            pass
+        with self._cond:
+            self._cond.notify_all()
+
+    def close(self):
+        with self._cond:
+            self._closed = True
+            slots = list(self._slots)
+            self._slots = []
+            self._cond.notify_all()
+        for slot in slots:
+            try:
+                slot.ssh.close()
+            except Exception:
+                pass
+
+
+def attach_ssh_connection_pool(ssh, host, port, user, pem="", password=""):
+    """Attach a lazy secondary-connection pool to an existing SSH client."""
+    pool = SSHConnectionPool(host, port, user, pem=pem, password=password)
+    setattr(ssh, _SSH_POOL_ATTR, pool)
+    return pool
+
+
+def close_ssh_connection_pool(ssh):
+    pool = getattr(ssh, _SSH_POOL_ATTR, None) if ssh is not None else None
+    if pool is not None:
+        try:
+            pool.close()
+        except Exception:
+            pass
+        try:
+            delattr(ssh, _SSH_POOL_ATTR)
+        except Exception:
+            pass
+
 
 def _ssh_guard(ssh):
+    """Fallback limiter for SSH clients not created by ConnectWorker."""
     guard = getattr(ssh, _SSH_GUARD_ATTR, None)
     if guard is None:
         guard = {
-            "sem": threading.BoundedSemaphore(_SSH_MAX_CONCURRENT_CHANNELS),
+            "sem": threading.BoundedSemaphore(_SSH_MAX_CHANNELS_PER_CONNECTION),
             "lock": threading.RLock(),
         }
         try:
@@ -34,10 +244,20 @@ def _ssh_guard(ssh):
 
 
 def open_managed_session(ssh, timeout=None):
-    """Open a bounded Paramiko session channel. Caller must close it with
-    close_managed_session(), which releases the concurrency slot."""
+    """Open a managed session channel.
+
+    Preferred path: acquire a channel from the secondary SSH connection pool.
+    Fallback path: use the supplied SSH client's own Transport with a bounded
+    semaphore, preserving compatibility for externally-created SSH clients.
+    """
     if ssh is None:
         raise RuntimeError("SSH connection is not available")
+
+    pool = getattr(ssh, _SSH_POOL_ATTR, None)
+    if pool is not None:
+        _owner_ssh, channel = pool.acquire_channel(timeout=timeout)
+        return channel
+
     transport = ssh.get_transport()
     if transport is None or not transport.is_active():
         raise RuntimeError("SSH transport is not active")
@@ -45,7 +265,6 @@ def open_managed_session(ssh, timeout=None):
     acquired = guard["sem"].acquire(timeout=timeout) if timeout is not None else guard["sem"].acquire()
     if not acquired:
         raise RuntimeError("SSH is busy; no session channel is currently available")
-    channel = None
     try:
         channel = transport.open_session()
         channel._kdb_channel_slot = guard["sem"]
@@ -58,21 +277,25 @@ def open_managed_session(ssh, timeout=None):
 def close_managed_session(channel):
     if channel is None:
         return
-    sem = getattr(channel, "_kdb_channel_slot", None)
+    pool = getattr(channel, "_kdb_pool_owner", None)
     try:
         channel.close()
     except Exception:
         pass
     finally:
-        if sem is not None:
-            try:
-                delattr(channel, "_kdb_channel_slot")
-            except Exception:
-                pass
-            try:
-                sem.release()
-            except Exception:
-                pass
+        if pool is not None:
+            pool.release_channel(channel)
+        else:
+            sem = getattr(channel, "_kdb_channel_slot", None)
+            if sem is not None:
+                try:
+                    delattr(channel, "_kdb_channel_slot")
+                except Exception:
+                    pass
+                try:
+                    sem.release()
+                except Exception:
+                    pass
 
 
 from contextlib import contextmanager
@@ -238,6 +461,16 @@ class ConnectWorker(QThread):
             sftp = ssh.open_sftp()
             with managed_exec_command(ssh, "echo $HOME") as (_stdin, stdout, _stderr):
                 home = stdout.read().decode().strip()
+
+            # Keep this primary SSH connection for SFTP/health checks and
+            # attach a lazy pool for all short-lived command/stream work.
+            # Secondary connections are only created when concurrency actually
+            # requires them.
+            effective_pem = self.pem if not self.password else ""
+            attach_ssh_connection_pool(
+                ssh, self.host, self.port, self.user,
+                pem=effective_pem, password=self.password
+            )
             self.connected.emit(ssh, sftp, home)
         except Exception as e:
             try:
