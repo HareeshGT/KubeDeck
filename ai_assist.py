@@ -311,7 +311,12 @@ def _openrouter_request(prompt, api_key, model):
     body = json.dumps({
         "model": model,
         "max_tokens": MAX_TOKENS,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
     }).encode("utf-8")
     return url, headers, body
 
