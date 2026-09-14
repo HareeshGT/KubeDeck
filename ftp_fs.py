@@ -3,6 +3,8 @@ import io
 import os
 import posixpath
 import stat as _stat
+import threading
+import time
 from ftplib import FTP, FTP_TLS
 
 
@@ -66,6 +68,14 @@ class FTPFS:
         self.timeout = timeout
         self.sudo_user = None
         self._ftp = None
+        self._stats_lock = threading.Lock()
+        self.connected_at = None
+        self.downloaded_bytes = 0
+        self.uploaded_bytes = 0
+        self.download_count = 0
+        self.upload_count = 0
+        self.last_operation = None
+        self.last_operation_at = None
         self._connect()
         self._initial_path = self.normalize(initial_path or "/")
 
@@ -78,6 +88,7 @@ class FTPFS:
             ftp.prot_p()
         ftp.set_pasv(self.passive)
         self._ftp = ftp
+        self.connected_at = time.time()
 
     def close(self):
         if self._ftp:
@@ -184,12 +195,25 @@ class FTPFS:
         self._ftp.retrbinary("RETR " + self.normalize(path), out.write)
         return out.getvalue()
 
+    def _record_transfer(self, direction, amount):
+        with self._stats_lock:
+            if direction == "download":
+                self.downloaded_bytes += int(amount)
+                self.download_count += 1
+            else:
+                self.uploaded_bytes += int(amount)
+                self.upload_count += 1
+            self.last_operation = direction
+            self.last_operation_at = time.time()
+
     def getfo(self, remote, fileobj, callback=None):
         done = [0]
         def cb(data):
             fileobj.write(data); done[0] += len(data)
             if callback: callback(len(data), done[0])
         self._ftp.retrbinary("RETR " + self.normalize(remote), cb)
+        if done[0]:
+            self._record_transfer("download", done[0])
 
     def putfo(self, fileobj, remote, callback=None):
         total = None
@@ -205,6 +229,8 @@ class FTPFS:
                     if callback: callback(len(data), done[0])
                 return data
         self._ftp.storbinary("STOR " + self.normalize(remote), Reader())
+        if done[0]:
+            self._record_transfer("upload", done[0])
 
     def get(self, remote, local, callback=None):
         with open(local, "wb") as f:

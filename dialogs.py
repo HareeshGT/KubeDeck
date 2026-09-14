@@ -29,16 +29,27 @@ from workers import CommandWorker, _TransferWorker, ScpTransferWorker, track_wor
 from editor_widgets import CodeEditor, make_highlighter, LANG_LABEL
 import ai_assist
 
-# PyAV is optional. Its PyPI wheels bundle FFmpeg, so FTP/FTPS media can be
-# decoded without requiring a separately installed VLC/FFmpeg application.
-# We use PyAV only for metadata probing; FFmpeg from imageio-ffmpeg performs
-# the actual native transcode to a temporary H.264/AAC MP4, then Qt handles playback.
+# PyAV is optional and only used for duration probing (to drive the
+# progress bar) ahead of a local-file transcode — it is never required for
+# playback itself, so its absence must never block the player.
 try:
     import av as _av
     _PYAV_AVAILABLE = True
 except Exception:
     _av = None
     _PYAV_AVAILABLE = False
+
+# FFmpeg (via imageio-ffmpeg, which ships a platform binary through pip) is
+# what actually performs every remote-media transcode, for both SSH and
+# FTP. This is checked once at import time so MediaPlayerDialog can show an
+# accurate, immediate message instead of the worker failing mid-playback.
+try:
+    import imageio_ffmpeg as _imageio_ffmpeg
+    _imageio_ffmpeg.get_ffmpeg_exe()
+    _FFMPEG_AVAILABLE = True
+except Exception:
+    _imageio_ffmpeg = None
+    _FFMPEG_AVAILABLE = False
 
 # QtMultimedia is an optional Qt component — most PyQt5 installs on macOS
 # and Linux ship it, but guard the import so a system missing the
@@ -2053,6 +2064,7 @@ class _RemoteRemuxWorker(QThread):
         self._remote = remote_path
         self._kind = kind
         self._cancelled = False
+        self._succeeded = False
         self._input_path = None
         self._output_path = None
         self.finished.connect(self.deleteLater)
@@ -2068,9 +2080,12 @@ class _RemoteRemuxWorker(QThread):
         import time
 
         try:
-            if not _PYAV_AVAILABLE:
-                raise RuntimeError("PyAV is not installed. Run: pip install av==18.1.0")
-
+            # Note: PyAV is only used below (in _transcode) for optional
+            # duration probing to drive the progress bar — the actual
+            # decode/encode is done natively by FFmpeg via imageio-ffmpeg.
+            # A missing PyAV install must not block playback; only a
+            # missing FFmpeg binary should (raised by _ffmpeg_binary()
+            # when a transcode command actually needs it).
             fd_out, self._output_path = tempfile.mkstemp(
                 prefix="deckhand_media_", suffix=".mp4"
             )
@@ -2106,19 +2121,32 @@ class _RemoteRemuxWorker(QThread):
                 return
 
             self.progress.emit(100, "Playback ready")
+            self._succeeded = True
             self.ready.emit(self._output_path)
 
         except Exception as exc:
             if not self._cancelled:
                 self.error.emit(str(exc))
         finally:
-            if self._cancelled:
-                for path in (self._input_path, self._output_path):
-                    if path:
-                        try:
-                            os.remove(path)
-                        except OSError:
-                            pass
+            # The downloaded source file (sudo path only) is scratch —
+            # it's never needed again once _transcode() has run, whether
+            # that succeeded, failed, or was cancelled, so it's removed
+            # unconditionally here instead of leaking on every successful
+            # (non-cancelled) sudo-mode playback.
+            if self._input_path:
+                try:
+                    os.remove(self._input_path)
+                except OSError:
+                    pass
+            # The output MP4 is only kept when it's about to be handed to
+            # the player (ready.emit above). On cancel *or* on a failed
+            # conversion it's a partial/unusable file and would otherwise
+            # leak in the temp dir forever.
+            if not self._succeeded and self._output_path:
+                try:
+                    os.remove(self._output_path)
+                except OSError:
+                    pass
 
     def _ffmpeg_binary(self):
         try:
@@ -2130,16 +2158,26 @@ class _RemoteRemuxWorker(QThread):
                 "and run: pip install imageio-ffmpeg"
             ) from exc
 
-    def _ffmpeg_cmd(self, ffmpeg_bin, hw=True):
+    def _ffmpeg_cmd(self, ffmpeg_bin, hw=True, input_path="pipe:0", loglevel="error"):
+        """Build one FFmpeg command line. Shared by both the non-sudo
+        streaming path (input_path="pipe:0", remote bytes piped straight
+        into stdin) and the sudo path (input_path=a local temp file
+        already fully downloaded) so the two never drift out of sync on
+        encoder settings — they used to be two hand-maintained copies of
+        nearly the same command, which is exactly how they'd quietly end
+        up encoding at different quality/behavior for no real reason.
+
+        Keeps output broadly compatible with Qt's player while using a
+        fast encoder. Fragmented MP4 is not used here because
+        QMediaPlayer's local file backend may try to seek before the file
+        is finalized.
+        """
         import sys
-        # Keep output broadly compatible with Qt's player while using a fast
-        # encoder. Fragmented MP4 is not used here because QMediaPlayer's local
-        # file backend may try to seek before the file is finalized.
-        cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
+        cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", loglevel, "-y"]
         if hw and sys.platform == "darwin":
             cmd += ["-hwaccel", "videotoolbox"]
         cmd += [
-            "-i", "pipe:0",
+            "-i", input_path,
             "-map", "0:v:0?",
             "-map", "0:a:0?",
             "-sn", "-dn", "-map_metadata", "-1",
@@ -2262,20 +2300,41 @@ class _RemoteRemuxWorker(QThread):
                             except Exception:
                                 pass
                 else:
-                    raw = getattr(self._remote_fs, "_sftp", self._remote_fs)
-                    with raw.open(self._remote, "rb") as in_f:
-                        try:
-                            in_f.MAX_REQUEST_SIZE = 1024 * 1024
-                            in_f.prefetch(total or None)
-                        except Exception:
-                            pass
-                        while True:
-                            if self._cancelled:
-                                raise InterruptedError
-                            data = in_f.read(1024 * 1024)
-                            if not data:
-                                break
-                            write_chunk(data)
+                    # Open a dedicated SFTP channel for this download rather
+                    # than reusing self._remote_fs's shared connection — the
+                    # same one the main-thread file browser keeps issuing
+                    # requests on. Concurrent use of one SFTP/raw channel
+                    # from two threads is exactly the class of bug already
+                    # called out elsewhere in this app (see the "Garbage
+                    # packet received" note in terminal_widget.py); this
+                    # runs for potentially a long time, so it's worth a
+                    # fresh channel the way MediaStreamServer already does.
+                    dedicated_sftp = None
+                    try:
+                        dedicated_sftp = self._ssh.open_sftp()
+                    except Exception:
+                        dedicated_sftp = None
+                    raw = dedicated_sftp or getattr(self._remote_fs, "_sftp", self._remote_fs)
+                    try:
+                        with raw.open(self._remote, "rb") as in_f:
+                            try:
+                                in_f.MAX_REQUEST_SIZE = 1024 * 1024
+                                in_f.prefetch(total or None)
+                            except Exception:
+                                pass
+                            while True:
+                                if self._cancelled:
+                                    raise InterruptedError
+                                data = in_f.read(1024 * 1024)
+                                if not data:
+                                    break
+                                write_chunk(data)
+                    finally:
+                        if dedicated_sftp is not None:
+                            try:
+                                dedicated_sftp.close()
+                            except Exception:
+                                pass
             except InterruptedError:
                 try:
                     proc.stdin.close()
@@ -2344,14 +2403,7 @@ class _RemoteRemuxWorker(QThread):
         import time
 
         try:
-            try:
-                import imageio_ffmpeg
-                ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
-            except Exception as exc:
-                raise RuntimeError(
-                    "FFmpeg runtime is not installed. Add imageio-ffmpeg to req.txt "
-                    "and run: pip install imageio-ffmpeg"
-                ) from exc
+            ffmpeg_bin = self._ffmpeg_binary()
 
             duration_sec = 0.0
             try:
@@ -2362,64 +2414,23 @@ class _RemoteRemuxWorker(QThread):
             except Exception:
                 pass
 
-            common = [
-                ffmpeg_bin,
-                "-hide_banner",
-                "-loglevel", "warning",
-                "-y",
-                "-i", self._input_path,
-                "-map", "0:v:0?",
-                "-map", "0:a:0?",
-                "-sn",
-                "-dn",
-                "-map_metadata", "-1",
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-ac", "2",
-                "-ar", "48000",
-                "-movflags", "+faststart",
-                self._output_path,
-            ]
-
-            # First choice on macOS: Apple's hardware path for both decode and
-            # encode. The fallback still runs natively in FFmpeg (not Python).
+            # Built via the same _ffmpeg_cmd() helper the streaming (non-sudo)
+            # path uses, just pointed at a local file instead of "pipe:0" —
+            # so the sudo and non-sudo playback paths always encode with
+            # identical settings instead of two hand-maintained command
+            # lists silently drifting apart (loglevel is kept at "warning"
+            # here so the time=/speed= progress lines below have something
+            # to parse). First choice on macOS is Apple's hardware path for
+            # both decode and encode; the fallback still runs natively in
+            # FFmpeg (not Python).
             commands = []
             if sys.platform == "darwin":
-                commands.append([
-                    ffmpeg_bin,
-                    "-hide_banner", "-loglevel", "warning", "-y",
-                    "-hwaccel", "videotoolbox",
-                    "-i", self._input_path,
-                    "-map", "0:v:0?", "-map", "0:a:0?",
-                    "-sn", "-dn", "-map_metadata", "-1",
-                    "-c:v", "h264_videotoolbox",
-                    "-allow_sw", "1",
-                    "-realtime", "1",
-                    "-b:v", "8M",
-                    "-maxrate", "8M",
-                    "-bufsize", "16M",
-                    "-pix_fmt", "yuv420p",
-                    "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
-                    "-movflags", "+faststart",
-                    self._output_path,
-                ])
-
-            commands.append([
-                ffmpeg_bin,
-                "-hide_banner", "-loglevel", "warning", "-y",
-                "-threads", "0",
-                "-i", self._input_path,
-                "-map", "0:v:0?", "-map", "0:a:0?",
-                "-sn", "-dn", "-map_metadata", "-1",
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-tune", "zerolatency",
-                "-crf", "28",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
-                "-movflags", "+faststart",
-                self._output_path,
-            ])
+                commands.append(self._ffmpeg_cmd(
+                    ffmpeg_bin, hw=True, input_path=self._input_path, loglevel="warning"
+                ))
+            commands.append(self._ffmpeg_cmd(
+                ffmpeg_bin, hw=False, input_path=self._input_path, loglevel="warning"
+            ))
 
             last_error = ""
             for attempt, cmd in enumerate(commands):
@@ -2681,10 +2692,10 @@ class MediaPlayerDialog(QDialog):
             self._status_lbl.setStyleSheet(
                 "color: {}; font-size: 12px; padding: 6px 12px;".format(T['WARNING']))
             self._dl_bar.hide()
-        elif self._needs_remote_remux and not _PYAV_AVAILABLE:
+        elif self._needs_remote_remux and not _FFMPEG_AVAILABLE:
             self._status_lbl.setText(
-                "This media format needs the 'av' Python package. "
-                "Install it with: pip install av"
+                "Media conversion needs the 'imageio-ffmpeg' Python package. "
+                "Install it with: pip install imageio-ffmpeg"
             )
             self._status_lbl.setStyleSheet(
                 "color: {}; font-size: 12px; padding: 6px 12px;".format(T['WARNING']))
@@ -2692,10 +2703,14 @@ class MediaPlayerDialog(QDialog):
 
         self._set_controls_enabled(False)
 
-        if _MULTIMEDIA_AVAILABLE and self._needs_remote_remux and _PYAV_AVAILABLE:
+        # _needs_remote_remux is always True (see comment above) — every
+        # file, SSH or FTP, goes through the FFmpeg conversion pipeline so
+        # the player always sees a known-good local H.264/AAC MP4. There's
+        # deliberately no fallback to the old direct-stream path here: for
+        # FTP connections self._ssh is None, so _start_stream() would just
+        # fail outright rather than actually play anything.
+        if _MULTIMEDIA_AVAILABLE and self._needs_remote_remux and _FFMPEG_AVAILABLE:
             self._start_remote_remux()
-        elif _MULTIMEDIA_AVAILABLE:
-            self._start_stream()
 
     # ── FTP/FTPS media path: PyAV + bundled FFmpeg ─────────────
     def _start_remote_remux(self):

@@ -30,6 +30,8 @@ import os
 import re
 import time
 import shlex
+import stat as _stat
+import posixpath
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
@@ -37,7 +39,7 @@ from PyQt5.QtWidgets import (
     QFrame, QScrollArea, QTreeWidget, QTreeWidgetItem, QGraphicsDropShadowEffect, QSizePolicy,
 )
 from PyQt5.QtCore import (
-    Qt, QTimer, pyqtSignal, QVariantAnimation, QEasingCurve, QEvent,
+    Qt, QTimer, QThread, pyqtSignal, QVariantAnimation, QEasingCurve, QEvent,
 )
 from PyQt5.QtGui import QColor, QPainter, QPen, QPainterPath
 
@@ -48,6 +50,204 @@ from progress_ring import CircularProgress
 
 
 REFRESH_MS = 3000  # live-dashboard cadence; never overlaps an in-flight refresh
+
+
+class _FTPDashboardWorker(QThread):
+    """Collect richer FTP/FTPS server and current-directory information.
+
+    A short-lived second FTP control connection is used for dashboard reads so
+    the live file-transfer connection is never shared across threads. That
+    avoids interleaving PWD/FEAT/MLSD with an upload/download operation.
+    """
+    done = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, fs, path):
+        super().__init__()
+        self.fs = fs
+        self.path = path
+        self.finished.connect(self.deleteLater)
+
+    @staticmethod
+    def _clean_features(raw):
+        out = []
+        for line in str(raw or "").splitlines():
+            line = line.strip().lstrip("-").strip()
+            if not line or line.upper() in {"211 END", "211 END OF FEAT"} or line.startswith("211") or line.upper() == "FEAT":
+                continue
+            token = line.split()[0] if line else ""
+            if token and token.upper() not in {"211", "FEAT"} and token not in out:
+                out.append(token)
+        return out
+
+    @staticmethod
+    def _format_age(seconds):
+        if seconds is None:
+            return "—"
+        seconds = max(0, int(seconds))
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"{minutes}m"
+        hours = minutes // 60
+        if hours < 24:
+            return f"{hours}h {minutes % 60}m"
+        days = hours // 24
+        return f"{days}d {hours % 24}h"
+
+    def run(self):
+        probe = None
+        try:
+            from ftp_fs import FTPFS
+            if not self.fs or not getattr(self.fs, "_ftp", None):
+                raise RuntimeError("FTP connection is not active")
+
+            # Use a separate control connection for dashboard inspection.
+            probe = FTPFS(
+                self.fs.host,
+                self.fs.port,
+                self.fs.user,
+                self.fs.password,
+                tls=getattr(self.fs, "tls", False),
+                passive=getattr(self.fs, "passive", True),
+                timeout=min(int(getattr(self.fs, "timeout", 15) or 15), 10),
+                initial_path="/",
+            )
+            ftp = probe._ftp
+            current = probe.normalize(self.path or "/")
+
+            started = time.monotonic()
+            try:
+                ftp.voidcmd("NOOP")
+                latency_ms = round((time.monotonic() - started) * 1000.0, 1)
+            except Exception:
+                latency_ms = None
+
+            try:
+                pwd = ftp.pwd() or current
+            except Exception:
+                pwd = current
+
+            welcome = str(getattr(ftp, "welcome", "") or "").strip()
+            try:
+                syst = str(ftp.sendcmd("SYST") or "").strip()
+            except Exception:
+                syst = "Unavailable"
+
+            features = []
+            try:
+                features = self._clean_features(ftp.sendcmd("FEAT"))
+            except Exception:
+                pass
+
+            entries = probe.listdir_attr(current)
+            files = folders = 0
+            total_bytes = 0
+            largest_name = "—"
+            largest_size = 0
+            newest_name = "—"
+            newest_ts = None
+            extensions = {}
+
+            for e in entries:
+                mode = int(getattr(e, "st_mode", 0) or 0)
+                is_dir = _stat.S_ISDIR(mode)
+                name = str(getattr(e, "filename", "") or "")
+                if is_dir:
+                    folders += 1
+                else:
+                    files += 1
+                    size = int(getattr(e, "st_size", 0) or 0)
+                    total_bytes += size
+                    if size > largest_size:
+                        largest_size = size
+                        largest_name = name or "—"
+                    suffix = os.path.splitext(name)[1].lower().lstrip(".")
+                    if suffix:
+                        extensions[suffix] = extensions.get(suffix, 0) + 1
+
+                    # MLSD timestamps are not retained by FTPFS's _FTPStat,
+                    # so fall back to MDTM for a small sample only: the first
+                    # 20 files. This keeps dashboard refreshes lightweight.
+            # Try MDTM for the first few entries to identify a recent file.
+            sample_files = [e.filename for e in entries if not _stat.S_ISDIR(int(getattr(e, "st_mode", 0) or 0))][:20]
+            for name in sample_files:
+                try:
+                    reply = ftp.sendcmd("MDTM " + probe.normalize(posixpath.join(current, name)))
+                    digits = reply.split()[-1]
+                    if digits.isdigit() and len(digits) >= 14:
+                        dt = datetime.strptime(digits[:14], "%Y%m%d%H%M%S")
+                        ts = dt.timestamp()
+                        if newest_ts is None or ts > newest_ts:
+                            newest_ts, newest_name = ts, name
+                except Exception:
+                    continue
+
+            sock = getattr(ftp, "sock", None)
+            tls_version = tls_cipher = None
+            try:
+                if sock is not None and hasattr(sock, "version"):
+                    tls_version = sock.version()
+                if sock is not None and hasattr(sock, "cipher"):
+                    c = sock.cipher()
+                    tls_cipher = c[0] if c else None
+            except Exception:
+                pass
+
+            stats = self.fs
+            uploaded = int(getattr(stats, "uploaded_bytes", 0) or 0)
+            downloaded = int(getattr(stats, "downloaded_bytes", 0) or 0)
+            download_count = int(getattr(stats, "download_count", 0) or 0)
+            upload_count = int(getattr(stats, "upload_count", 0) or 0)
+            connected_at = getattr(stats, "connected_at", None)
+            uptime = time.time() - connected_at if connected_at else None
+
+            ext_top = sorted(extensions.items(), key=lambda kv: (-kv[1], kv[0]))[:8]
+            feature_text = ", ".join(features[:20]) if features else "Not reported"
+
+            self.done.emit({
+                "protocol": "FTPS" if getattr(self.fs, "tls", False) else "FTP",
+                "host": str(getattr(self.fs, "host", "") or ""),
+                "port": int(getattr(self.fs, "port", 21) or 21),
+                "user": str(getattr(self.fs, "user", "") or ""),
+                "tls": bool(getattr(self.fs, "tls", False)),
+                "passive": bool(getattr(self.fs, "passive", True)),
+                "cwd": str(pwd),
+                "system": syst,
+                "welcome": welcome,
+                "files": files,
+                "folders": folders,
+                "total_bytes": total_bytes,
+                "items": len(entries),
+                "largest_name": largest_name,
+                "largest_size": largest_size,
+                "newest_name": newest_name,
+                "newest_age": self._format_age(time.time() - newest_ts) if newest_ts else "Unavailable",
+                "extensions": ext_top,
+                "features": features[:20],
+                "feature_text": feature_text,
+                "latency_ms": latency_ms,
+                "tls_version": tls_version or "—",
+                "tls_cipher": tls_cipher or "—",
+                "encoding": getattr(ftp, "encoding", None) or "—",
+                "timeout": getattr(self.fs, "timeout", None),
+                "uptime": self._format_age(uptime),
+                "downloaded_bytes": downloaded,
+                "uploaded_bytes": uploaded,
+                "download_count": download_count,
+                "upload_count": upload_count,
+                "last_operation": getattr(stats, "last_operation", None) or "None",
+                "last_operation_age": self._format_age(time.time() - stats.last_operation_at) if getattr(stats, "last_operation_at", None) else "—",
+            })
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            if probe is not None:
+                try:
+                    probe.close()
+                except Exception:
+                    pass
 
 
 def _is_light_background():
@@ -1105,6 +1305,15 @@ class DashboardTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.ssh      = None
+        self.ftp      = None
+        self._connection_protocol = None
+        self._connection_host = None
+        self._connection_port = None
+        self._connection_user = None
+        self._ftp_busy = False
+        self._ftp_worker = None
+        self._ftp_snapshot = None
+        self._ftp_current_path = "/"
         self._kube_context = ""
         self._active  = False
         self._busy    = False
@@ -1153,6 +1362,12 @@ class DashboardTab(QWidget):
         self._history_restart_limit = 5
         self._history_pending_limit = 1
 
+        # FTP/FTPS dashboard widgets populated by _build_ui().
+        self._ftp_fields = {}
+        self._ftp_snapshot = {}
+        self._ftp_current_path = "/"
+        self.ftp = None
+
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
 
@@ -1170,7 +1385,123 @@ class DashboardTab(QWidget):
         if self._active and self.ssh:
             self._refresh()
 
+    def set_connection(self, protocol, fs=None, ssh=None, host="", port=None, user=""):
+        """Bind the dashboard to either SSH or FTP/FTPS."""
+        self._connection_protocol = (protocol or "").lower()
+        self._connection_host = host or getattr(fs, "host", "") or ""
+        self._connection_port = port or getattr(fs, "port", None)
+        self._connection_user = user or getattr(fs, "user", "") or ""
+        self._ftp_current_path = "/"
+        self.ftp = fs if self._connection_protocol in ("ftp", "ftps") else None
+        self.set_ssh(ssh) if self._connection_protocol == "ssh" else self._set_ftp_connection(fs)
+
+    def _set_ftp_connection(self, fs):
+        self._snapshot_generation += 1
+        self._busy = False
+        self.ssh = None
+        self.ftp = fs
+        self._history_key = None
+        self._history = []
+        self._last_history_time = 0
+        self._render_history()
+        if fs:
+            self._show_ftp_placeholder()
+            if self._active:
+                self._refresh_ftp()
+                self._timer.start(REFRESH_MS)
+        else:
+            self._timer.stop()
+            self._show_disconnected()
+
+    def set_ftp_path(self, path):
+        self._ftp_current_path = str(path or "/")
+        if self._active and self.ftp:
+            self._refresh_ftp()
+
+    def _show_ftp_placeholder(self):
+        self.disconnected_lbl.hide()
+        self.vm_card["frame"].hide()
+        self.k8s_summary_card["frame"].hide()
+        self.workloads_card["frame"].hide()
+        self.services_card["frame"].hide()
+        self.events_card["frame"].hide()
+        self.history_card["frame"].hide()
+        self.k8s_card["frame"].hide()
+        self.ftp_card["frame"].show()
+        self._update_live_label()
+
+    def _render_ftp_snapshot(self, snap):
+        self._ftp_snapshot = snap
+        vals = {
+            "protocol": snap.get("protocol", "—"),
+            "host": snap.get("host", "—"),
+            "port": str(snap.get("port", "—")),
+            "user": snap.get("user", "—"),
+            "security": "TLS / encrypted" if snap.get("tls") else "Plain FTP",
+            "mode": "Passive" if snap.get("passive") else "Active",
+            "cwd": snap.get("cwd", "—"),
+            "system": snap.get("system", "—"),
+            "items": str(snap.get("items", 0)),
+            "files": str(snap.get("files", 0)),
+            "folders": str(snap.get("folders", 0)),
+            "total": size_fmt(snap.get("total_bytes", 0)),
+            "latency": f'{snap.get("latency_ms"):.0f} ms' if snap.get("latency_ms") is not None else "Unavailable",
+            "uptime": snap.get("uptime", "—"),
+            "encoding": snap.get("encoding", "—"),
+            "timeout": f'{snap.get("timeout")} s' if snap.get("timeout") else "—",
+            "tls_version": snap.get("tls_version", "—"),
+            "tls_cipher": snap.get("tls_cipher", "—"),
+            "largest": f'{snap.get("largest_name", "—")}  ({size_fmt(snap.get("largest_size", 0))})',
+            "newest": f'{snap.get("newest_name", "—")}  ({snap.get("newest_age", "—")} ago)' if snap.get("newest_name") not in (None, "—") else "Unavailable",
+            "downloaded": size_fmt(snap.get("downloaded_bytes", 0)),
+            "uploaded": size_fmt(snap.get("uploaded_bytes", 0)),
+            "download_count": str(snap.get("download_count", 0)),
+            "upload_count": str(snap.get("upload_count", 0)),
+            "last_operation": f'{snap.get("last_operation", "None")} ({snap.get("last_operation_age", "—")} ago)',
+        }
+        for key, value in vals.items():
+            field = self._ftp_fields.get(key)
+            if field is not None:
+                field.setText(value)
+
+        feature_text = snap.get("feature_text") or "Not reported"
+        ext = snap.get("extensions") or []
+        ext_text = "   ·   ".join(f".{k}: {v}" for k, v in ext) if ext else "No file-extension data"
+        self.ftp_features.setText(
+            f'Server banner: {snap.get("welcome") or "Not reported"}\n'
+            f'Features: {feature_text}\n'
+            f'File types: {ext_text}'
+        )
+        self.updated_lbl.setText(f"Updated {time.strftime('%H:%M:%S')}")
+
+    def _refresh_ftp(self):
+        if not self.ftp or not self._active or self._ftp_busy:
+            return
+        self._ftp_busy = True
+        worker = _FTPDashboardWorker(self.ftp, getattr(self, "_ftp_current_path", "/"))
+        self._ftp_worker = worker
+        worker.done.connect(self._on_ftp_snapshot)
+        worker.error.connect(self._on_ftp_error)
+        worker.finished.connect(self._ftp_worker_done)
+        worker.start()
+
+    def _on_ftp_snapshot(self, snap):
+        if self.ftp is None:
+            return
+        self._render_ftp_snapshot(snap)
+        self.status_msg.emit("FTP dashboard updated")
+
+    def _on_ftp_error(self, message):
+        if self.ftp:
+            self.status_msg.emit(f"FTP dashboard: {message}")
+
+    def _ftp_worker_done(self):
+        self._ftp_busy = False
+        self._ftp_worker = None
+
     def set_ssh(self, ssh):
+        self._connection_protocol = "ssh" if ssh else None
+        self.ftp = None
         # Invalidate callbacks from any in-flight collection belonging to the
         # previous SSH connection.
         self._snapshot_generation += 1
@@ -1213,6 +1544,9 @@ class DashboardTab(QWidget):
         self._active = active
         if active and self.ssh:
             self._refresh()          # snap up-to-date immediately on return
+            self._timer.start(REFRESH_MS)
+        elif active and self.ftp:
+            self._refresh_ftp()
             self._timer.start(REFRESH_MS)
         else:
             self._timer.stop()
@@ -1348,6 +1682,110 @@ class DashboardTab(QWidget):
 
         self.vm_card["body"].addLayout(vm_body)
         self._content_layout.addWidget(self.vm_card["frame"])
+
+        # ── FTP / FTPS device dashboard ───────────────────────
+        self.ftp_card = self._make_card("🌐  FTP / FTPS Device")
+        ftp_outer = self.ftp_card["body"]
+
+        def add_metric_row(parent_layout, title, pairs):
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            for key, label in pairs:
+                tile = QFrame()
+                tile.setObjectName("ftp_metric_tile")
+                tl = QVBoxLayout(tile)
+                tl.setContentsMargins(12, 9, 12, 9)
+                tl.setSpacing(2)
+                value = QLabel("—")
+                value.setAlignment(Qt.AlignCenter)
+                value.setStyleSheet(f"color: {_dashboard_text('primary')}; font-size: 17px; font-weight: 700;")
+                caption = QLabel(label)
+                caption.setAlignment(Qt.AlignCenter)
+                caption.setStyleSheet(f"color: {_dashboard_text('muted')}; font-size: 10px; font-weight: 600;")
+                tl.addWidget(value)
+                tl.addWidget(caption)
+                row.addWidget(tile, 1)
+                self._ftp_fields[key] = value
+            parent_layout.addLayout(row)
+
+        add_metric_row(ftp_outer, "", [
+            ("protocol", "Protocol"), ("host", "Server"), ("port", "Port"), ("user", "Username"),
+        ])
+        add_metric_row(ftp_outer, "", [
+            ("security", "Security"), ("mode", "Transfer mode"), ("latency", "Control latency"), ("uptime", "Session uptime"),
+        ])
+
+        conn_grid = QGridLayout()
+        conn_grid.setHorizontalSpacing(24)
+        conn_grid.setVerticalSpacing(8)
+        for row, (key, label) in enumerate([
+            ("cwd", "Current directory"), ("system", "Server system"),
+            ("encoding", "Encoding"), ("timeout", "Timeout"),
+            ("tls_version", "TLS version"), ("tls_cipher", "TLS cipher"),
+        ]):
+            lk = QLabel(label + ":")
+            lk.setStyleSheet(f"color: {_dashboard_text('muted')}; font-size: 12px;")
+            lv = QLabel("—")
+            lv.setWordWrap(True)
+            lv.setStyleSheet(f"color: {_dashboard_text('primary')}; font-size: 12px;")
+            conn_grid.addWidget(lk, row // 2, (row % 2) * 2)
+            conn_grid.addWidget(lv, row // 2, (row % 2) * 2 + 1)
+            conn_grid.setColumnStretch((row % 2) * 2 + 1, 1)
+            self._ftp_fields[key] = lv
+        ftp_outer.addLayout(conn_grid)
+
+        dir_label = QLabel("Current directory")
+        dir_label.setStyleSheet(f"color: {_dashboard_text('muted')}; font-size: 12px; font-weight: 700;")
+        ftp_outer.addWidget(dir_label)
+        add_metric_row(ftp_outer, "", [
+            ("items", "Items"), ("files", "Files"), ("folders", "Folders"), ("total", "Listed size"),
+        ])
+
+        insight_grid = QGridLayout()
+        insight_grid.setHorizontalSpacing(24)
+        insight_grid.setVerticalSpacing(8)
+        for row, (key, label) in enumerate([
+            ("largest", "Largest file"), ("newest", "Newest file"),
+        ]):
+            lk = QLabel(label + ":")
+            lk.setStyleSheet(f"color: {_dashboard_text('muted')}; font-size: 12px;")
+            lv = QLabel("—")
+            lv.setWordWrap(True)
+            lv.setStyleSheet(f"color: {_dashboard_text('primary')}; font-size: 12px;")
+            insight_grid.addWidget(lk, row, 0)
+            insight_grid.addWidget(lv, row, 1)
+            insight_grid.setColumnStretch(1, 1)
+            self._ftp_fields[key] = lv
+        ftp_outer.addLayout(insight_grid)
+
+        activity_label = QLabel("Session activity")
+        activity_label.setStyleSheet(f"color: {_dashboard_text('muted')}; font-size: 12px; font-weight: 700;")
+        ftp_outer.addWidget(activity_label)
+        add_metric_row(ftp_outer, "", [
+            ("downloaded", "Downloaded"), ("uploaded", "Uploaded"),
+            ("download_count", "Downloads"), ("upload_count", "Uploads"),
+        ])
+        last_row = QHBoxLayout()
+        last_lbl = QLabel("Last transfer:")
+        last_lbl.setStyleSheet(f"color: {_dashboard_text('muted')}; font-size: 12px;")
+        last_value = QLabel("—")
+        last_value.setStyleSheet(f"color: {_dashboard_text('primary')}; font-size: 12px;")
+        self._ftp_fields["last_operation"] = last_value
+        last_row.addWidget(last_lbl)
+        last_row.addWidget(last_value, 1)
+        ftp_outer.addLayout(last_row)
+
+        self.ftp_features = QLabel("")
+        self.ftp_features.setWordWrap(True)
+        self.ftp_features.setStyleSheet(f"color: {_dashboard_text('muted')}; font-size: 11px;")
+        ftp_outer.addWidget(self.ftp_features)
+
+        ftp_note = QLabel("CPU, RAM, OS and system disk metrics require an OS-level interface such as SSH; standard FTP does not expose them reliably.")
+        ftp_note.setWordWrap(True)
+        ftp_note.setStyleSheet(f"color: {_dashboard_text('muted')}; font-size: 11px;")
+        ftp_outer.addWidget(ftp_note)
+
+        self._content_layout.addWidget(self.ftp_card["frame"])
 
         # ── Kubernetes cluster overview ─────────────────────
         self.k8s_summary_card = self._make_card("☸  Kubernetes Overview")
@@ -1495,8 +1933,11 @@ class DashboardTab(QWidget):
         self.events_card["frame"].hide()
         self.history_card["frame"].hide()
         self.k8s_card["frame"].hide()
+        self.ftp_card["frame"].hide()
 
         self._apply_styles()
+        for tile in self.findChildren(QFrame, "ftp_metric_tile"):
+            tile.setStyleSheet(f"QFrame#ftp_metric_tile {{ background: {T['BG_PANEL']}; border: 1px solid {T['BORDER']}; border-radius: 10px; }}")
 
     def _make_card(self, title: str) -> dict:
         frame = QFrame()
@@ -1664,7 +2105,7 @@ class DashboardTab(QWidget):
         self._update_live_label()
 
     def _update_live_label(self):
-        if not self.ssh:
+        if not self.ssh and not self.ftp:
             self.live_lbl.setText("⚫  Not connected")
             self.live_lbl.setStyleSheet(f"color: {_dashboard_text("muted")}; font-size: 12px;")
         elif self._active:
@@ -1684,6 +2125,7 @@ class DashboardTab(QWidget):
         self.events_card["frame"].hide()
         self.history_card["frame"].hide()
         self.k8s_card["frame"].hide()
+        self.ftp_card["frame"].hide()
         self.updated_lbl.setText("")
         self._update_live_label()
 
@@ -1696,6 +2138,7 @@ class DashboardTab(QWidget):
         self.events_card["frame"].show()
         self.history_card["frame"].show()
         self.k8s_card["frame"].show()
+        self.ftp_card["frame"].hide()
         self._update_live_label()
 
     # ── Refresh ────────────────────────────────────────────────
@@ -1716,6 +2159,9 @@ class DashboardTab(QWidget):
         blocked until BOTH workers have finished. This prevents a slow
         kubectl snapshot from overlapping the next timer tick.
         """
+        if self.ftp and not self.ssh:
+            self._refresh_ftp()
+            return
         if not self.ssh or not self._active or self._busy:
             return
 

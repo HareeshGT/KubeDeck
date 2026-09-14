@@ -1451,7 +1451,7 @@ class EC2FileManager(QMainWindow):
         self._sudo_user = None
         self._set_connected(True)
         self.k8s_tab.set_ssh(None)
-        self.dashboard_tab.set_ssh(None)
+        self.dashboard_tab.set_connection(protocol, fs=fs, host=host, port=port, user=user)
         self.k8s_tab.clear_connection_info()
         self.sidebar.populate_remote(self.sftp)
         add_recent_instance(host, port, user, "", info["alias"], protocol)
@@ -1482,7 +1482,7 @@ class EC2FileManager(QMainWindow):
         self._conn_password = password
         self._set_connected(True)
         self.k8s_tab.set_ssh(self.ssh)
-        self.dashboard_tab.set_ssh(self.ssh)
+        self.dashboard_tab.set_connection("ssh", ssh=self.ssh, host=host, port=port, user=user)
         # Local (client-side) connection details for the port-tunnel
         # feature, which runs `ssh` on this machine rather than over
         # the remote self.ssh session.
@@ -1614,6 +1614,8 @@ class EC2FileManager(QMainWindow):
             self.history.append(self.current_path)
             self.future.clear()
         self.current_path = resolved
+        if self._conn_protocol in ("ftp", "ftps") and hasattr(self, "dashboard_tab"):
+            self.dashboard_tab.set_ftp_path(resolved)
         self._refresh()
 
     def _go_back(self):
