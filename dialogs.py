@@ -9,6 +9,7 @@ import re
 import shlex
 import time
 import threading
+import sys
 
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -27,6 +28,17 @@ from utils import load_recent_instances, size_fmt, append_terminal_html, append_
 from workers import CommandWorker, _TransferWorker, ScpTransferWorker, track_worker, FileStreamReadWorker, MediaStreamServer, _StreamServerStartWorker, managed_exec_command, open_managed_session, close_managed_session
 from editor_widgets import CodeEditor, make_highlighter, LANG_LABEL
 import ai_assist
+
+# PyAV is optional. Its PyPI wheels bundle FFmpeg, so FTP/FTPS media can be
+# decoded without requiring a separately installed VLC/FFmpeg application.
+# We use PyAV only for metadata probing; FFmpeg from imageio-ffmpeg performs
+# the actual native transcode to a temporary H.264/AAC MP4, then Qt handles playback.
+try:
+    import av as _av
+    _PYAV_AVAILABLE = True
+except Exception:
+    _av = None
+    _PYAV_AVAILABLE = False
 
 # QtMultimedia is an optional Qt component — most PyQt5 installs on macOS
 # and Linux ship it, but guard the import so a system missing the
@@ -143,7 +155,7 @@ class FileTransferDialog(QDialog):
         # transfer still needs the SudoFS two-hop dance (upload to a tmp
         # path, then `sudo mv` over ssh), which a single scp invocation
         # can't express, so that keeps using the SFTP path.
-        use_scp = bool(host) and bool(user) and not sudo_user and (bool(pem) or bool(password))
+        use_scp = (not hasattr(sftp, "_ftp")) and bool(host) and bool(user) and not sudo_user and (bool(pem) or bool(password))
         total_size = None
         if use_scp:
             try:
@@ -274,7 +286,7 @@ class ConnectDialog(QDialog):
         layout.setSpacing(10)
         layout.setContentsMargins(24, 24, 24, 24)
 
-        title = QLabel("SSH Connection")
+        title = QLabel("Server Connection")
         title.setFont(QFont("Segoe UI", 16, QFont.Bold))
         title.setStyleSheet(f"color: {T['TEXT_PRIMARY']}; margin-bottom: 4px;")
         layout.addWidget(title)
@@ -320,6 +332,12 @@ class ConnectDialog(QDialog):
             f"letter-spacing: 1px; padding: 2px 0;"
         )
         layout.addWidget(fields_lbl)
+
+        self.protocol_input = QComboBox()
+        self.protocol_input.addItems(["SSH / SFTP", "FTP", "FTPS"])
+        self.protocol_input.currentIndexChanged.connect(self._protocol_changed)
+        layout.addWidget(QLabel("Protocol"))
+        layout.addWidget(self.protocol_input)
 
         self.host_input  = self._field("ec2-xx-xx-xx-xx.compute.amazonaws.com")
         self.port_input  = self._field("22")
@@ -367,6 +385,17 @@ class ConnectDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
+    def _protocol_changed(self, index):
+        protocol = ("ssh", "ftp", "ftps")[index]
+        self.pem_input.setEnabled(protocol == "ssh")
+        self.password.setEnabled(True)
+        if protocol == "ssh":
+            self.port_input.setText("22")
+        elif protocol == "ftp":
+            self.port_input.setText("21")
+        else:
+            self.port_input.setText("21")
+
     def _field(self, hint: str = "", password: bool = False) -> QLineEdit:
         w = QLineEdit()
         w.setPlaceholderText(hint)
@@ -384,6 +413,8 @@ class ConnectDialog(QDialog):
 
     def _fill_from_recent(self, item):
         inst = item.data(Qt.UserRole)
+        protocol = inst.get("protocol", "ssh").lower()
+        self.protocol_input.setCurrentIndex({"ssh": 0, "ftp": 1, "ftps": 2}.get(protocol, 0))
         self.host_input.setText(inst.get("host", ""))
         self.port_input.setText(inst.get("port", "22"))
         self.user_input.setText(inst.get("user", ""))
@@ -396,6 +427,7 @@ class ConnectDialog(QDialog):
 
     def _fill_localhost(self):
         import getpass
+        self.protocol_input.setCurrentIndex(0)
         self.host_input.setText("127.0.0.1")
         self.port_input.setText("22")
         self.user_input.setText(getpass.getuser())
@@ -403,12 +435,13 @@ class ConnectDialog(QDialog):
         self.alias_input.clear()
 
     def values(self) -> tuple:
-        """Returns (host, port, user, pem, password, alias)."""
+        """Returns (protocol, host, port, user, pem, password, alias)."""
         return (
+            ("ssh", "ftp", "ftps")[self.protocol_input.currentIndex()],
             self.host_input.text().strip(),
             int(self.port_input.text().strip() or "22"),
             self.user_input.text().strip(),
-            self.pem_input.text().strip(),
+            self.pem_input.text().strip() if self.protocol_input.currentIndex() == 0 else "",
             self.password.text().strip(),
             self.alias_input.text().strip(),
         )
@@ -1920,7 +1953,10 @@ class FileEditorDialog(QDialog):
                 if err.strip():
                     raise PermissionError(err.strip())
             else:
-                self._sftp._sftp.putfo(buf, self._remote)
+                if hasattr(self._sftp, "_ftp"):
+                    self._sftp.putfo(buf, self._remote)
+                else:
+                    self._sftp._sftp.putfo(buf, self._remote)
             self._original = content
             self._modified_dot.hide()
             self._set_status("Saved ✓", T['SUCCESS'])
@@ -1996,6 +2032,470 @@ class FileEditorDialog(QDialog):
         dlg = cls(parent, sftp, ssh, remote_path, content=None, sudo_user=sudo_user)
         dlg.exec_()
         return dlg
+
+
+class _RemoteRemuxWorker(QThread):
+    """Download a remote media file over SSH/SFTP or FTP/FTPS, then fully
+    decode and transcode it to a broadly compatible H.264/AAC MP4.
+
+    This path is intentionally identical for SSH and FTP so the built-in
+    player sees the same local, known-good MP4 regardless of transport.
+    """
+
+    progress = pyqtSignal(int, str)
+    ready = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, remote_fs, ssh, remote_path, kind):
+        super().__init__()
+        self._remote_fs = remote_fs
+        self._ssh = ssh
+        self._remote = remote_path
+        self._kind = kind
+        self._cancelled = False
+        self._input_path = None
+        self._output_path = None
+        self.finished.connect(self.deleteLater)
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        import os
+        import tempfile
+        import subprocess
+        import sys
+        import time
+
+        try:
+            if not _PYAV_AVAILABLE:
+                raise RuntimeError("PyAV is not installed. Run: pip install av==18.1.0")
+
+            fd_out, self._output_path = tempfile.mkstemp(
+                prefix="deckhand_media_", suffix=".mp4"
+            )
+            os.close(fd_out)
+
+            total = 0
+            try:
+                total = int(self._remote_fs.stat(self._remote).st_size)
+            except Exception:
+                pass
+
+            # A privileged/sudo SFTP path cannot be safely streamed through the
+            # existing abstraction, so retain the old local-download fallback.
+            if getattr(self._remote_fs, "sudo_user", None):
+                fd_in, self._input_path = tempfile.mkstemp(
+                    prefix="deckhand_media_", suffix=".source"
+                )
+                os.close(fd_in)
+                self.progress.emit(0, "Downloading remote media…")
+                self._remote_fs.get(self._remote, self._input_path)
+                if self._cancelled:
+                    return
+                self.progress.emit(65, "Converting to H.264/AAC…")
+                self._transcode()
+            else:
+                # IMPORTANT: stream the remote file directly into FFmpeg.
+                # Download and decode/encode now happen at the same time instead
+                # of waiting for a full temporary source download first.
+                self.progress.emit(1, "Starting native FFmpeg conversion…")
+                self._transcode_remote(total)
+
+            if self._cancelled:
+                return
+
+            self.progress.emit(100, "Playback ready")
+            self.ready.emit(self._output_path)
+
+        except Exception as exc:
+            if not self._cancelled:
+                self.error.emit(str(exc))
+        finally:
+            if self._cancelled:
+                for path in (self._input_path, self._output_path):
+                    if path:
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+
+    def _ffmpeg_binary(self):
+        try:
+            import imageio_ffmpeg
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as exc:
+            raise RuntimeError(
+                "FFmpeg runtime is not installed. Add imageio-ffmpeg to req.txt "
+                "and run: pip install imageio-ffmpeg"
+            ) from exc
+
+    def _ffmpeg_cmd(self, ffmpeg_bin, hw=True):
+        import sys
+        # Keep output broadly compatible with Qt's player while using a fast
+        # encoder. Fragmented MP4 is not used here because QMediaPlayer's local
+        # file backend may try to seek before the file is finalized.
+        cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
+        if hw and sys.platform == "darwin":
+            cmd += ["-hwaccel", "videotoolbox"]
+        cmd += [
+            "-i", "pipe:0",
+            "-map", "0:v:0?",
+            "-map", "0:a:0?",
+            "-sn", "-dn", "-map_metadata", "-1",
+        ]
+        if hw and sys.platform == "darwin":
+            cmd += [
+                "-c:v", "h264_videotoolbox",
+                "-allow_sw", "1",
+                "-b:v", "6M",
+                "-maxrate", "6M",
+                "-bufsize", "12M",
+            ]
+        else:
+            cmd += [
+                "-threads", "0",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-crf", "28",
+            ]
+        cmd += [
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
+            "-movflags", "+faststart",
+            self._output_path,
+        ]
+        return cmd
+
+    def _transcode_remote(self, total):
+        import os
+        import subprocess
+        import sys
+        import threading
+        import time
+
+        ffmpeg_bin = self._ffmpeg_binary()
+        commands = []
+        if sys.platform == "darwin":
+            commands.append(self._ffmpeg_cmd(ffmpeg_bin, hw=True))
+        commands.append(self._ffmpeg_cmd(ffmpeg_bin, hw=False))
+
+        last_error = ""
+        for attempt, cmd in enumerate(commands):
+            if self._cancelled:
+                return
+            try:
+                if os.path.exists(self._output_path):
+                    os.remove(self._output_path)
+            except OSError:
+                pass
+
+            self.progress.emit(2, "Downloading + converting…")
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            stderr_data = bytearray()
+
+            def drain_stderr():
+                try:
+                    while True:
+                        chunk = proc.stderr.read(4096)
+                        if not chunk:
+                            break
+                        stderr_data.extend(chunk)
+                        if len(stderr_data) > 16000:
+                            del stderr_data[:-16000]
+                except Exception:
+                    pass
+
+            err_thread = threading.Thread(target=drain_stderr, daemon=True)
+            err_thread.start()
+            done = 0
+            last_emit = 0.0
+
+            def write_chunk(data):
+                nonlocal done, last_emit
+                if self._cancelled:
+                    raise InterruptedError
+                proc.stdin.write(data)
+                done += len(data)
+                now = time.monotonic()
+                if total and now - last_emit >= 0.20:
+                    # This is transport progress, while FFmpeg is encoding
+                    # concurrently. It reaches 95 only when the remote bytes
+                    # have all been fed, then FFmpeg finalizes the MP4.
+                    pct = 2 + int((done / total) * 93)
+                    self.progress.emit(min(95, pct),
+                                       "Downloading + converting… {}%".format(
+                                           min(100, int(done * 100 / total))))
+                    last_emit = now
+
+            try:
+                if hasattr(self._remote_fs, "_ftp"):
+                    from ftplib import FTP, FTP_TLS
+                    ftp_cls = FTP_TLS if getattr(self._remote_fs, "tls", False) else FTP
+                    ftp = ftp_cls()
+                    try:
+                        ftp.connect(
+                            self._remote_fs.host,
+                            self._remote_fs.port,
+                            timeout=getattr(self._remote_fs, "timeout", 15),
+                        )
+                        ftp.login(self._remote_fs.user, self._remote_fs.password)
+                        if getattr(self._remote_fs, "tls", False):
+                            ftp.prot_p()
+                        ftp.set_pasv(getattr(self._remote_fs, "passive", True))
+                        remote = self._remote_fs.normalize(self._remote)
+                        ftp.retrbinary("RETR " + remote, write_chunk,
+                                       blocksize=1024 * 1024)
+                    finally:
+                        try:
+                            ftp.quit()
+                        except Exception:
+                            try:
+                                ftp.close()
+                            except Exception:
+                                pass
+                else:
+                    raw = getattr(self._remote_fs, "_sftp", self._remote_fs)
+                    with raw.open(self._remote, "rb") as in_f:
+                        try:
+                            in_f.MAX_REQUEST_SIZE = 1024 * 1024
+                            in_f.prefetch(total or None)
+                        except Exception:
+                            pass
+                        while True:
+                            if self._cancelled:
+                                raise InterruptedError
+                            data = in_f.read(1024 * 1024)
+                            if not data:
+                                break
+                            write_chunk(data)
+            except InterruptedError:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return
+            except Exception as exc:
+                last_error = str(exc)
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                proc.wait()
+                if attempt + 1 < len(commands):
+                    continue
+                raise
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+            rc = proc.wait()
+            err_thread.join(timeout=1.0)
+            if rc == 0 and os.path.exists(self._output_path) and os.path.getsize(self._output_path) > 0:
+                self.progress.emit(99, "Finalizing playback…")
+                return
+
+            last_error = bytes(stderr_data).decode("utf-8", "replace").strip()
+            if not last_error:
+                last_error = "FFmpeg exited with status {}".format(rc)
+            if attempt + 1 < len(commands):
+                continue
+            raise RuntimeError(last_error)
+
+    @staticmethod
+    def _first_stream(container, stream_type):
+        for stream in container.streams:
+            if stream.type == stream_type:
+                return stream
+        return None
+
+    def _transcode(self):
+        """Native FFmpeg transcode: much faster than decoding/encoding frames in Python.
+
+        imageio-ffmpeg supplies a platform FFmpeg binary through pip, so no
+        separate system FFmpeg/VLC installation is required. On macOS we first
+        try VideoToolbox hardware HEVC decode + H.264 encode; if that is not
+        available we fall back to software H.264 with an ultrafast preset.
+
+        Video and audio are transcoded in a single FFmpeg process, avoiding the
+        previous implementation's separate video pass + second demux/decode
+        audio pass.
+        """
+        import os
+        import re
+        import subprocess
+        import time
+
+        try:
+            try:
+                import imageio_ffmpeg
+                ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception as exc:
+                raise RuntimeError(
+                    "FFmpeg runtime is not installed. Add imageio-ffmpeg to req.txt "
+                    "and run: pip install imageio-ffmpeg"
+                ) from exc
+
+            duration_sec = 0.0
+            try:
+                import av
+                with av.open(self._input_path) as probe:
+                    if probe.duration:
+                        duration_sec = float(probe.duration) / av.time_base
+            except Exception:
+                pass
+
+            common = [
+                ffmpeg_bin,
+                "-hide_banner",
+                "-loglevel", "warning",
+                "-y",
+                "-i", self._input_path,
+                "-map", "0:v:0?",
+                "-map", "0:a:0?",
+                "-sn",
+                "-dn",
+                "-map_metadata", "-1",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-ac", "2",
+                "-ar", "48000",
+                "-movflags", "+faststart",
+                self._output_path,
+            ]
+
+            # First choice on macOS: Apple's hardware path for both decode and
+            # encode. The fallback still runs natively in FFmpeg (not Python).
+            commands = []
+            if sys.platform == "darwin":
+                commands.append([
+                    ffmpeg_bin,
+                    "-hide_banner", "-loglevel", "warning", "-y",
+                    "-hwaccel", "videotoolbox",
+                    "-i", self._input_path,
+                    "-map", "0:v:0?", "-map", "0:a:0?",
+                    "-sn", "-dn", "-map_metadata", "-1",
+                    "-c:v", "h264_videotoolbox",
+                    "-allow_sw", "1",
+                    "-realtime", "1",
+                    "-b:v", "8M",
+                    "-maxrate", "8M",
+                    "-bufsize", "16M",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
+                    "-movflags", "+faststart",
+                    self._output_path,
+                ])
+
+            commands.append([
+                ffmpeg_bin,
+                "-hide_banner", "-loglevel", "warning", "-y",
+                "-threads", "0",
+                "-i", self._input_path,
+                "-map", "0:v:0?", "-map", "0:a:0?",
+                "-sn", "-dn", "-map_metadata", "-1",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-crf", "28",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
+                "-movflags", "+faststart",
+                self._output_path,
+            ])
+
+            last_error = ""
+            for attempt, cmd in enumerate(commands):
+                if self._cancelled:
+                    return
+                try:
+                    if os.path.exists(self._output_path):
+                        os.remove(self._output_path)
+                except OSError:
+                    pass
+
+                self.progress.emit(66, "Converting to H.264/AAC…")
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True,
+                )
+
+                last_pct = 66
+                stderr_tail = []
+                t0 = time.monotonic()
+                while True:
+                    if self._cancelled:
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=1.0)
+                        except Exception:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                        return
+
+                    line = proc.stderr.readline()
+                    if line:
+                        stderr_tail.append(line.rstrip())
+                        stderr_tail = stderr_tail[-20:]
+                        # FFmpeg warning lines are not progress, but keep an eye
+                        # out for time=00:xx:xx so the UI advances continuously.
+                        m = re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
+                        if m and duration_sec > 0:
+                            cur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                            pct = 66 + int(max(0.0, min(1.0, cur / duration_sec)) * 33)
+                            if pct != last_pct:
+                                last_pct = pct
+                                elapsed = max(time.monotonic() - t0, 0.001)
+                                speed_note = ""
+                                # imageio-ffmpeg's stderr can include speed=x.xx.
+                                sm = re.search(r"speed=\s*([0-9.]+)x", line)
+                                if sm:
+                                    speed_note = " • {}x".format(sm.group(1))
+                                self.progress.emit(pct, "Converting… {}%{}".format(
+                                    max(0, int((pct - 66) * 100 / 33)), speed_note))
+                        continue
+
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.03)
+
+                rc = proc.wait()
+                if rc == 0 and os.path.exists(self._output_path) and os.path.getsize(self._output_path) > 0:
+                    self.progress.emit(99, "Finalizing playback…")
+                    return
+
+                last_error = "\n".join(stderr_tail).strip() or "FFmpeg exited with status {}".format(rc)
+                # If VideoToolbox failed, retry immediately with the software path.
+                if attempt + 1 < len(commands):
+                    continue
+                raise RuntimeError(last_error)
+        finally:
+            # ffmpeg created the converted file in _output_path. The caller will
+            # remove it when the player dialog closes.
+            pass
 
 
 # ─── Media player dialog ───────────────────────────────────────
@@ -2151,7 +2651,16 @@ class MediaPlayerDialog(QDialog):
         c.addLayout(btn_row)
         lay.addWidget(controls)
 
+        self._is_ftp_media = hasattr(self._sftp, "_ftp")
+        # Use one consistent playback pipeline for both SSH/SFTP and FTP/FTPS.
+        # Every remote audio/video file is downloaded, decoded and transcoded
+        # to H.264/AAC MP4 before it is handed to QMediaPlayer.
+        self._needs_remote_remux = True
         self._player = None
+        self._remote_remux_worker = None
+        self._remote_temp_input = None
+        self._remote_temp_output = None
+
         if _MULTIMEDIA_AVAILABLE:
             self._player = QMediaPlayer(self)
             if self._video_widget is not None:
@@ -2163,7 +2672,8 @@ class MediaPlayerDialog(QDialog):
             self._player.bufferStatusChanged.connect(self._on_buffer_status)
             self._player.error.connect(self._on_player_error)
             self._vol_slider.valueChanged.connect(self._player.setVolume)
-        else:
+
+        if not _MULTIMEDIA_AVAILABLE:
             self._status_lbl.setText(
                 "Media playback isn't available - this Qt install is missing "
                 "QtMultimedia. You can still download the file instead."
@@ -2171,11 +2681,66 @@ class MediaPlayerDialog(QDialog):
             self._status_lbl.setStyleSheet(
                 "color: {}; font-size: 12px; padding: 6px 12px;".format(T['WARNING']))
             self._dl_bar.hide()
+        elif self._needs_remote_remux and not _PYAV_AVAILABLE:
+            self._status_lbl.setText(
+                "This media format needs the 'av' Python package. "
+                "Install it with: pip install av"
+            )
+            self._status_lbl.setStyleSheet(
+                "color: {}; font-size: 12px; padding: 6px 12px;".format(T['WARNING']))
+            self._dl_bar.hide()
 
         self._set_controls_enabled(False)
 
-        if _MULTIMEDIA_AVAILABLE:
+        if _MULTIMEDIA_AVAILABLE and self._needs_remote_remux and _PYAV_AVAILABLE:
+            self._start_remote_remux()
+        elif _MULTIMEDIA_AVAILABLE:
             self._start_stream()
+
+    # ── FTP/FTPS media path: PyAV + bundled FFmpeg ─────────────
+    def _start_remote_remux(self):
+        self._status_lbl.setText("Downloading remote media…")
+        self._dl_bar.show()
+        self._dl_bar.setRange(0, 100)
+        self._dl_bar.setValue(0)
+        self._remote_remux_worker = _RemoteRemuxWorker(
+            self._sftp, self._ssh, self._remote, self._kind
+        )
+        self._remote_remux_worker.progress.connect(self._on_remote_remux_progress)
+        self._remote_remux_worker.ready.connect(self._on_remote_remux_ready)
+        self._remote_remux_worker.error.connect(self._on_remote_remux_error)
+        self._remote_remux_worker.finished.connect(self._on_remote_remux_finished)
+        self._remote_remux_worker.start()
+
+    def _on_remote_remux_progress(self, percent, text):
+        try:
+            self._dl_bar.setValue(max(0, min(100, int(percent))))
+            self._status_lbl.setText(text)
+        except RuntimeError:
+            pass
+
+    def _on_remote_remux_ready(self, output_path):
+        try:
+            self._remote_temp_output = output_path
+            self._dl_bar.hide()
+            self._status_lbl.setText("Ready — playing")
+            self._set_controls_enabled(True)
+            self._player.setMedia(QMediaContent(QUrl.fromLocalFile(output_path)))
+            self._player.play()
+        except RuntimeError:
+            pass
+
+    def _on_remote_remux_error(self, msg):
+        try:
+            self._dl_bar.hide()
+            self._status_lbl.setText("Media preparation failed: {}".format(msg))
+            self._status_lbl.setStyleSheet(
+                "color: {}; font-size: 12px; padding: 6px 12px;".format(T['DANGER']))
+        except RuntimeError:
+            pass
+
+    def _on_remote_remux_finished(self):
+        self._remote_remux_worker = None
 
     # ── background stream startup ─────────────────────────────
     def _start_stream(self):
@@ -2198,8 +2763,9 @@ class MediaPlayerDialog(QDialog):
             else:
                 self._status_lbl.setText("Streaming (seek limited under sudo)")
             self._set_controls_enabled(True)
-            self._player.setMedia(QMediaContent(QUrl(url)))
-            self._player.play()
+            if self._player:
+                self._player.setMedia(QMediaContent(QUrl(url)))
+                self._player.play()
         except RuntimeError:
             pass
 
@@ -2296,6 +2862,22 @@ class MediaPlayerDialog(QDialog):
 
     # ── cleanup ──────────────────────────────────────────────
     def closeEvent(self, event):
+        if self._remote_remux_worker:
+            try:
+                self._remote_remux_worker.cancel()
+            except Exception:
+                pass
+            self._remote_remux_worker = None
+
+        # Remove temporary FTP media files created by the PyAV path.
+        import os as _os
+        for _path in (self._remote_temp_input, self._remote_temp_output):
+            if _path:
+                try:
+                    _os.remove(_path)
+                except OSError:
+                    pass
+
         # Disconnect the player's own signals first so nothing it fires
         # while winding down (position/duration/buffer/error updates)
         # can land on a dialog that's mid-close.
@@ -2324,17 +2906,39 @@ class MediaPlayerDialog(QDialog):
         # let it finish naturally (it cleans itself up via
         # finished -> deleteLater). Waiting briefly here avoids racing
         # MediaStreamServer.stop() against the worker's own start().
-        if self._start_worker:
+        # The QThread object may already have been destroyed by Qt via
+        # finished -> deleteLater before the dialog gets its closeEvent.
+        # Never call methods such as isRunning() on a potentially-deleted
+        # wrapper; even querying it can raise RuntimeError and abort PyQt.
+        worker = self._start_worker
+        self._start_worker = None
+        if worker is not None:
             try:
-                self._start_worker.ready.disconnect(self._on_stream_ready)
-                self._start_worker.error.disconnect(self._on_stream_error)
-            except Exception:
+                try:
+                    worker.ready.disconnect(self._on_stream_ready)
+                except (TypeError, RuntimeError):
+                    pass
+                try:
+                    worker.error.disconnect(self._on_stream_error)
+                except (TypeError, RuntimeError):
+                    pass
+                try:
+                    worker.requestInterruption()
+                except RuntimeError:
+                    worker = None
+                if worker is not None:
+                    try:
+                        worker.wait(1500)
+                    except RuntimeError:
+                        pass
+            except RuntimeError:
                 pass
-            if self._start_worker.isRunning():
-                self._start_worker.wait(1500)
 
         if self._stream_server:
-            self._stream_server.stop()
+            try:
+                self._stream_server.stop()
+            except Exception:
+                pass
 
         event.accept()
 

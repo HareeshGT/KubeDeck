@@ -26,7 +26,8 @@ import themes as _themes
 from themes import T, THEMES, apply_theme_vars, build_qss, apply_qss_to, save_settings
 from utils import classify, icon_for, size_fmt, add_recent_instance, monospace_font
 from sudo_fs import SudoFS
-from workers import CommandWorker, ConnectWorker, ConnectionHealthWorker, FileStreamReadWorker, track_worker, managed_exec_command, close_ssh_connection_pool
+from ftp_fs import FTPFS
+from workers import CommandWorker, ConnectWorker, FTPConnectionWorker, ConnectionHealthWorker, FileStreamReadWorker, track_worker, managed_exec_command, close_ssh_connection_pool
 from dialogs import ConnectDialog, FileTransferDialog, FileEditorDialog, FileExecDialog, SearchDialog, ConnectingDialog, MediaPlayerDialog, AIExplainDialog
 import ai_assist
 from sidebar import Sidebar
@@ -692,6 +693,7 @@ class EC2FileManager(QMainWindow):
         self._conn_user    = None  # type: Optional[str]
         self._conn_pem     = None  # type: Optional[str]
         self._conn_password = None  # type: Optional[str]
+        self._conn_protocol = "ssh"
         self._terminal_cwd = None  # type: Optional[str]
         # "Analyze with AI" AI feature state for the plain SSH terminal —
         # mirrors ExecDialog's equivalent state (see dialogs.py).
@@ -1410,37 +1412,56 @@ class EC2FileManager(QMainWindow):
         dlg = ConnectDialog(self)
         if dlg.exec_() != QDialog.Accepted:
             return
-        # Unpack 6-tuple — alias is the new 6th value
-        host, port, user, pem, password, alias = dlg.values()
+        protocol, host, port, user, pem, password, alias = dlg.values()
         if not host or not user:
             QMessageBox.warning(self, "Missing info", "Host and username are required.")
             return
 
-        # Stash the details needed once the background worker reports back.
-        # ConnectWorker prioritizes password over pem whenever both are
-        # present (see ConnectWorker.run()) — so if we blindly stashed
-        # whatever's in the pem field, a password-authenticated session
-        # with leftover/stale text in the pem field would later have
-        # FileTransferDialog pick the fast scp path using a key that has
-        # nothing to do with how this session actually authenticated,
-        # and every upload/download would fail. Only keep the pem here if
-        # it's actually the credential that's about to be used.
         effective_pem = pem if not password else ""
-        self._pending_conn = dict(host=host, port=port, user=user, pem=effective_pem,
-                                   password=password, alias=alias)
+        self._pending_conn = dict(protocol=protocol, host=host, port=port, user=user,
+                                  pem=effective_pem, password=password, alias=alias)
 
         self.progress.show()
         self.status.showMessage("Connecting to {}…".format(host))
-
         self._connecting_dlg = ConnectingDialog(self, host)
         self._connecting_dlg.show()
 
-        # Run the SSH handshake off the UI thread so the "Connecting…" dialog
-        # keeps animating instead of freezing for the duration of the call.
-        self._connect_worker = ConnectWorker(host, port, user, pem, password)
-        self._connect_worker.connected.connect(self._on_connect_success)
+        if protocol == "ssh":
+            self._connect_worker = ConnectWorker(host, port, user, pem, password)
+            self._connect_worker.connected.connect(self._on_connect_success)
+        else:
+            self._connect_worker = FTPConnectionWorker(
+                host, port, user, password, tls=(protocol == "ftps"), passive=True
+            )
+            self._connect_worker.connected.connect(self._on_ftp_connect_success)
         self._connect_worker.error.connect(self._on_connect_error)
         self._connect_worker.start()
+
+    def _on_ftp_connect_success(self, fs, home):
+        info = self._pending_conn
+        host, port, user = info["host"], info["port"], info["user"]
+        protocol = info["protocol"]
+        self.ssh = None
+        self.sftp = fs
+        self._conn_protocol = protocol
+        self.host_label = info["alias"] if info["alias"] else "{}@{}".format(user, host)
+        self._conn_host, self._conn_port = host, port
+        self._conn_user, self._conn_pem = user, ""
+        self._conn_password = info.get("password")
+        self._sudo_user = None
+        self._set_connected(True)
+        self.k8s_tab.set_ssh(None)
+        self.dashboard_tab.set_ssh(None)
+        self.k8s_tab.clear_connection_info()
+        self.sidebar.populate_remote(self.sftp)
+        add_recent_instance(host, port, user, "", info["alias"], protocol)
+        self._nav_to(home or "/")
+        self._terminal_cwd = None
+        self.terminal.clear()
+        self.terminal.write_output("Connected to {} via {}.".format(self.host_label, protocol.upper()))
+        self.terminal.show_prompt("(FTP) $ ")
+        self.status.showMessage("Connected successfully")
+        self._finish_connect_ui()
 
     def _on_connect_success(self, ssh, sftp, home):
         info = self._pending_conn
@@ -1449,6 +1470,7 @@ class EC2FileManager(QMainWindow):
 
         self.ssh  = ssh
         self.sftp = SudoFS(sftp, ssh)
+        self._conn_protocol = "ssh"
         # Use alias as the display label when set, else user@host
         self.host_label = alias if alias else "{}@{}".format(user, host)
         self._conn_host, self._conn_port = host, port
@@ -1467,7 +1489,7 @@ class EC2FileManager(QMainWindow):
         self.k8s_tab.set_connection_info(host, port, user, pem)
         self.sidebar.populate_remote(self.sftp)
         # Pass alias to persist it in the CSV
-        add_recent_instance(host, port, user, pem, alias)
+        add_recent_instance(host, port, user, pem, alias, "ssh")
         self._nav_to("")
         self._terminal_cwd = home or None
         self.terminal.clear()
@@ -1563,6 +1585,7 @@ class EC2FileManager(QMainWindow):
         self._sudo_user = None
         self._conn_host = self._conn_user = self._conn_pem = None
         self._conn_password = None
+        self._conn_protocol = "ssh"
         self._conn_port = 22
         self.k8s_tab.set_ssh(None)
         self.k8s_tab.clear_connection_info()

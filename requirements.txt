@@ -11,6 +11,9 @@ PyQt5>=5.15,<6
 paramiko>=3.0
 SpeechRecognition>=3.10,<4
 PyAudio>=0.2.13
+python-vlc==3.0.21203
+av==18.1.0
+imageio-ffmpeg==0.6.0
 
 # ── Ops Mind spoken status narration (k8s_ai_ops.py) ──
 # Offline, on-device text-to-speech — NOT a cloud/AI voice API. pyobjc is

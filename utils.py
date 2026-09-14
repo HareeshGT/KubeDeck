@@ -12,7 +12,7 @@ RECENT_FILE = os.path.join(APP_DIR, "recent.csv")
 os.makedirs(APP_DIR, exist_ok=True)
 
 RECENT_MAX    = 50
-RECENT_FIELDS = ["host", "port", "user", "pem", "alias"]   # alias is 5th column
+RECENT_FIELDS = ["host", "port", "user", "pem", "alias", "protocol"]   # alias is 5th column
 
 
 # ─── Recent instances ─────────────────────────────────────────
@@ -27,8 +27,9 @@ def load_recent_instances() -> list:
                     continue
                 host, port, user, pem = row[:4]
                 alias = row[4].strip() if len(row) > 4 else ""
+                protocol = row[5].strip().lower() if len(row) > 5 else "ssh"
                 rows.append({"host": host, "port": port, "user": user,
-                             "pem": pem, "alias": alias})
+                             "pem": pem, "alias": alias, "protocol": protocol or "ssh"})
         return rows
     except Exception:
         return []
@@ -45,12 +46,13 @@ def save_recent_instances(instances: list):
                     inst.get("user", ""),
                     inst.get("pem", ""),
                     inst.get("alias", ""),
+                    inst.get("protocol", "ssh"),
                 ])
     except Exception:
         pass
 
 
-def add_recent_instance(host: str, port: int, user: str, pem: str, alias: str = ""):
+def add_recent_instance(host: str, port: int, user: str, pem: str, alias: str = "", protocol: str = "ssh"):
     instances = load_recent_instances()
     # Remove any existing entry for the same host+port+user
     instances = [
@@ -63,6 +65,7 @@ def add_recent_instance(host: str, port: int, user: str, pem: str, alias: str = 
         "user":  user,
         "pem":   pem or "",
         "alias": alias or "",
+        "protocol": protocol or "ssh",
     })
     save_recent_instances(instances[:RECENT_MAX])
 

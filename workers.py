@@ -483,6 +483,30 @@ class ConnectWorker(QThread):
             self.error.emit(str(e))
 
 
+class FTPConnectionWorker(QThread):
+    """Connects to FTP or explicit FTPS without blocking the Qt UI."""
+    connected = pyqtSignal(object, str)   # FTPFS, initial path
+    error = pyqtSignal(str)
+
+    def __init__(self, host, port, user, password, tls=False, passive=True):
+        super().__init__()
+        self.host, self.port, self.user, self.password = host, port, user, password
+        self.tls, self.passive = tls, passive
+        self.finished.connect(self.deleteLater)
+
+    def run(self):
+        fs = None
+        try:
+            from ftp_fs import FTPFS
+            fs = FTPFS(self.host, self.port, self.user, self.password, tls=self.tls, passive=self.passive)
+            self.connected.emit(fs, fs.normalize("/"))
+        except Exception as e:
+            if fs is not None:
+                try: fs.close()
+                except Exception: pass
+            self.error.emit(str(e))
+
+
 class ConnectionHealthWorker(QThread):
     """Watches the live SSH transport and warns the UI before the session
     is actually gone, instead of the app only finding out when the next
@@ -669,12 +693,36 @@ class FileStreamReadWorker(QThread):
 
     def run(self):
         try:
-            if self._sudo_user:
+            if hasattr(self._sftp, "_ftp"):
+                self._run_ftp_stream()
+            elif self._sudo_user:
                 self._run_sudo_stream()
             else:
                 self._run_direct_stream()
         except Exception as e:
             self.finished_err.emit(str(e))
+
+    def _run_ftp_stream(self):
+        try:
+            total = self._sftp.stat(self._remote).st_size
+        except Exception:
+            total = 0
+        done = 0
+        out = bytearray()
+        def cb(data):
+            nonlocal done
+            if self._cancelled or (self._max_bytes and done >= self._max_bytes):
+                return
+            take = data
+            if self._max_bytes:
+                take = data[:max(0, self._max_bytes - done)]
+            if take:
+                done += len(take)
+                self.chunk_ready.emit(bytes(take))
+                self.progress.emit(done, total)
+        self._sftp._ftp.retrbinary("RETR " + self._sftp.normalize(self._remote), cb, blocksize=self.CHUNK_SIZE)
+        if not self._cancelled:
+            self.finished_ok.emit(done)
 
     # ── plain SFTP path — real chunked reads with real progress ──
     def _run_direct_stream(self):
@@ -790,6 +838,16 @@ class _TransferWorker(QThread):
 
     # ── helpers ──────────────────────────────────────────────
     def _download(self):
+        if hasattr(self._sftp, "_ftp"):
+            try: total = self._sftp.stat(self._remote).st_size
+            except Exception: total = 0
+            done = [0]
+            with open(self._local, "wb") as f:
+                def cb(data):
+                    if self._cancelled: return
+                    f.write(data); done[0] += len(data); self.progress.emit(done[0], total)
+                self._sftp._ftp.retrbinary("RETR " + self._sftp.normalize(self._remote), cb, blocksize=256*1024)
+            return
         if self._sftp.sudo_user:
             # sudo path — stream via cat
             try:
@@ -850,35 +908,24 @@ class _TransferWorker(QThread):
                         self.progress.emit(done, total)
 
     def _upload(self):
-        total = os.path.getsize(self._local)
-        chunk = 65536
-        done  = 0
-        if self._sftp.sudo_user:
-            self.progress.emit(0, total)
-            self._sftp.put(self._local, self._remote)
-            self.progress.emit(total, total)
-        else:
-            # Same round-trip problem as the download path, mirrored for
-            # writes: set_pipelined(True) stops paramiko from waiting for
-            # each write's server ack before sending the next chunk, so
-            # writes queue up back-to-back instead of stalling on
-            # latency. This is what paramiko's own sftp.put() does
-            # internally, too.
-            REQUEST_SIZE = 256 * 1024
-            chunk = REQUEST_SIZE
-            with open(self._local, "rb") as local_f:
-                with self._sftp._sftp.open(self._remote, "wb") as remote_f:
-                    remote_f.MAX_REQUEST_SIZE = REQUEST_SIZE
-                    remote_f.set_pipelined(True)
-                    while True:
-                        if self._cancelled:
-                            return
-                        buf = local_f.read(chunk)
-                        if not buf:
-                            break
-                        remote_f.write(buf)
-                        done += len(buf)
-                        self.progress.emit(done, total)
+        if hasattr(self._sftp, "_ftp"):
+            total = os.path.getsize(self._local)
+            done = [0]
+
+            with open(self._local, "rb") as f:
+                def cb(data):
+                    if self._cancelled:
+                        return
+                    done[0] += len(data)
+                    self.progress.emit(done[0], total)
+
+                self._sftp._ftp.storbinary(
+                    "STOR " + self._sftp.normalize(self._remote),
+                    f,
+                    blocksize=256 * 1024,
+                    callback=cb,
+                )
+            return
 
 class _PtyProc:
     """Wraps an os.forkpty() child so the read loop below can treat it the
