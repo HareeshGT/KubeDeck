@@ -429,8 +429,12 @@ PROVIDERS = {
         "was_truncated": _groq_truncated,
 
         "model_samples": [
+            "meta-llama/llama-prompt-guard-2-22m",
+            "meta-llama/llama-prompt-guard-2-86m",
             "openai/gpt-oss-20b",
             "openai/gpt-oss-120b",
+            "whisper-large-v3",
+            "whisper-large-v3-turbo",
         ],
 
         "default_model": "openai/gpt-oss-120b",
