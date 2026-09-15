@@ -110,6 +110,11 @@ DELETE_RESOURCES = {
 }
 READ_RESOURCES = ALLOWED_RESOURCES
 
+# Resource types whose "get" data is a key/value map, so a "get" request can
+# optionally target a single "key" within them instead of the whole object
+# (e.g. "get the value of key COW_DB_USER from the cow-env configmap").
+KEY_VALUE_RESOURCES = {"configmap", "secret"}
+
 MIN_REPLICAS = 0
 MAX_REPLICAS = 100
 
@@ -412,12 +417,33 @@ Rules:
     return clarification_required. If a numeric delta is given (e.g. "by 2",
     "by one"), use mode "relative" instead of asking for clarification.
 14. If the request is unsupported, return unsupported.
+15. If the user asks for the value of a specific key inside a configmap or
+    secret (e.g. "get the value of key COW_DB_USER from the cow-env
+    configmap", "what is DB_HOST set to in secret app-secrets"), return
+    action "get" with resource "configmap" or "secret" as appropriate,
+    PLUS a "key" field containing exactly that key name. Do not invent a
+    key name — only set "key" when the user names one. If the user asks
+    for a configmap/secret WITHOUT naming a specific key, omit "key"
+    entirely so the whole resource is returned.
+16. If the user asks for TWO OR MORE specific keys from the same configmap
+    or secret (e.g. "get the values of the keys COW_DB_NAME and
+    MINIO_ACCESS_KEY from the cow-env configmap"), return action "get"
+    with a "keys" field: a JSON array of exactly those key names, in the
+    order the user asked for them. Use "keys" (plural, array) instead of
+    "key" whenever more than one key is named — this is fully supported,
+    do NOT ask for clarification or pick just one.
 
 Valid absolute-scale response example:
 {{"action":"scale","resource":"deployment","name":"my-app","namespace":"test-cc","mode":"absolute","replicas":5}}
 
 Valid relative-scale response example (scale up by 2):
 {{"action":"scale","resource":"deployment","name":"my-app","namespace":"test-cc","mode":"relative","delta":2}}
+
+Valid get-configmap-key response example (get the value of key COW_DB_USER from the cow-env configmap):
+{{"action":"get","resource":"configmap","name":"cow-env","namespace":"test-cc","key":"COW_DB_USER"}}
+
+Valid get-configmap-multi-key response example (get the values of keys COW_DB_NAME and MINIO_ACCESS_KEY from the cow-env configmap):
+{{"action":"get","resource":"configmap","name":"cow-env","namespace":"test-cc","keys":["COW_DB_NAME","MINIO_ACCESS_KEY"]}}
 
 Valid relative-scale response example (scale down by 1):
 {{"action":"scale","resource":"deployment","name":"my-app","namespace":"test-cc","mode":"relative","delta":-1}}
@@ -1187,13 +1213,46 @@ def validate_action(data: dict):
     if action == "delete" and resource not in DELETE_RESOURCES:
         raise ValueError(f"Cannot delete Kubernetes resource type: {resource}")
 
-    return {
+    result = {
         "kind": "operation",
         "action": action,
         "resource": resource,
         "name": name,
         "namespace": namespace,
     }
+
+    # "get" on a configmap/secret may target one data key
+    # (e.g. "get the value of key COW_DB_USER from the cow-env configmap")
+    # or several ("get the values of keys A and B from the cow-env
+    # configmap"). Any "key"/"keys" supplied for other actions/resources is
+    # silently ignored — scale/restart/delete/describe/rollout_status have
+    # no notion of a key, and get on a non-key-value resource (pod,
+    # deployment, ...) returns the whole object as before.
+    def _clean_key(raw_key) -> str:
+        k = str(raw_key or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,253}", k):
+            raise ValueError(f"Invalid configmap/secret key returned by AI: {k}")
+        return k
+
+    if action == "get" and resource in KEY_VALUE_RESOURCES:
+        keys_raw = data.get("keys")
+        if isinstance(keys_raw, list) and keys_raw:
+            cleaned, seen = [], set()
+            for raw_key in keys_raw:
+                k = _clean_key(raw_key)
+                if k not in seen:
+                    seen.add(k)
+                    cleaned.append(k)
+            if len(cleaned) == 1:
+                result["key"] = cleaned[0]
+            else:
+                result["keys"] = cleaned
+        else:
+            key = str(data.get("key") or "").strip()
+            if key:
+                result["key"] = _clean_key(key)
+
+    return result
 
 
 def build_kubectl_command(action: dict) -> str:
@@ -1217,6 +1276,53 @@ def build_kubectl_command(action: dict) -> str:
     if operation == "delete":
         return f"{base} delete {resource}/{name}"
     if operation == "get":
+        keys = action.get("keys")
+        if keys and resource in KEY_VALUE_RESOURCES:
+            # Multiple keys requested from the same configmap/secret. Query
+            # each key with its own kubectl call (own exit code) rather
+            # than one combined jsonpath template, because
+            # --allow-missing-template-keys=false aborts a combined
+            # template at the FIRST missing key — which would silently
+            # hide results for every key after it. Emits one
+            # "KEY=value" line per key, or "KEY=<<<MISSING>>>" when that
+            # key's own kubectl lookup fails (e.g. key not present),
+            # decoding secret values only after confirming kubectl
+            # succeeded (a pipe's exit status would otherwise reflect
+            # base64's exit code, not kubectl's).
+            key_list = " ".join(shlex.quote(k) for k in keys)
+            get_one = (
+                f'{base} get {resource}/{name} -o jsonpath="{{.data.$k}}" '
+                f"--allow-missing-template-keys=false 2>/dev/null"
+            )
+            decode_stage = (
+                'v=$(printf "%s" "$v" | base64 --decode); '
+                if resource == "secret" else ""
+            )
+            return (
+                f"for k in {key_list}; do "
+                f"v=$({get_one}); st=$?; "
+                f'if [ "$st" -eq 0 ]; then {decode_stage}'
+                f'printf "%s=%s\\n" "$k" "$v"; '
+                f'else printf "%s=<<<MISSING>>>\\n" "$k"; fi; '
+                f"done"
+            )
+        key = action.get("key")
+        if key and resource in KEY_VALUE_RESOURCES:
+            jsonpath = shlex.quote(f"{{.data.{key}}}")
+            # --allow-missing-template-keys=false makes kubectl itself fail
+            # (non-zero exit, "no entry for key" on stderr) when the key
+            # doesn't exist, instead of the default behaviour of silently
+            # printing nothing — which would be indistinguishable from a
+            # key that exists but is set to an empty string.
+            get_cmd = (
+                f"{base} get {resource}/{name} "
+                f"-o jsonpath={jsonpath} --allow-missing-template-keys=false"
+            )
+            if resource == "secret":
+                # secret data values are base64-encoded in the API object;
+                # decode so the output matches what configmap returns.
+                get_cmd += " | base64 --decode"
+            return get_cmd
         return f"{base} get {resource}/{name}"
     if operation == "describe":
         return f"{base} describe {resource}/{name}"
@@ -1249,6 +1355,19 @@ def operation_description(action: dict) -> str:
     if operation == "delete":
         return f'Delete {resource} "{name}" in namespace "{namespace}"'
     if operation == "get":
+        keys = action.get("keys")
+        if keys:
+            key_list = ", ".join(f'"{k}"' for k in keys)
+            return (
+                f"Get keys {key_list} from {resource} "
+                f'"{name}" in namespace "{namespace}"'
+            )
+        key = action.get("key")
+        if key:
+            return (
+                f'Get key "{key}" from {resource} "{name}" '
+                f'in namespace "{namespace}"'
+            )
         return f'Get {resource} "{name}" in namespace "{namespace}"'
     if operation == "describe":
         return f'Describe {resource} "{name}" in namespace "{namespace}"'
@@ -1290,6 +1409,12 @@ def _spoken_start_phrase(action: dict) -> str:
     if operation == "delete":
         return f"Deleting {resource} {name}."
     if operation == "get":
+        keys = action.get("keys")
+        if keys:
+            return f"Getting {len(keys)} keys from {resource} {name}."
+        key = action.get("key")
+        if key:
+            return f"Getting key {key} from {resource} {name}."
         return f"Getting {resource} {name}."
     if operation == "describe":
         return f"Describing {resource} {name}."
@@ -2418,6 +2543,83 @@ class K8sAIOpsWidget(QWidget):
     ):
         output = (output or "").strip()
         error_text = (err or "").strip()
+
+        # A "get <keys> from configmap/secret" (plural — see the "keys"
+        # multi-key branch of build_kubectl_command) always exits 0 from
+        # its shell for-loop; each key's own presence/absence is encoded
+        # per-line as "KEY=value" or "KEY=<<<MISSING>>>" instead of via
+        # the overall exit code. Parse those lines here, report any
+        # missing keys plainly, and still show whichever keys resolved.
+        if action.get("action") == "get" and action.get("keys"):
+            requested = list(action["keys"])
+            found, missing = {}, []
+            for line in output.splitlines():
+                if "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                if v == "<<<MISSING>>>":
+                    missing.append(k)
+                else:
+                    found[k] = v
+            # Any requested key with no line at all (unexpected shell/SSH
+            # hiccup) is reported missing too, rather than silently dropped.
+            missing.extend(k for k in requested if k not in found and k not in missing)
+
+            if found:
+                lines = [f"{k}={found[k]}" for k in requested if k in found]
+                self.output.append(
+                    f'<br><span style="color:{T["TEXT_DIM"]}">kubectl output:</span><br>'
+                    f'<span style="color:{T["TEXT_PRIMARY"]}">'
+                    f'{self._escape_html(chr(10).join(lines)).replace(chr(10), "<br>")}'
+                    f'</span>'
+                )
+            if missing:
+                missing_list = ", ".join(missing)
+                note = f"Key not found: {missing_list} in resource. Check the key name and try again."
+                self._write_error(f"\n✗ {note}" if not found else f"\n⚠ {note}")
+            summary = ", ".join(f"{k}={found[k]}" for k in requested if k in found)
+            if missing:
+                summary = (summary + "; " if summary else "") + "missing: " + ", ".join(missing)
+            if found:
+                self._remember_operation(action, command, "success", summary)
+                self._write_success("\n✓ Kubernetes operation completed successfully.")
+                self._speak(_spoken_done_phrase(action, success=True))
+                self.operation_finished.emit()
+            else:
+                self._remember_operation(action, command, "failed", summary)
+                self._speak(_spoken_done_phrase(action, success=False))
+            return
+
+        # A "get <key> from configmap/secret" for a key that does not exist
+        # is a kubectl error (thanks to --allow-missing-template-keys=false
+        # in build_kubectl_command). kubectl's own wording for that error
+        # varies by version — some print "no entry for key ...", others
+        # "<KEY> is not found" — and can include a large Go-template dump
+        # of the whole object, so don't try to pattern-match the general
+        # phrase "not found" (it appears in both the per-key template
+        # error AND a real "resource itself doesn't exist" error) or print
+        # any of it. Only kubectl's own API-level 404 wording — the stable
+        # "Error from server (NotFound)" prefix used for a genuinely
+        # missing configmap/secret — is treated as a different, more
+        # useful error below. Everything else here just means the key
+        # wasn't found. Empty output on exit 0 is treated the same way,
+        # as a safety net for a command built before this flag existed
+        # (e.g. a re-run of an older history entry).
+        combined_lower = (output + " " + error_text).lower()
+        resource_missing = bool(
+            re.search(r"error from server\s*\(\s*notfound\s*\)", combined_lower)
+        )
+        if (
+            action.get("action") == "get"
+            and action.get("key")
+            and not resource_missing
+            and (exit_code != 0 or (not error_text and not output))
+        ):
+            message = "Key not found. in resource. Check the key name and try again."
+            self._remember_operation(action, command, "failed", message)
+            self._write_error(f"\n✗ {message}")
+            self._speak(_spoken_done_phrase(action, success=False))
+            return
 
         if output:
             self.output.append(
