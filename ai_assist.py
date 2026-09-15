@@ -296,56 +296,6 @@ def _groq_truncated(data):
     return bool(choices) and choices[0].get("finish_reason") == "length"
 
 
-def _openrouter_request(prompt, api_key, model):
-    # OpenRouter is also OpenAI-compatible and fronts 70+ providers behind
-    # one key/host — including a rotating set of models suffixed ":free"
-    # that cost nothing to call. HTTP-Referer/X-Title headers are optional
-    # (only used by OpenRouter for their own leaderboard attribution), so
-    # they're left out here to keep this dependency-free and match the
-    # other providers' minimal header set.
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-    body = json.dumps({
-        "model": model,
-        "max_tokens": MAX_TOKENS,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-    }).encode("utf-8")
-    return url, headers, body
-
-
-def _openrouter_parse(data):
-    try:
-        return (data["choices"][0]["message"]["content"] or "").strip()
-    except (KeyError, IndexError, TypeError):
-        return ""
-
-
-def _openrouter_error(detail, code):
-    # OpenRouter wraps the same {"error": {"message": ...}} shape as
-    # OpenAI, but on a routing failure (e.g. an unrecognized/retired
-    # ":free" model id) sometimes returns the message as a bare string
-    # instead of a dict — handle both.
-    if isinstance(detail, dict):
-        err = detail.get("error")
-        if isinstance(err, dict):
-            return err.get("message")
-        if isinstance(err, str):
-            return err
-    return None
-
-
-def _openrouter_truncated(data):
-    choices = data.get("choices") or []
-    return bool(choices) and choices[0].get("finish_reason") == "length"
-
 
 PROVIDERS = {
     "anthropic": {
@@ -412,7 +362,6 @@ PROVIDERS = {
         # deepseek-reasoner aliases were retired in July 2026 in favor of
         # explicit V4 model names.) DeepSeek's own API only exposes these
         # two — more variants (Flash-Vision-Exp, dated snapshots, etc.)
-        # exist on router platforms like OpenRouter, not on DeepSeek's
         # direct API.
         "model_samples": [
             "deepseek-v4-flash",
@@ -434,27 +383,6 @@ PROVIDERS = {
         ],
 
         "default_model": "openai/gpt-oss-120b",
-    },
-    "openrouter": {
-        "label": "OpenRouter (free models)",
-        "key_placeholder": "sk-or-v1-…",
-        "build_request": _openrouter_request,
-        "parse_response": _openrouter_parse,
-        "parse_error": _openrouter_error,
-        "was_truncated": _openrouter_truncated,
-        # One key, routed to 70+ providers. Anything ending in ":free" is
-        # a permanently-free model — no credit card needed to call these
-        # specific ids (get a key at openrouter.ai/keys). Non-":free"
-        # model ids also work here if a key has paid credits.
-        "model_samples": [
-            "openrouter/free",
-            "nvidia/nemotron-3-ultra:free",
-            "minimax/minimax-m3:free",
-            "poolside/laguna-s-2.1:free",
-            "openai/gpt-oss-20b:free",
-            "nvidia/ling-3.0-flash:free",
-        ],
-        "default_model": "meta-llama/llama-3.3-70b-instruct:free",
     },
 }
 
