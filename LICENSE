@@ -1,68 +1,21 @@
-# KubeDeck Proprietary License
+MIT License
 
-Copyright (c) 2026 Hareesh GT. All rights reserved.
+Copyright (c) 2026 Hareesh GT
 
-## 1. Ownership
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-KubeDeck, including its source code, object code, binaries, application files, user interface, graphics, documentation, and associated materials, is the exclusive intellectual property of Hareesh GT ("Author"), except for third-party components that are separately licensed by their respective owners.
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-## 2. License Grant
-
-The Author grants the user a limited, non-exclusive, non-transferable, non-sublicensable license to use the KubeDeck software for personal or internal business purposes, subject to the terms of this License.
-
-## 3. Restrictions
-
-Unless expressly authorized in writing by the Author, you may not:
-
-* Copy, reproduce, or redistribute KubeDeck or substantial portions of its source code.
-* Sell, rent, lease, sublicense, or otherwise commercially distribute KubeDeck or modified versions of it.
-* Publish, upload, mirror, or make the KubeDeck source code available to the public.
-* Modify, fork, rebrand, or create derivative works based on KubeDeck for distribution.
-* Remove or alter copyright, attribution, trademark, or proprietary notices.
-* Use the KubeDeck name, logo, branding, or other identifying materials to represent a derivative product as an official KubeDeck product.
-* Incorporate KubeDeck source code into another software product for distribution without prior written permission from the Author.
-* Reverse engineer, decompile, or disassemble KubeDeck except where such activity cannot legally be restricted under applicable law.
-
-## 4. Third-Party Components
-
-KubeDeck may contain or depend upon third-party software, libraries, frameworks, or other components.
-
-Such components remain subject to their respective licenses. Nothing in this License overrides or restricts rights granted by applicable third-party licenses.
-
-## 5. Intellectual Property
-
-All rights, title, and interest in KubeDeck that are not expressly granted under this License remain with the Author.
-
-No ownership rights are transferred to the user by this License.
-
-## 6. Trademarks
-
-"KubeDeck" and associated logos, names, and branding are not licensed under this License.
-
-Permission to use the KubeDeck name or branding for a derivative or competing product requires prior written authorization from the Author.
-
-## 7. Warranty Disclaimer
-
-KubeDeck is provided "AS IS" and without warranties of any kind, whether express or implied, including but not limited to warranties of merchantability, fitness for a particular purpose, and non-infringement.
-
-## 8. Limitation of Liability
-
-To the maximum extent permitted by applicable law, the Author shall not be liable for any direct, indirect, incidental, special, consequential, or other damages arising from the use of or inability to use KubeDeck.
-
-## 9. Termination
-
-This License automatically terminates if the user violates its terms.
-
-Upon termination, the user must cease use and distribution of KubeDeck and destroy copies of the software that are not otherwise lawfully retained.
-
-## 10. Permission for Additional Uses
-
-Any rights not expressly granted by this License require prior written permission from the Author.
-
-For licensing inquiries or permission to use KubeDeck beyond the terms of this License, contact the Author.
-
----
-
-Copyright (c) 2026 Hareesh GT.
-
-All rights reserved.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
