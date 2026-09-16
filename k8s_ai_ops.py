@@ -294,7 +294,7 @@ def _append_audit(action: dict, command: str, status: str, output: str = "",
     rows.append({
         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         "context": action.get("context", ""),
-        "namespace": action.get("namespace", "default"),
+        "namespace": action.get("namespace", ""),
         "action": action.get("action"),
         "resource": action.get("resource"),
         "name": action.get("name"),
@@ -330,7 +330,7 @@ def _history_text(history: list, limit: int = HISTORY_CONTEXT_ITEMS) -> str:
         action = row.get("action", "")
         resource = row.get("resource", "")
         name = row.get("name", "")
-        namespace = row.get("namespace", "default")
+        namespace = row.get("namespace", "")
         timestamp = row.get("timestamp", "")
         replicas = row.get("replicas")
 
@@ -400,7 +400,15 @@ Rules:
 4. delete is valid only for the supported delete resources.
 5. get, describe, and rollout_status are read/status operations.
 6. Never invent a resource name.
-7. Use the selected namespace unless the user explicitly specifies another.
+7. Namespace handling:
+   - If the user explicitly specifies a namespace, return that namespace.
+   - If the user does NOT explicitly specify a namespace, return an empty
+     "namespace" value. Do NOT silently assume the currently selected namespace.
+   - For read/status requests without an explicitly specified namespace, the
+     application will use kubectl -A to check across all namespaces.
+   - For mutating requests (scale, restart, delete) without an explicitly
+     specified namespace, return clarification_required because the target
+     namespace must be unambiguous.
 8. Never return more than one operation.
 9. If a request refers to a previous operation, use the operation history below.
 10. If the user says "undo" a previous scale operation, return a scale action
@@ -661,7 +669,7 @@ def _general_question_response(request: str, namespace: str = None):
     if clean in namespace_patterns:
         return (
             f"The currently selected Kubernetes namespace is "
-            f"'{namespace or 'default'}'."
+            f"'{namespace or 'all namespaces'}'."
         )
 
     # --------------------------------------------------
@@ -1142,7 +1150,7 @@ def validate_action(data: dict):
 
     resource = str(data.get("resource", "")).strip().lower()
     name = str(data.get("name", "")).strip()
-    namespace = str(data.get("namespace", "")).strip() or "default"
+    namespace = str(data.get("namespace", "")).strip()
 
     if resource not in ALLOWED_RESOURCES:
         raise ValueError(
@@ -1153,7 +1161,9 @@ def validate_action(data: dict):
 
     if not re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", name, flags=re.IGNORECASE):
         raise ValueError(f"Invalid Kubernetes resource name returned by AI: {name}")
-    if not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", namespace, flags=re.IGNORECASE):
+    if namespace and not re.fullmatch(
+        r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", namespace, flags=re.IGNORECASE
+    ):
         raise ValueError(f"Invalid Kubernetes namespace returned by AI: {namespace}")
 
     if action == "scale":
@@ -1262,7 +1272,19 @@ def build_kubectl_command(action: dict) -> str:
     namespace = action["namespace"]
     context = str(action.get("context") or "").strip()
     context_flag = f"--context {shlex.quote(context)} " if context else ""
-    base = f"kubectl {context_flag}-n {namespace}"
+    if namespace:
+        base = f"kubectl {context_flag}-n {shlex.quote(namespace)}"
+    elif operation in {"get", "describe", "rollout_status"}:
+        # -A/--all-namespaces is a command-specific kubectl flag and must
+        # appear after the subcommand (for example: `kubectl get pods -A`).
+        # Keep the context flag global, but add -A at the operation level.
+        base = f"kubectl {context_flag}".rstrip()
+    else:
+        raise ValueError(
+            f"Namespace is required for Kubernetes {operation} operations."
+        )
+
+    all_namespaces = not bool(namespace)
 
     if operation == "scale":
         if "replicas" not in action:
@@ -1274,6 +1296,19 @@ def build_kubectl_command(action: dict) -> str:
     if operation == "restart":
         return f"{base} rollout restart {resource}/{name}"
     if operation == "delete":
+        if resource == "pod":
+            prefix = shlex.quote(name)
+            if namespace:
+                return (
+                    f"for pod in $({base} get pods --no-headers | "
+                    f"awk -v prefix={prefix} 'index($1, prefix) == 1 {{print $1}}'); do "
+                    f"{base} delete pod/$pod; done"
+                )
+            return (
+                f"{base} get pods -A --no-headers | "
+                f"awk -v prefix={prefix} 'index($2, prefix) == 1 {{print $1, $2}}' | "
+                f"while read ns pod; do kubectl {context_flag}-n \"$ns\" delete pod/\"$pod\"; done"
+            )
         return f"{base} delete {resource}/{name}"
     if operation == "get":
         keys = action.get("keys")
@@ -1307,6 +1342,21 @@ def build_kubectl_command(action: dict) -> str:
                 f"done"
             )
         key = action.get("key")
+        if resource == "pod" and not key:
+            # Pod names commonly contain generated suffixes, e.g.
+            # "pod1-dcsd-some-random-uuid". When the user supplies the
+            # stable prefix ("pod1"), return every matching pod instead of
+            # requiring the complete generated name.
+            prefix = shlex.quote(name)
+            if namespace:
+                return (
+                    f"{base} get pods --no-headers | "
+                    f"awk -v prefix={prefix} 'index($1, prefix) == 1'"
+                )
+            return (
+                f"{base} get pods -A --no-headers | "
+                f"awk -v prefix={prefix} 'index($2, prefix) == 1'"
+            )
         if key and resource in KEY_VALUE_RESOURCES:
             jsonpath = shlex.quote(f"{{.data.{key}}}")
             # --allow-missing-template-keys=false makes kubectl itself fail
@@ -1323,11 +1373,24 @@ def build_kubectl_command(action: dict) -> str:
                 # decode so the output matches what configmap returns.
                 get_cmd += " | base64 --decode"
             return get_cmd
-        return f"{base} get {resource}/{name}"
+        return f"{base} get {resource}/{name}" + (" -A" if all_namespaces else "")
     if operation == "describe":
-        return f"{base} describe {resource}/{name}"
+        if resource == "pod":
+            prefix = shlex.quote(name)
+            if namespace:
+                return (
+                    f"for pod in $({base} get pods --no-headers | "
+                    f"awk -v prefix={prefix} 'index($1, prefix) == 1 {{print $1}}'); do "
+                    f"{base} describe pod/$pod; done"
+                )
+            return (
+                f"{base} get pods -A --no-headers | "
+                f"awk -v prefix={prefix} 'index($2, prefix) == 1 {{print $1, $2}}' | "
+                f"while read ns pod; do kubectl {context_flag}-n \"$ns\" describe pod/\"$pod\"; done"
+            )
+        return f"{base} describe {resource}/{name}" + (" -A" if all_namespaces else "")
     if operation == "rollout_status":
-        return f"{base} rollout status {resource}/{name}"
+        return f"{base} rollout status {resource}/{name}" + (" -A" if all_namespaces else "")
 
     raise ValueError(f"Unsupported operation: {operation}")
 
@@ -1343,38 +1406,38 @@ def operation_description(action: dict) -> str:
             delta = action.get("delta", 0)
             direction = "up" if delta >= 0 else "down"
             return (
-                f'Scale {resource} "{name}" in namespace "{namespace}" '
+                f'Scale {resource} "{name}" in namespace "{namespace or "all namespaces"}" '
                 f'{direction} by {abs(delta)} replica(s) (relative to current count)'
             )
         return (
-            f'Scale {resource} "{name}" in namespace "{namespace}" '
+            f'Scale {resource} "{name}" in namespace "{namespace or "all namespaces"}" '
             f'to {action["replicas"]} replica(s)'
         )
     if operation == "restart":
-        return f'Restart {resource} "{name}" in namespace "{namespace}"'
+        return f'Restart {resource} "{name}" in namespace "{namespace or "all namespaces"}"'
     if operation == "delete":
-        return f'Delete {resource} "{name}" in namespace "{namespace}"'
+        return f'Delete {resource} "{name}" in namespace "{namespace or "all namespaces"}"'
     if operation == "get":
         keys = action.get("keys")
         if keys:
             key_list = ", ".join(f'"{k}"' for k in keys)
             return (
                 f"Get keys {key_list} from {resource} "
-                f'"{name}" in namespace "{namespace}"'
+                f'"{name}" in namespace "{namespace or "all namespaces"}"'
             )
         key = action.get("key")
         if key:
             return (
                 f'Get key "{key}" from {resource} "{name}" '
-                f'in namespace "{namespace}"'
+                f'in namespace "{namespace or "all namespaces"}"'
             )
-        return f'Get {resource} "{name}" in namespace "{namespace}"'
+        return f'Get {resource} "{name}" in namespace "{namespace or "all namespaces"}"'
     if operation == "describe":
-        return f'Describe {resource} "{name}" in namespace "{namespace}"'
+        return f'Describe {resource} "{name}" in namespace "{namespace or "all namespaces"}"'
     if operation == "rollout_status":
         return (
             f'Check rollout status of {resource} "{name}" '
-            f'in namespace "{namespace}"'
+            f'in namespace "{namespace or "all namespaces"}"'
         )
     return f"{operation} {resource}/{name}"
 
@@ -1782,10 +1845,10 @@ class K8sAIOpsWidget(QWidget):
         if self._namespace_getter:
             try:
                 value = self._namespace_getter()
-                return str(value or "default").strip() or "default"
+                return str(value or "").strip()
             except Exception:
                 pass
-        return "default"
+        return ""
 
     def _context(self) -> str:
         if self._context_getter:
@@ -2207,7 +2270,7 @@ class K8sAIOpsWidget(QWidget):
         )
         self.output.append(
             f'<span style="color:{T["TEXT_MUTED"]}">'
-            f'Namespace: {self._escape_html(namespace)}</span>'
+            f"Namespace: {self._escape_html(namespace or 'all namespaces')}</span>"
         )
 
         self._set_busy(True)
@@ -2247,6 +2310,22 @@ class K8sAIOpsWidget(QWidget):
         if action["kind"] == "unsupported":
             self._write_error("\n" + action["reason"])
             self._speak("That operation isn't supported.")
+            return
+
+        # A mutating operation must have an explicit namespace. Read/status
+        # operations are allowed to use all namespaces when the user did not
+        # specify one, and build_kubectl_command() will add -A for those.
+        if (
+            action.get("action") in {"scale", "restart", "delete"}
+            and not action.get("namespace")
+        ):
+            reason = (
+                "Please specify the Kubernetes namespace for this "
+                f"{action.get('action')} operation."
+            )
+            self._write_info("\nAI needs more information:\n" + reason)
+            self._speak("I need the Kubernetes namespace to do that safely.")
+            self.request_input.setFocus()
             return
 
         self._execute_action(action)
@@ -2419,9 +2498,18 @@ class K8sAIOpsWidget(QWidget):
         resource = action["resource"]
         name = action["name"]
         namespace = action["namespace"]
+        if not namespace:
+            self._pending_scale_action = None
+            self._write_error(
+                "\n✗ A namespace is required before reading the current "
+                "replica count for a scale operation."
+            )
+            self._speak("A namespace is required for scaling.")
+            self._set_busy(False)
+            return
 
         probe = (
-            f"kubectl {((f"--context {shlex.quote(str(action.get("context") or ""))} ") if action.get("context") else "")} -n {namespace} get {resource}/{name} "
+            f"kubectl {((f"--context {shlex.quote(str(action.get("context") or ""))} ") if action.get("context") else "")} -n {shlex.quote(namespace)} get {resource}/{name} "
             f"-o jsonpath={{.spec.replicas}}"
         )
 
@@ -2668,7 +2756,7 @@ class K8sAIOpsWidget(QWidget):
             "action": action.get("action"),
             "resource": action.get("resource"),
             "name": action.get("name"),
-            "namespace": action.get("namespace", "default"),
+            "namespace": action.get("namespace", ""),
             "context": action.get("context", ""),
             "command": command,
         }
@@ -2712,7 +2800,7 @@ class K8sAIOpsWidget(QWidget):
                     f"[{row.get('timestamp','')}] {str(row.get('status','')).upper()} "
                     f"risk={row.get('risk','low')}\n"
                     f"context:   {row.get('context','—')}\n"
-                    f"namespace: {row.get('namespace','default')}\n"
+                    f"namespace: {row.get('namespace') or 'all namespaces'}\n"
                     f"operation: {row.get('action','')} {row.get('resource','')}/{row.get('name','')}\n"
                     f"command:   {row.get('command','')}\n"
                     f"confirmed: {row.get('confirmed', False)}\n"
