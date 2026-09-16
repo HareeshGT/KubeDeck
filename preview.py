@@ -88,6 +88,16 @@ class PreviewPane(QWidget):
     def show_text(self, content: str):
         self.text_preview.setPlainText(content)
 
+    def reset_text(self):
+        """Clear just the text-preview area, leaving the name/size/kind
+        header alone. Used when an in-flight preview load is cancelled
+        (e.g. the file was opened for editing instead) so the pane
+        doesn't sit on a stale "Loading…" forever — its own
+        chunk/finished callbacks correctly never fire for a cancelled
+        worker, so nothing else would ever clear this."""
+        self.text_preview.clear()
+        self.text_preview.setPlaceholderText("Select a file to preview…")
+
     def clear(self):
         self.icon_lbl.setText("")
         self.name_lbl.setText("")

@@ -1809,6 +1809,12 @@ class EC2FileManager(QMainWindow):
     if self._preview_worker is not None:
       self._preview_worker.cancel()
       self._preview_worker = None
+      # cancel() now closes the worker's handle immediately (see
+      # workers.py), so its chunk_ready/finished_ok/finished_err
+      # callbacks correctly never fire for it — nothing else would
+      # ever move the pane off the "Loading…" text _fetch_preview set,
+      # so reset it here explicitly.
+      self.preview.reset_text()
 
   # ── Edit helpers ──────────────────────────────────────────
   def _selected_meta(self):
