@@ -29,6 +29,99 @@ if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
 fi
 
 # --------------------------------------------------
+# Select GitHub Branch
+# --------------------------------------------------
+
+# You can optionally pass a branch directly:
+#
+#   ./build.sh <branch>
+#
+# Examples:
+#
+#   ./build.sh main
+#   ./build.sh dev
+#   ./build.sh release/v1.2.0
+#
+# If no branch is supplied, the script retrieves the available
+# remote branches from GitHub and lets the user select one.
+
+SELECTED_BRANCH="${1:-}"
+
+echo
+echo "=========================================="
+echo "KubeDeck GitHub Branch Selection"
+echo "=========================================="
+echo
+
+if ! command -v git >/dev/null 2>&1; then
+    echo "ERROR: git is required but was not found."
+    exit 1
+fi
+
+# Retrieve remote branches from GitHub.
+echo "Fetching available branches from GitHub..."
+echo
+
+BRANCH_LIST="$(
+    git ls-remote --heads "$REPO" 2>/dev/null |
+    sed 's#^[^[:space:]]*[[:space:]]*refs/heads/##' |
+    grep -v '/$' |
+    sort
+)"
+
+if [ -z "$BRANCH_LIST" ]; then
+    echo "ERROR: Could not retrieve branches from:"
+    echo "$REPO"
+    echo
+    echo "Check your internet connection and verify that the repository is accessible."
+    exit 1
+fi
+
+# If a branch was supplied as an argument, validate it.
+if [ -n "$SELECTED_BRANCH" ]; then
+    if ! printf '%s\n' "$BRANCH_LIST" | grep -Fxq "$SELECTED_BRANCH"; then
+        echo "ERROR: Branch '$SELECTED_BRANCH' does not exist in the repository."
+        echo
+        echo "Available branches:"
+        printf '%s\n' "$BRANCH_LIST" | sed 's/^/  - /'
+        exit 1
+    fi
+else
+    # Build a numbered branch list.
+    BRANCH_COUNT=0
+    while IFS= read -r BRANCH; do
+        BRANCH_COUNT=$((BRANCH_COUNT + 1))
+        BRANCHES[$BRANCH_COUNT]="$BRANCH"
+    done <<< "$BRANCH_LIST"
+
+    echo "Available branches:"
+    echo
+
+    for ((i=1; i<=BRANCH_COUNT; i++)); do
+        printf "  [%d] %s\n" "$i" "${BRANCHES[$i]}"
+    done
+
+    echo
+    printf "Select branch [1-%d]: " "$BRANCH_COUNT"
+    read -r BRANCH_SELECTION
+
+    if ! [[ "$BRANCH_SELECTION" =~ ^[0-9]+$ ]] ||
+       [ "$BRANCH_SELECTION" -lt 1 ] ||
+       [ "$BRANCH_SELECTION" -gt "$BRANCH_COUNT" ]; then
+        echo
+        echo "ERROR: Invalid branch selection."
+        exit 1
+    fi
+
+    SELECTED_BRANCH="${BRANCHES[$BRANCH_SELECTION]}"
+fi
+
+echo
+echo "Selected branch:"
+echo "  $SELECTED_BRANCH"
+echo
+
+# --------------------------------------------------
 # Clone / Update Repository
 # --------------------------------------------------
 
@@ -36,19 +129,44 @@ if [ -d "$DIR/.git" ]; then
     echo "Repository already exists. Updating..."
     cd "$DIR"
 
-    git pull
+    git fetch --prune origin
+
+    # Make sure the selected branch exists locally.
+    if git show-ref --verify --quiet "refs/remotes/origin/$SELECTED_BRANCH"; then
+        git checkout -B "$SELECTED_BRANCH" "origin/$SELECTED_BRANCH"
+    else
+        echo "ERROR: Remote branch origin/$SELECTED_BRANCH was not found."
+        exit 1
+    fi
+
+    git reset --hard "origin/$SELECTED_BRANCH"
 
     echo
-    echo "Git Logs..."
-    git log -5 --oneline
+    echo "Git branch:"
+    git branch --show-current
+
+    echo
+    echo "Git commit:"
+    git log -1 --oneline
 else
-    git clone "$REPO" "$DIR"
+    echo "Cloning KubeDeck branch '$SELECTED_BRANCH'..."
+    git clone --branch "$SELECTED_BRANCH" --single-branch "$REPO" "$DIR"
     cd "$DIR"
 
     echo
-    echo "Git Logs..."
-    git log -5 --oneline
+    echo "Git branch:"
+    git branch --show-current
+
+    echo
+    echo "Git commit:"
+    git log -1 --oneline
 fi
+
+echo
+echo "=========================================="
+echo "Building from branch: $SELECTED_BRANCH"
+echo "=========================================="
+echo
 
 # --------------------------------------------------
 # Find / Install Python
@@ -594,6 +712,9 @@ echo
 echo "=========================================="
 echo "KubeDeck installed successfully!"
 echo "=========================================="
+echo
+echo "Built from GitHub branch:"
+echo "  $SELECTED_BRANCH"
 echo
 echo "Included:"
 echo "  ✓ Kubernetes Ops Mind"
