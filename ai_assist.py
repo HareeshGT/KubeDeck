@@ -364,10 +364,10 @@ PROVIDERS = {
         # two — more variants (Flash-Vision-Exp, dated snapshots, etc.)
         # direct API.
         "model_samples": [
-            "deepseek-v4-flash",
+            "deepseek-flash",
             "deepseek-v4-pro",
         ],
-        "default_model": "deepseek-v4-flash",
+        "default_model": "deepseek-flash",
     },
     "groq": {
         "label": "Groq (free tier)",
