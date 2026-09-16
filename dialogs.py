@@ -3725,7 +3725,7 @@ class _ServiceCard(QFrame):
 
     row.addLayout(text_col, 1)
 
-    self.edit_btn = _IconButton("️", "Edit this service")
+    self.edit_btn = _IconButton("", "Edit this service")
     self.edit_btn.clicked.connect(lambda: self.edit_clicked.emit(self.svc))
     row.addWidget(self.edit_btn)
 
@@ -3993,7 +3993,7 @@ class _ServiceFormPanel(QFrame):
 
   def load_for_edit(self, svc: dict):
     self._editing = svc
-    self.heading.setText(f"️ Edit “{svc['name']}”")
+    self.heading.setText(f" Edit “{svc['name']}”")
     self.save_btn.setText("Save Changes")
     ns = svc.get("namespace", "") or "default"
     self.ns_input.setCurrentText(ns)
@@ -4007,7 +4007,7 @@ class _ServiceFormPanel(QFrame):
     self._reload_services(ns)
 
   def show_error(self, msg: str):
-    self.error_lbl.setText("️ " + msg)
+    self.error_lbl.setText(" " + msg)
     self.error_lbl.show()
 
   def _on_save(self):

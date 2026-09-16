@@ -23,7 +23,8 @@ from PyQt5.QtCore import (
 from PyQt5.QtGui import QFont, QColor, QPalette, QKeySequence
 
 import themes as _themes
-from ui_icons import set_icon, apply_text_icon, add_icon_tab, icon_button, icon_pixmap
+from ui_icons import (set_icon, apply_text_icon, add_icon_tab, icon_button,
+                      icon_pixmap, split_icon_text)
 from themes import T, THEMES, apply_theme_vars, build_qss, apply_qss_to, save_settings
 from utils import classify, icon_for, size_fmt, add_recent_instance, monospace_font
 from sudo_fs import SudoFS
@@ -764,10 +765,22 @@ class EC2FileManager(QMainWindow):
         b.setFixedWidth(width)
       return b
 
-    def _icon_btn(text, tooltip="", checkable=False):
-      """Compact square icon button."""
+    def _icon_btn(text, tooltip="", checkable=False, icon_name=None):
+      """Compact square icon button.
+
+      apply_text_icon() derives the SVG from the *label*, so a button that
+      is meant to be icon-only (empty label) gets no icon at all and renders
+      as an empty box. For those, resolve the icon from an explicit
+      icon_name, falling back to the tooltip — and keep the label empty so
+      the tooltip text never leaks into the 30x28 button face.
+      """
       b = QPushButton()
       apply_text_icon(b, text)
+      if not text.strip():
+        name = icon_name or split_icon_text(tooltip)[0]
+        if name:
+          set_icon(b, name, size=16)
+        b.setText("")
       b.setToolTip(tooltip)
       b.setFixedSize(30, 28)
       b.setStyleSheet("padding: 0; font-size: 14px;")
@@ -832,12 +845,12 @@ class EC2FileManager(QMainWindow):
     tb.addWidget(self.sort_dir_btn)
     sep4 = _sep(); tb.addWidget(sep4); self._fm_seps.append(sep4)
 
-    self.view_list_btn = _icon_btn("", "List view", checkable=True)
+    self.view_list_btn = _icon_btn("", "List view", checkable=True, icon_name="list")
     self.view_list_btn.setChecked(True)
     self.view_list_btn.clicked.connect(lambda: self._set_view_mode("list"))
     tb.addWidget(self.view_list_btn)
 
-    self.view_grid_btn = _icon_btn("▦", "Grid view", checkable=True)
+    self.view_grid_btn = _icon_btn("", "Grid view", checkable=True, icon_name="grid")
     self.view_grid_btn.clicked.connect(lambda: self._set_view_mode("grid"))
     tb.addWidget(self.view_grid_btn)
     sep5 = _sep(); tb.addWidget(sep5); self._fm_seps.append(sep5)
@@ -849,9 +862,14 @@ class EC2FileManager(QMainWindow):
     self.act_settings = _icon_btn("", "Settings")
     self.act_settings.clicked.connect(self._open_settings)
     tb.addWidget(self.act_settings)
-    tb.addWidget(_sep()) # always-visible sep before connect buttons
 
     tb.addStretch()
+
+    # Must come *after* the stretch: placed before it, this separator stays
+    # glued to the left-hand group, so on the Kubernetes/Dashboard tabs
+    # (where the FM controls are hidden) it floats alone in empty space
+    # a thousand pixels from the buttons it is supposed to separate.
+    tb.addWidget(_sep()) # always-visible sep before connect buttons
 
     self.act_connect  = _tbtn(" Connect",  "Connect to server")
     self.act_disconnect = _tbtn(" Disconnect", "Disconnect")
@@ -936,7 +954,7 @@ class EC2FileManager(QMainWindow):
     for label, slot in [
       ("⬆ Upload",   self._upload),
       ("⬇ Download",  self._download),
-      ("️ Edit",    self._edit_selected),
+      (" Edit",    self._edit_selected),
       ("▶ Run",    self._run_selected),
       (" Search",  self._open_search),
       (" New Folder", self._new_folder),
@@ -975,7 +993,8 @@ class EC2FileManager(QMainWindow):
     self.t_header.setFixedHeight(28)
     header_row.addWidget(self.t_header, 1)
 
-    self.terminal_explain_btn = icon_button("", size=16)
+    self.terminal_explain_btn = QPushButton()
+    set_icon(self.terminal_explain_btn, "explain", size=16)
     self.terminal_explain_btn.setToolTip("Explain the last failed command with AI")
     self.terminal_explain_btn.setFixedSize(28, 28)
     self.terminal_explain_btn.setStyleSheet("padding: 0px;")
@@ -2433,7 +2452,7 @@ class EC2FileManager(QMainWindow):
           menu.addAction("▶ Play", lambda m=meta: self._play_media(m))
 
         if kind in _EDITABLE_KINDS:
-          menu.addAction("️ Edit", lambda m=meta: self._edit_file(m))
+          menu.addAction(" Edit", lambda m=meta: self._edit_file(m))
 
         if ext in _EXECUTABLE_EXTS or kind == "exec":
           menu.addAction("▶ Run", lambda m=meta: self._exec_file(m))

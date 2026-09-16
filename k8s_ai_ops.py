@@ -2509,8 +2509,13 @@ class K8sAIOpsWidget(QWidget):
       self._set_busy(False)
       return
 
+    ctx = action.get("context")
+    ctx_flag = (
+      "--context {} ".format(shlex.quote(str(ctx or ""))) if ctx else ""
+    )
+
     probe = (
-      f"kubectl {((f"--context {shlex.quote(str(action.get("context") or ""))} ") if action.get("context") else "")} -n {shlex.quote(namespace)} get {resource}/{name} "
+      f"kubectl {ctx_flag} -n {shlex.quote(namespace)} get {resource}/{name} "
       f"-o jsonpath={{.spec.replicas}}"
     )
 

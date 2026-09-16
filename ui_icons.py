@@ -138,8 +138,11 @@ LABEL_TO_ICON = {
     "dashboard": "dashboard",
     "home": "home",
     "file manager": "folder",
-    "files": "files",
+    "files": "file",
     "settings": "settings",
+    "terminal": "terminal",
+    "list view": "list",
+    "grid view": "grid",
     "security": "security",
 
     # Infrastructure

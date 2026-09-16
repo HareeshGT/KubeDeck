@@ -873,10 +873,7 @@ class KubernetesTab(QWidget):
 
     lay.addWidget(self.k8s_ai_ops)
 
-    self.sub_tabs.addTab(
-      w,
-      " Ops Mind",
-    )
+    add_icon_tab(self.sub_tabs, w, "Ops Mind")
 
   def _ai_ops_context(self):
     """Give Ops Mind a small amount of useful UI context.
@@ -1075,7 +1072,7 @@ class KubernetesTab(QWidget):
     splitter.addWidget(right)
     splitter.setSizes([440, 480])
     lay.addWidget(splitter)
-    add_icon_tab(self.sub_tabs, w, "️ Jobs & CronJobs")
+    add_icon_tab(self.sub_tabs, w, "Jobs && CronJobs")
     self._update_workload_action_visibility()
 
   def _style_toggle(self, widget, buttons):
@@ -1727,7 +1724,7 @@ class KubernetesTab(QWidget):
     splitter.addWidget(right)
     splitter.setSizes([320, 620])
     lay.addWidget(splitter)
-    add_icon_tab(self.sub_tabs, w, " Config & Secrets")
+    add_icon_tab(self.sub_tabs, w, "Config && Secrets")
 
   def _style_cfg_toggle(self):
     """Pill-shaped container + two checkable buttons that look like one
@@ -1834,7 +1831,7 @@ class KubernetesTab(QWidget):
     run.clicked.connect(self._run_kubectl_terminal)
     inp_row.addWidget(run)
     lay.addLayout(inp_row)
-    self.sub_tabs.addTab(w, "⌨ Terminal")
+    add_icon_tab(self.sub_tabs, w, "Terminal")
 
   def _build_tunnels_tab(self):
     w = QWidget()
@@ -1868,7 +1865,7 @@ class KubernetesTab(QWidget):
     tb.addWidget(reload_btn)
 
     manage_btn = self._toolbar_btn(
-      "️ Manage Services",
+      " Manage Services",
       tooltip="Add, edit, or remove tunnel services stored on the connected VM",
     )
     manage_btn.clicked.connect(self._open_manage_tunnel_services)
