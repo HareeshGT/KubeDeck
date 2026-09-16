@@ -30,6 +30,15 @@ from workers import CommandWorker, _TransferWorker, ScpTransferWorker, track_wor
 from editor_widgets import CodeEditor, make_highlighter, LANG_LABEL
 import ai_assist
 
+
+def _rgba(hex_color: str, alpha: float) -> str:
+  """'#7c6af7' -> 'rgba(124, 106, 247, 0.15)', for tinted badge backgrounds."""
+  hex_color = (hex_color or "#888888").lstrip("#")
+  if len(hex_color) != 6:
+    hex_color = "888888"
+  r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+  return f"rgba({r}, {g}, {b}, {alpha})"
+
 # PyAV is optional and only used for duration probing (to drive the
 # progress bar) ahead of a local-file transcode — it is never required for
 # playback itself, so its absence must never block the player.
@@ -314,20 +323,16 @@ class ConnectDialog(QDialog):
       layout.addWidget(recent_lbl)
       self.recent_list = QListWidget()
       self.recent_list.setObjectName("recent_list")
-      self.recent_list.setMaximumHeight(130)
+      self.recent_list.setMaximumHeight(210)
+      self.recent_list.setSpacing(0)
       self.recent_list.setFocusPolicy(Qt.NoFocus)
       for inst in recent:
-        # Show alias if set, otherwise fall back to user@host:port
-        alias = inst.get("alias", "").strip()
-        if alias:
-          label = f" {alias} — {inst['user']}@{inst['host']}:{inst['port']}"
-        else:
-          label = f" {inst['user']}@{inst['host']}:{inst['port']}"
-        if inst.get("pem"):
-          label += " [key]"
-        item = QListWidgetItem(label)
+        item = QListWidgetItem()
         item.setData(Qt.UserRole, inst)
+        row = self._build_recent_row(inst)
+        item.setSizeHint(row.sizeHint())
         self.recent_list.addItem(item)
+        self.recent_list.setItemWidget(item, row)
       self.recent_list.itemClicked.connect(self._fill_from_recent)
       self.recent_list.itemDoubleClicked.connect(self._fill_and_accept)
       layout.addWidget(self.recent_list)
@@ -422,6 +427,73 @@ class ConnectDialog(QDialog):
     )
     if path:
       self.pem_input.setText(path)
+
+  def _build_recent_row(self, inst: dict) -> QWidget:
+    """Build one rich row for the Recent Instances list: an icon badge,
+    a bold title (alias, falling back to host), a muted connection-string
+    subtitle, and small pills for protocol / auth method on the right."""
+    row = QWidget()
+    row.setStyleSheet("background: transparent;")
+    h = QHBoxLayout(row)
+    h.setContentsMargins(10, 8, 10, 8)
+    h.setSpacing(10)
+
+    alias    = inst.get("alias", "").strip()
+    host     = inst.get("host", "")
+    user     = inst.get("user", "")
+    port     = inst.get("port", "22")
+    protocol = (inst.get("protocol") or "ssh").upper()
+
+    # Icon badge — tinted circle with a server glyph.
+    badge = QLabel()
+    badge.setFixedSize(34, 34)
+    badge.setAlignment(Qt.AlignCenter)
+    badge.setStyleSheet(
+      f"background: {_rgba(T['ACCENT'], 0.16)}; border-radius: 17px;"
+    )
+    badge.setPixmap(icon_pixmap("server", color=T["ACCENT"], size=17))
+    h.addWidget(badge)
+
+    # Title (alias, or host if no alias) + subtitle (full connection string).
+    text_col = QVBoxLayout()
+    text_col.setSpacing(1)
+
+    title = QLabel(alias if alias else host)
+    title.setStyleSheet(
+      f"color: {T['TEXT_PRIMARY']}; font-size: 15px; font-weight: 600; background: transparent;"
+    )
+    title.setToolTip(f"{user}@{host}:{port}")
+    text_col.addWidget(title)
+
+    subtitle = QLabel(f"{user}@{host}:{port}" if alias else f"user  {user}")
+    subtitle.setStyleSheet(
+      f"color: {T['TEXT_MUTED']}; font-size: 13px; background: transparent;"
+    )
+    text_col.addWidget(subtitle)
+
+    h.addLayout(text_col, 1)
+
+    # Right-side pills: non-SSH protocol, and key-auth indicator.
+    if protocol != "SSH":
+      proto_lbl = QLabel(protocol)
+      proto_lbl.setStyleSheet(
+        f"color: {T['INFO']}; background: {_rgba(T['INFO'], 0.16)}; "
+        f"border-radius: 8px; padding: 2px 7px; font-size: 10px; font-weight: 700;"
+      )
+      h.addWidget(proto_lbl)
+
+    if inst.get("pem", "").strip():
+      key_badge = QLabel()
+      key_badge.setFixedSize(22, 22)
+      key_badge.setAlignment(Qt.AlignCenter)
+      key_badge.setToolTip("Connects using a PEM key")
+      key_badge.setStyleSheet(
+        f"background: {_rgba(T['TEXT_MUTED'], 0.14)}; border-radius: 11px;"
+      )
+      key_badge.setPixmap(icon_pixmap("key", color=T["TEXT_DIM"], size=12))
+      h.addWidget(key_badge)
+
+    return row
 
   def _fill_from_recent(self, item):
     inst = item.data(Qt.UserRole)

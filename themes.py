@@ -317,7 +317,7 @@ def build_qss() -> str:
     QListWidget#recent_list {{
         background: {c['BG_DARK']}; border: 1px solid {c['BORDER']}; border-radius: 8px; outline: none;
     }}
-    QListWidget#recent_list::item {{ border-radius: 6px; padding: 6px 10px; margin: 2px 4px; color: {c['TEXT_PRIMARY']}; }}
+    QListWidget#recent_list::item {{ border-radius: 8px; padding: 0px; margin: 3px 5px; color: {c['TEXT_PRIMARY']}; }}
     QListWidget#recent_list::item:hover    {{ background: {c['BG_HOVER']}; }}
     QListWidget#recent_list::item:selected {{ background: {c['BG_ITEM_SEL']}; color: {c['TEXT_PRIMARY']}; }}
 """
