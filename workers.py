@@ -243,15 +243,27 @@ def _ssh_guard(ssh):
     return guard
 
 
+_DEFAULT_SESSION_WAIT = 30  # seconds — see open_managed_session docstring
+
+
 def open_managed_session(ssh, timeout=None):
     """Open a managed session channel.
 
     Preferred path: acquire a channel from the secondary SSH connection pool.
     Fallback path: use the supplied SSH client's own Transport with a bounded
     semaphore, preserving compatibility for externally-created SSH clients.
+
+    timeout=None (the default) used to mean "wait forever" here — so if the
+    pool was ever fully checked out (e.g. a channel leaked by some other
+    caller, or just several features hammering it at once), any new file
+    open/preview/command would sit spinning with no error and no way to
+    tell why. It now falls back to a bounded default wait so a starved pool
+    surfaces as a real "SSH is busy" error instead of an indefinite spinner.
     """
     if ssh is None:
         raise RuntimeError("SSH connection is not available")
+    if timeout is None:
+        timeout = _DEFAULT_SESSION_WAIT
 
     pool = getattr(ssh, _SSH_POOL_ATTR, None)
     if pool is not None:
@@ -686,10 +698,27 @@ class FileStreamReadWorker(QThread):
         self._sudo_user  = sudo_user
         self._max_bytes  = max_bytes
         self._cancelled  = False
+        # Handle to whatever blocking resource the active _run_*_stream
+        # is currently reading from (a paramiko SFTPFile or raw Channel),
+        # so cancel() can close it out from under a blocked read/recv
+        # call instead of only flipping a flag. Without this, a worker
+        # blocked inside a single paramiko read (e.g. the preview fetch
+        # that a double-click's own edit-load races right behind — see
+        # _cancel_preview_worker's docstring in main_window.py) keeps
+        # holding the shared SFTP connection until that one call happens
+        # to return on its own, and a second worker starting concurrently
+        # against the same connection in the meantime can wedge both.
+        self._handle    = None
         self.finished.connect(self.deleteLater)
 
     def cancel(self):
         self._cancelled = True
+        handle = self._handle
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
 
     def run(self):
         try:
@@ -732,17 +761,32 @@ class FileStreamReadWorker(QThread):
         except Exception:
             total = 0
 
-        done   = 0
-        with raw.open(self._remote, "rb") as f:
-            try:
-                f.MAX_REQUEST_SIZE = 256 * 1024
-                f.prefetch(total or None)
-            except Exception:
-                pass
+        done = 0
+        f = raw.open(self._remote, "rb")
+        self._handle = f
+        try:
+            # NOTE: no f.prefetch() here. prefetch() fires a burst of
+            # concurrent async SFTP requests ahead of the sequential
+            # read() calls below, and on a freshly-opened SFTP channel
+            # (e.g. the first file opened right after connecting) a
+            # response can land against the wrong pending request in
+            # paramiko's bookkeeping, leaving a later read() waiting on
+            # a request ID that never resolves — a silent, permanent
+            # stall with the server sitting idle. Plain sequential
+            # read(CHUNK_SIZE) below never has more than one request
+            # outstanding, so there's nothing to mis-file.
             while True:
                 if self._cancelled:
                     return
-                buf = f.read(self.CHUNK_SIZE)
+                try:
+                    buf = f.read(self.CHUNK_SIZE)
+                except Exception:
+                    # cancel() closing the handle out from under us
+                    # surfaces here as a read error — treat that as a
+                    # clean stop rather than a load failure.
+                    if self._cancelled:
+                        return
+                    raise
                 if not buf:
                     break
                 done += len(buf)
@@ -750,6 +794,12 @@ class FileStreamReadWorker(QThread):
                 self.progress.emit(done, total)
                 if self._max_bytes and done >= self._max_bytes:
                     break
+        finally:
+            self._handle = None
+            try:
+                f.close()
+            except Exception:
+                pass
         self.finished_ok.emit(done)
 
     # ── sudo path — stream a "sudo -u <user> cat" over a raw channel ──
@@ -763,6 +813,7 @@ class FileStreamReadWorker(QThread):
         sq = getattr(self._sftp, "_sq", lambda p: "'" + p.replace("'", "'\\''") + "'")
         cmd = "{}cat {} 2>/dev/null".format(prefix, sq(self._remote))
         channel = open_managed_session(self._ssh)
+        self._handle = channel
         try:
             channel.settimeout(0.5)
             channel.exec_command(cmd)
@@ -787,6 +838,7 @@ class FileStreamReadWorker(QThread):
                 self.msleep(30)
             self.finished_ok.emit(done)
         finally:
+            self._handle = None
             close_managed_session(channel)
 
 

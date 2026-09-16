@@ -310,7 +310,7 @@ class KubernetesTab(QWidget):
 
     cb.addWidget(self._vline())
 
-    self.refresh_btn = self._toolbar_btn("↺ Refresh")
+    self.refresh_btn = self._toolbar_btn(" Refresh")
     self.refresh_btn.clicked.connect(self._refresh_current_tab)
     cb.addWidget(self.refresh_btn)
 
