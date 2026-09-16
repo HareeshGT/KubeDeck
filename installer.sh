@@ -13,19 +13,19 @@ echo "Detected OS: $OS"
 # --------------------------------------------------
 if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
 
-    if ! net session >/dev/null 2>&1; then
-        echo
-        echo "Administrator privileges are required."
-        echo "Requesting elevation..."
-        echo
+  if ! net session >/dev/null 2>&1; then
+    echo
+    echo "Administrator privileges are required."
+    echo "Requesting elevation..."
+    echo
 
-        SCRIPT="$(cygpath -w "$0")"
+    SCRIPT="$(cygpath -w "$0")"
 
-        powershell.exe -NoProfile -ExecutionPolicy Bypass \
-            -Command "Start-Process 'C:\Program Files\Git\bin\bash.exe' -ArgumentList '\"$SCRIPT\"' -Verb RunAs"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass \
+      -Command "Start-Process 'C:\Program Files\Git\bin\bash.exe' -ArgumentList '\"$SCRIPT\"' -Verb RunAs"
 
-        exit 0
-    fi
+    exit 0
+  fi
 fi
 
 # --------------------------------------------------
@@ -34,13 +34,13 @@ fi
 
 # You can optionally pass a branch directly:
 #
-#   ./build.sh <branch>
+#  ./build.sh <branch>
 #
 # Examples:
 #
-#   ./build.sh main
-#   ./build.sh dev
-#   ./build.sh release/v1.2.0
+#  ./build.sh main
+#  ./build.sh dev
+#  ./build.sh release/v1.2.0
 #
 # If no branch is supplied, the script retrieves the available
 # remote branches from GitHub and lets the user select one.
@@ -54,8 +54,8 @@ echo "=========================================="
 echo
 
 if ! command -v git >/dev/null 2>&1; then
-    echo "ERROR: git is required but was not found."
-    exit 1
+  echo "ERROR: git is required but was not found."
+  exit 1
 fi
 
 # Retrieve remote branches from GitHub.
@@ -63,62 +63,62 @@ echo "Fetching available branches from GitHub..."
 echo
 
 BRANCH_LIST="$(
-    git ls-remote --heads "$REPO" 2>/dev/null |
-    sed 's#^[^[:space:]]*[[:space:]]*refs/heads/##' |
-    grep -v '/$' |
-    sort
+  git ls-remote --heads "$REPO" 2>/dev/null |
+  sed 's#^[^[:space:]]*[[:space:]]*refs/heads/##' |
+  grep -v '/$' |
+  sort
 )"
 
 if [ -z "$BRANCH_LIST" ]; then
-    echo "ERROR: Could not retrieve branches from:"
-    echo "$REPO"
-    echo
-    echo "Check your internet connection and verify that the repository is accessible."
-    exit 1
+  echo "ERROR: Could not retrieve branches from:"
+  echo "$REPO"
+  echo
+  echo "Check your internet connection and verify that the repository is accessible."
+  exit 1
 fi
 
 # If a branch was supplied as an argument, validate it.
 if [ -n "$SELECTED_BRANCH" ]; then
-    if ! printf '%s\n' "$BRANCH_LIST" | grep -Fxq "$SELECTED_BRANCH"; then
-        echo "ERROR: Branch '$SELECTED_BRANCH' does not exist in the repository."
-        echo
-        echo "Available branches:"
-        printf '%s\n' "$BRANCH_LIST" | sed 's/^/  - /'
-        exit 1
-    fi
-else
-    # Build a numbered branch list.
-    BRANCH_COUNT=0
-    while IFS= read -r BRANCH; do
-        BRANCH_COUNT=$((BRANCH_COUNT + 1))
-        BRANCHES[$BRANCH_COUNT]="$BRANCH"
-    done <<< "$BRANCH_LIST"
-
+  if ! printf '%s\n' "$BRANCH_LIST" | grep -Fxq "$SELECTED_BRANCH"; then
+    echo "ERROR: Branch '$SELECTED_BRANCH' does not exist in the repository."
+    echo
     echo "Available branches:"
+    printf '%s\n' "$BRANCH_LIST" | sed 's/^/ - /'
+    exit 1
+  fi
+else
+  # Build a numbered branch list.
+  BRANCH_COUNT=0
+  while IFS= read -r BRANCH; do
+    BRANCH_COUNT=$((BRANCH_COUNT + 1))
+    BRANCHES[$BRANCH_COUNT]="$BRANCH"
+  done <<< "$BRANCH_LIST"
+
+  echo "Available branches:"
+  echo
+
+  for ((i=1; i<=BRANCH_COUNT; i++)); do
+    printf " [%d] %s\n" "$i" "${BRANCHES[$i]}"
+  done
+
+  echo
+  printf "Select branch [1-%d]: " "$BRANCH_COUNT"
+  read -r BRANCH_SELECTION
+
+  if ! [[ "$BRANCH_SELECTION" =~ ^[0-9]+$ ]] ||
+    [ "$BRANCH_SELECTION" -lt 1 ] ||
+    [ "$BRANCH_SELECTION" -gt "$BRANCH_COUNT" ]; then
     echo
+    echo "ERROR: Invalid branch selection."
+    exit 1
+  fi
 
-    for ((i=1; i<=BRANCH_COUNT; i++)); do
-        printf "  [%d] %s\n" "$i" "${BRANCHES[$i]}"
-    done
-
-    echo
-    printf "Select branch [1-%d]: " "$BRANCH_COUNT"
-    read -r BRANCH_SELECTION
-
-    if ! [[ "$BRANCH_SELECTION" =~ ^[0-9]+$ ]] ||
-       [ "$BRANCH_SELECTION" -lt 1 ] ||
-       [ "$BRANCH_SELECTION" -gt "$BRANCH_COUNT" ]; then
-        echo
-        echo "ERROR: Invalid branch selection."
-        exit 1
-    fi
-
-    SELECTED_BRANCH="${BRANCHES[$BRANCH_SELECTION]}"
+  SELECTED_BRANCH="${BRANCHES[$BRANCH_SELECTION]}"
 fi
 
 echo
 echo "Selected branch:"
-echo "  $SELECTED_BRANCH"
+echo " $SELECTED_BRANCH"
 echo
 
 # --------------------------------------------------
@@ -126,40 +126,40 @@ echo
 # --------------------------------------------------
 
 if [ -d "$DIR/.git" ]; then
-    echo "Repository already exists. Updating..."
-    cd "$DIR"
+  echo "Repository already exists. Updating..."
+  cd "$DIR"
 
-    git fetch --prune origin
+  git fetch --prune origin
 
-    # Make sure the selected branch exists locally.
-    if git show-ref --verify --quiet "refs/remotes/origin/$SELECTED_BRANCH"; then
-        git checkout -B "$SELECTED_BRANCH" "origin/$SELECTED_BRANCH"
-    else
-        echo "ERROR: Remote branch origin/$SELECTED_BRANCH was not found."
-        exit 1
-    fi
+  # Make sure the selected branch exists locally.
+  if git show-ref --verify --quiet "refs/remotes/origin/$SELECTED_BRANCH"; then
+    git checkout -B "$SELECTED_BRANCH" "origin/$SELECTED_BRANCH"
+  else
+    echo "ERROR: Remote branch origin/$SELECTED_BRANCH was not found."
+    exit 1
+  fi
 
-    git reset --hard "origin/$SELECTED_BRANCH"
+  git reset --hard "origin/$SELECTED_BRANCH"
 
-    echo
-    echo "Git branch:"
-    git branch --show-current
+  echo
+  echo "Git branch:"
+  git branch --show-current
 
-    echo
-    echo "Git commit:"
-    git log -1 --oneline
+  echo
+  echo "Git commit:"
+  git log -1 --oneline
 else
-    echo "Cloning KubeDeck branch '$SELECTED_BRANCH'..."
-    git clone --branch "$SELECTED_BRANCH" --single-branch "$REPO" "$DIR"
-    cd "$DIR"
+  echo "Cloning KubeDeck branch '$SELECTED_BRANCH'..."
+  git clone --branch "$SELECTED_BRANCH" --single-branch "$REPO" "$DIR"
+  cd "$DIR"
 
-    echo
-    echo "Git branch:"
-    git branch --show-current
+  echo
+  echo "Git branch:"
+  git branch --show-current
 
-    echo
-    echo "Git commit:"
-    git log -1 --oneline
+  echo
+  echo "Git commit:"
+  git log -1 --oneline
 fi
 
 echo
@@ -174,56 +174,56 @@ echo
 
 if [[ "$OS" == "Darwin" ]]; then
 
+  echo
+  echo "Checking Homebrew..."
+
+  if ! command -v brew >/dev/null 2>&1; then
     echo
-    echo "Checking Homebrew..."
+    echo "Homebrew is required on macOS."
+    echo
+    echo "Install Homebrew from:"
+    echo "https://brew.sh/"
+    echo
+    exit 1
+  fi
 
-    if ! command -v brew >/dev/null 2>&1; then
-        echo
-        echo "Homebrew is required on macOS."
-        echo
-        echo "Install Homebrew from:"
-        echo "https://brew.sh/"
-        echo
-        exit 1
-    fi
+  echo "Homebrew: $(brew --version | head -n 1)"
 
-    echo "Homebrew: $(brew --version | head -n 1)"
+  # Always use Homebrew Python 3.14.
+  if ! brew list --formula python@3.14 >/dev/null 2>&1; then
+    echo
+    echo "Installing Python 3.14..."
+    brew install python@3.14
+  else
+    echo
+    echo "Python 3.14 already installed."
+  fi
 
-    # Always use Homebrew Python 3.14.
-    if ! brew list --formula python@3.14 >/dev/null 2>&1; then
-        echo
-        echo "Installing Python 3.14..."
-        brew install python@3.14
-    else
-        echo
-        echo "Python 3.14 already installed."
-    fi
+  PYTHON="$(brew --prefix python@3.14)/bin/python3"
 
-    PYTHON="$(brew --prefix python@3.14)/bin/python3"
+  if [ ! -x "$PYTHON" ]; then
+    echo
+    echo "ERROR: Homebrew Python 3.14 was not found:"
+    echo "$PYTHON"
+    exit 1
+  fi
 
-    if [ ! -x "$PYTHON" ]; then
-        echo
-        echo "ERROR: Homebrew Python 3.14 was not found:"
-        echo "$PYTHON"
-        exit 1
-    fi
-
-    # Make Homebrew tools available to child processes as well.
-    export PATH="$(brew --prefix python@3.14)/bin:$(brew --prefix)/bin:$PATH"
+  # Make Homebrew tools available to child processes as well.
+  export PATH="$(brew --prefix python@3.14)/bin:$(brew --prefix)/bin:$PATH"
 
 elif command -v python3 >/dev/null 2>&1; then
 
-    PYTHON="$(command -v python3)"
+  PYTHON="$(command -v python3)"
 
 elif command -v python >/dev/null 2>&1; then
 
-    PYTHON="$(command -v python)"
+  PYTHON="$(command -v python)"
 
 else
 
-    echo
-    echo "Python not found."
-    exit 1
+  echo
+  echo "Python not found."
+  exit 1
 
 fi
 
@@ -238,93 +238,93 @@ echo "$PYTHON"
 
 if [[ "$OS" == "Darwin" ]]; then
 
-    echo
-    echo "Installing macOS native dependencies..."
+  echo
+  echo "Installing macOS native dependencies..."
 
-    # PyAudio -> PortAudio
-    if ! brew list --formula portaudio >/dev/null 2>&1; then
-        echo "Installing PortAudio..."
-        brew install portaudio
-    else
-        echo "PortAudio already installed."
-    fi
+  # PyAudio -> PortAudio
+  if ! brew list --formula portaudio >/dev/null 2>&1; then
+    echo "Installing PortAudio..."
+    brew install portaudio
+  else
+    echo "PortAudio already installed."
+  fi
 
-    # SpeechRecognition -> FLAC
-    #
-    # This is especially important on Apple Silicon.
-    # SpeechRecognition can otherwise fall back to its bundled flac-mac
-    # executable, which can be Intel-only.
-    if ! brew list --formula flac >/dev/null 2>&1; then
-        echo "Installing FLAC..."
-        brew install flac
-    else
-        echo "FLAC already installed."
-    fi
+  # SpeechRecognition -> FLAC
+  #
+  # This is especially important on Apple Silicon.
+  # SpeechRecognition can otherwise fall back to its bundled flac-mac
+  # executable, which can be Intel-only.
+  if ! brew list --formula flac >/dev/null 2>&1; then
+    echo "Installing FLAC..."
+    brew install flac
+  else
+    echo "FLAC already installed."
+  fi
 
-    export PATH="$(brew --prefix)/bin:$PATH"
+  export PATH="$(brew --prefix)/bin:$PATH"
 
-    # Help PyAudio find Homebrew PortAudio headers/libraries.
-    export CPPFLAGS="${CPPFLAGS:-} -I$(brew --prefix portaudio)/include"
-    export LDFLAGS="${LDFLAGS:-} -L$(brew --prefix portaudio)/lib"
-    export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-}:$(brew --prefix portaudio)/lib/pkgconfig"
+  # Help PyAudio find Homebrew PortAudio headers/libraries.
+  export CPPFLAGS="${CPPFLAGS:-} -I$(brew --prefix portaudio)/include"
+  export LDFLAGS="${LDFLAGS:-} -L$(brew --prefix portaudio)/lib"
+  export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-}:$(brew --prefix portaudio)/lib/pkgconfig"
 
 elif [[ "$OS" == "Linux" ]]; then
 
+  echo
+  echo "Checking Linux native dependencies..."
+
+  # PyAudio needs PortAudio development headers.
+  if command -v apt-get >/dev/null 2>&1; then
+
+    echo "Using apt-get..."
+
+    sudo apt-get update
+    sudo apt-get install -y \
+      portaudio19-dev \
+      libportaudiocpp0 \
+      flac \
+      ffmpeg
+
+  elif command -v dnf >/dev/null 2>&1; then
+
+    echo "Using dnf..."
+
+    sudo dnf install -y \
+      portaudio-devel \
+      flac \
+      ffmpeg
+
+  elif command -v yum >/dev/null 2>&1; then
+
+    echo "Using yum..."
+
+    sudo yum install -y \
+      portaudio-devel \
+      flac \
+      ffmpeg
+
+  elif command -v pacman >/dev/null 2>&1; then
+
+    echo "Using pacman..."
+
+    sudo pacman -Sy --noconfirm \
+      portaudio \
+      flac \
+      ffmpeg
+
+  else
+
     echo
-    echo "Checking Linux native dependencies..."
+    echo "WARNING: Could not determine Linux package manager."
+    echo "Make sure PortAudio and FLAC are installed manually."
 
-    # PyAudio needs PortAudio development headers.
-    if command -v apt-get >/dev/null 2>&1; then
-
-        echo "Using apt-get..."
-
-        sudo apt-get update
-        sudo apt-get install -y \
-            portaudio19-dev \
-            libportaudiocpp0 \
-            flac \
-            ffmpeg
-
-    elif command -v dnf >/dev/null 2>&1; then
-
-        echo "Using dnf..."
-
-        sudo dnf install -y \
-            portaudio-devel \
-            flac \
-            ffmpeg
-
-    elif command -v yum >/dev/null 2>&1; then
-
-        echo "Using yum..."
-
-        sudo yum install -y \
-            portaudio-devel \
-            flac \
-            ffmpeg
-
-    elif command -v pacman >/dev/null 2>&1; then
-
-        echo "Using pacman..."
-
-        sudo pacman -Sy --noconfirm \
-            portaudio \
-            flac \
-            ffmpeg
-
-    else
-
-        echo
-        echo "WARNING: Could not determine Linux package manager."
-        echo "Make sure PortAudio and FLAC are installed manually."
-
-    fi
+  fi
 
 elif [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
 
-    echo
-    echo "Windows detected."
-    echo "Python wheels will provide the required Python dependencies."
+  echo
+  echo "Windows detected."
+  echo "Python wheels will provide the required Python dependencies."
 
 fi
 
@@ -336,9 +336,9 @@ echo
 echo "Checking pip..."
 
 if [[ "$OS" == "Darwin" ]]; then
-    "$PYTHON" -m pip --version
+  "$PYTHON" -m pip --version
 else
-    "$PYTHON" -m pip --version
+  "$PYTHON" -m pip --version
 fi
 
 # --------------------------------------------------
@@ -347,27 +347,27 @@ fi
 
 if [ -f requirements.txt ]; then
 
-    echo
-    echo "Installing Python requirements..."
+  echo
+  echo "Installing Python requirements..."
 
-    if [[ "$OS" == "Darwin" ]]; then
+  if [[ "$OS" == "Darwin" ]]; then
 
-        "$PYTHON" -m pip install \
-            --break-system-packages \
-            -r requirements.txt
+    "$PYTHON" -m pip install \
+      --break-system-packages \
+      -r requirements.txt
 
-    else
+  else
 
-        "$PYTHON" -m pip install \
-            -r requirements.txt
+    "$PYTHON" -m pip install \
+      -r requirements.txt
 
-    fi
+  fi
 
 else
 
-    echo
-    echo "ERROR: requirements.txt not found."
-    exit 1
+  echo
+  echo "ERROR: requirements.txt not found."
+  exit 1
 
 fi
 
@@ -384,30 +384,30 @@ import sys
 print("Python:", sys.executable)
 
 required = [
-    ("PyQt5", "PyQt5"),
-    ("paramiko", "paramiko"),
-    ("SpeechRecognition", "speech_recognition"),
-    ("PyAudio", "pyaudio"),
-    ("PyInstaller", "PyInstaller"),
+  ("PyQt5", "PyQt5"),
+  ("paramiko", "paramiko"),
+  ("SpeechRecognition", "speech_recognition"),
+  ("PyAudio", "pyaudio"),
+  ("PyInstaller", "PyInstaller"),
 ]
 
 failed = []
 
 for label, module in required:
-    try:
-        imported = __import__(module)
-        version = getattr(imported, "__version__", "installed")
-        print(f"✓ {label}: {version}")
-    except Exception as exc:
-        print(f"✗ {label}: {exc}")
-        failed.append(label)
+  try:
+    imported = __import__(module)
+    version = getattr(imported, "__version__", "installed")
+    print(f"[OK] {label}: {version}")
+  except Exception as exc:
+    print(f"[ERROR] {label}: {exc}")
+    failed.append(label)
 
 if failed:
-    print()
-    print("Missing/broken dependencies:")
-    for name in failed:
-        print(" -", name)
-    sys.exit(1)
+  print()
+  print("Missing/broken dependencies:")
+  for name in failed:
+    print(" -", name)
+  sys.exit(1)
 
 print()
 print("All Python dependencies are available.")
@@ -419,17 +419,17 @@ PY
 
 if [[ "$OS" == "Darwin" || "$OS" == "Linux" ]]; then
 
+  echo
+  echo "Verifying FLAC..."
+
+  if ! command -v flac >/dev/null 2>&1; then
     echo
-    echo "Verifying FLAC..."
+    echo "ERROR: FLAC executable was not found."
+    exit 1
+  fi
 
-    if ! command -v flac >/dev/null 2>&1; then
-        echo
-        echo "ERROR: FLAC executable was not found."
-        exit 1
-    fi
-
-    echo "FLAC: $(command -v flac)"
-    flac --version | head -n 1
+  echo "FLAC: $(command -v flac)"
+  flac --version | head -n 1
 
 fi
 
@@ -439,21 +439,21 @@ fi
 
 if ! "$PYTHON" -c "import PyInstaller" >/dev/null 2>&1; then
 
-    echo
-    echo "Installing PyInstaller..."
+  echo
+  echo "Installing PyInstaller..."
 
-    if [[ "$OS" == "Darwin" ]]; then
+  if [[ "$OS" == "Darwin" ]]; then
 
-        "$PYTHON" -m pip install \
-            --break-system-packages \
-            "pyinstaller>=6.0"
+    "$PYTHON" -m pip install \
+      --break-system-packages \
+      "pyinstaller>=6.0"
 
-    else
+  else
 
-        "$PYTHON" -m pip install \
-            "pyinstaller>=6.0"
+    "$PYTHON" -m pip install \
+      "pyinstaller>=6.0"
 
-    fi
+  fi
 
 fi
 
@@ -465,17 +465,17 @@ ICON=""
 
 case "$OS" in
 
-    Darwin)
-        if [ -f VM_Visualizer.icns ]; then
-            ICON="VM_Visualizer.icns"
-        fi
-        ;;
+  Darwin)
+    if [ -f VM_Visualizer.icns ]; then
+      ICON="VM_Visualizer.icns"
+    fi
+    ;;
 
-    MINGW*|MSYS*|CYGWIN*)
-        if [ -f VM_Visualizer.ico ]; then
-            ICON="VM_Visualizer.ico"
-        fi
-        ;;
+  MINGW*|MSYS*|CYGWIN*)
+    if [ -f VM_Visualizer.ico ]; then
+      ICON="VM_Visualizer.ico"
+    fi
+    ;;
 
 esac
 
@@ -502,40 +502,56 @@ echo
 echo "Building application..."
 
 CMD=(
-    "$PYTHON"
-    -m
-    PyInstaller
-    --windowed
-    --onedir
-    --name
-    "KubeDeck"
-    --osx-bundle-identifier
-    "com.hareeshgt.ec2manager"
+  "$PYTHON"
+  -m
+  PyInstaller
+  --windowed
+  --onedir
+  --name
+  "KubeDeck"
+  --osx-bundle-identifier
+  "com.hareeshgt.ec2manager"
 
-    # Existing SSH/Paramiko support
-    --hidden-import=paramiko
-    --collect-all=paramiko
+  # Existing SSH/Paramiko support
+  --hidden-import=paramiko
+  --collect-all=paramiko
 
-    # AI provider support
-    --hidden-import=ai_assist
+  # AI provider support
+  --hidden-import=ai_assist
 
-    # Kubernetes Ops Mind
-    --hidden-import=k8s_ai_ops
+  # Kubernetes Ops Mind
+  --hidden-import=k8s_ai_ops
 
-    # Voice input
-    --hidden-import=speech_recognition
-    --hidden-import=pyaudio
+  # Voice input
+  --hidden-import=speech_recognition
+  --hidden-import=pyaudio
 
-    main.py
+  main.py
 )
 
 # Add the icon if available.
 if [ -n "$ICON" ]; then
-    CMD=(
-        "${CMD[@]:0:${#CMD[@]}-1}"
-        "--icon=$ICON"
-        "main.py"
-    )
+  CMD=(
+    "${CMD[@]:0:${#CMD[@]}-1}"
+    "--icon=$ICON"
+    "main.py"
+  )
+fi
+
+# Bundle KubeDeck SVG icons into the PyInstaller application.
+# PyInstaller uses ":" on macOS/Linux and ";" on Windows.
+if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
+  CMD=(
+    "${CMD[@]:0:${#CMD[@]}-1}"
+    "--add-data=assets;assets"
+    "main.py"
+  )
+else
+  CMD=(
+    "${CMD[@]:0:${#CMD[@]}-1}"
+    "--add-data=assets:assets"
+    "main.py"
+  )
 fi
 
 "${CMD[@]}"
@@ -546,74 +562,74 @@ fi
 
 if [[ "$OS" == "Darwin" ]]; then
 
-    APP_PATH="dist/KubeDeck.app"
-    APP_PLIST="$APP_PATH/Contents/Info.plist"
+  APP_PATH="dist/KubeDeck.app"
+  APP_PLIST="$APP_PATH/Contents/Info.plist"
 
-    # Finder-launched apps need an explicit microphone usage description.
-    # Without NSMicrophoneUsageDescription, macOS may not present the
-    # microphone permission prompt and the application may not appear under
-    # System Settings -> Privacy & Security -> Microphone.
+  # Finder-launched apps need an explicit microphone usage description.
+  # Without NSMicrophoneUsageDescription, macOS may not present the
+  # microphone permission prompt and the application may not appear under
+  # System Settings -> Privacy & Security -> Microphone.
+  echo
+  echo "Configuring macOS microphone permission..."
+
+  if [ ! -f "$APP_PLIST" ]; then
     echo
-    echo "Configuring macOS microphone permission..."
+    echo "ERROR: App Info.plist not found:"
+    echo "$APP_PLIST"
+    exit 1
+  fi
 
-    if [ ! -f "$APP_PLIST" ]; then
-        echo
-        echo "ERROR: App Info.plist not found:"
-        echo "$APP_PLIST"
-        exit 1
-    fi
+  /usr/libexec/PlistBuddy     -c "Delete :NSMicrophoneUsageDescription"     "$APP_PLIST" 2>/dev/null || true
 
-    /usr/libexec/PlistBuddy         -c "Delete :NSMicrophoneUsageDescription"         "$APP_PLIST" 2>/dev/null || true
+  /usr/libexec/PlistBuddy     -c "Add :NSMicrophoneUsageDescription string 'KubeDeck uses the microphone for Kubernetes voice commands.'"     "$APP_PLIST"
 
-    /usr/libexec/PlistBuddy         -c "Add :NSMicrophoneUsageDescription string 'KubeDeck uses the microphone for Kubernetes voice commands.'"         "$APP_PLIST"
+  # Give the application a stable bundle identifier.
+  /usr/libexec/PlistBuddy     -c "Delete :CFBundleIdentifier"     "$APP_PLIST" 2>/dev/null || true
 
-    # Give the application a stable bundle identifier.
-    /usr/libexec/PlistBuddy         -c "Delete :CFBundleIdentifier"         "$APP_PLIST" 2>/dev/null || true
+  /usr/libexec/PlistBuddy     -c "Add :CFBundleIdentifier string 'com.hareeshgt.ec2manager'"     "$APP_PLIST"
 
-    /usr/libexec/PlistBuddy         -c "Add :CFBundleIdentifier string 'com.hareeshgt.ec2manager'"         "$APP_PLIST"
+  echo "Microphone usage description added."
+  echo "Bundle identifier: com.hareeshgt.ec2manager"
 
-    echo "Microphone usage description added."
-    echo "Bundle identifier: com.hareeshgt.ec2manager"
+  # PyInstaller may have signed the bundle before Info.plist was changed.
+  # Re-sign the completed bundle so the final application has a consistent
+  # code signature after the privacy metadata update.
+  echo
+  echo "Re-signing macOS application..."
 
-    # PyInstaller may have signed the bundle before Info.plist was changed.
-    # Re-sign the completed bundle so the final application has a consistent
-    # code signature after the privacy metadata update.
+  codesign     --deep     --force     --sign -     "$APP_PATH"
+
+  echo "Application re-signed."
+
+  # The application is launched from Finder, so its PATH cannot be
+  # assumed to contain Homebrew's bin directory.
+  #
+  # The Python application itself adds /opt/homebrew/bin to PATH before
+  # speech recognition, while this check verifies that native FLAC is
+  # available during installation.
+  if [ -x "$(brew --prefix)/bin/flac" ]; then
     echo
-    echo "Re-signing macOS application..."
-
-    codesign         --deep         --force         --sign -         "$APP_PATH"
-
-    echo "Application re-signed."
-
-    # The application is launched from Finder, so its PATH cannot be
-    # assumed to contain Homebrew's bin directory.
-    #
-    # The Python application itself adds /opt/homebrew/bin to PATH before
-    # speech recognition, while this check verifies that native FLAC is
-    # available during installation.
-    if [ -x "$(brew --prefix)/bin/flac" ]; then
-        echo
-        echo "Using native Homebrew FLAC:"
-        echo "$(brew --prefix)/bin/flac"
-    else
-        echo
-        echo "WARNING: Homebrew FLAC was not found."
-    fi
-
-    # Verify the privacy key survived the final bundle/signing step.
-    MICROPHONE_DESC=$(
-        /usr/libexec/PlistBuddy             -c "Print :NSMicrophoneUsageDescription"             "$APP_PLIST" 2>/dev/null || true
-    )
-
-    if [ -z "$MICROPHONE_DESC" ]; then
-        echo
-        echo "ERROR: NSMicrophoneUsageDescription was not added."
-        exit 1
-    fi
-
+    echo "Using native Homebrew FLAC:"
+    echo "$(brew --prefix)/bin/flac"
+  else
     echo
-    echo "Microphone permission metadata verified:"
-    echo "$MICROPHONE_DESC"
+    echo "WARNING: Homebrew FLAC was not found."
+  fi
+
+  # Verify the privacy key survived the final bundle/signing step.
+  MICROPHONE_DESC=$(
+    /usr/libexec/PlistBuddy       -c "Print :NSMicrophoneUsageDescription"       "$APP_PLIST" 2>/dev/null || true
+  )
+
+  if [ -z "$MICROPHONE_DESC" ]; then
+    echo
+    echo "ERROR: NSMicrophoneUsageDescription was not added."
+    exit 1
+  fi
+
+  echo
+  echo "Microphone permission metadata verified:"
+  echo "$MICROPHONE_DESC"
 
 fi
 
@@ -625,78 +641,78 @@ case "$OS" in
 
 Darwin)
 
+  echo
+  echo "Installing on macOS..."
+
+  APP_PATH="dist/KubeDeck.app"
+
+  if [ ! -d "$APP_PATH" ]; then
     echo
-    echo "Installing on macOS..."
+    echo "ERROR: PyInstaller did not create:"
+    echo "$APP_PATH"
+    exit 1
+  fi
 
-    APP_PATH="dist/KubeDeck.app"
+  sudo rm -rf "/Applications/KubeDeck.app"
+  sudo cp -R "$APP_PATH" "/Applications/"
 
-    if [ ! -d "$APP_PATH" ]; then
-        echo
-        echo "ERROR: PyInstaller did not create:"
-        echo "$APP_PATH"
-        exit 1
-    fi
-
-    sudo rm -rf "/Applications/KubeDeck.app"
-    sudo cp -R "$APP_PATH" "/Applications/"
-
-    echo
-    echo "Installed:"
-    echo "/Applications/KubeDeck.app"
-    ;;
+  echo
+  echo "Installed:"
+  echo "/Applications/KubeDeck.app"
+  ;;
 
 Linux)
 
+  echo
+  echo "Installing on Linux..."
+
+  if [ ! -d "dist/KubeDeck" ]; then
     echo
-    echo "Installing on Linux..."
+    echo "ERROR: PyInstaller did not create:"
+    echo "dist/KubeDeck"
+    exit 1
+  fi
 
-    if [ ! -d "dist/KubeDeck" ]; then
-        echo
-        echo "ERROR: PyInstaller did not create:"
-        echo "dist/KubeDeck"
-        exit 1
-    fi
+  sudo rm -rf "/opt/KubeDeck"
+  sudo mkdir -p "/opt/KubeDeck"
+  sudo cp -R "dist/KubeDeck/." "/opt/KubeDeck/"
 
-    sudo rm -rf "/opt/KubeDeck"
-    sudo mkdir -p "/opt/KubeDeck"
-    sudo cp -R "dist/KubeDeck/." "/opt/KubeDeck/"
-
-    echo
-    echo "Installed:"
-    echo "/opt/KubeDeck"
-    ;;
+  echo
+  echo "Installed:"
+  echo "/opt/KubeDeck"
+  ;;
 
 MINGW*|MSYS*|CYGWIN*)
 
+  echo
+  echo "Installing on Windows..."
+
+  INSTALL_DIR="/c/Program Files/KubeDeck"
+
+  if [ ! -d "dist/KubeDeck" ]; then
     echo
-    echo "Installing on Windows..."
+    echo "ERROR: PyInstaller did not create:"
+    echo "dist/KubeDeck"
+    exit 1
+  fi
 
-    INSTALL_DIR="/c/Program Files/KubeDeck"
+  rm -rf "$INSTALL_DIR"
+  mkdir -p "$INSTALL_DIR"
 
-    if [ ! -d "dist/KubeDeck" ]; then
-        echo
-        echo "ERROR: PyInstaller did not create:"
-        echo "dist/KubeDeck"
-        exit 1
-    fi
+  cp -R "dist/KubeDeck/." "$INSTALL_DIR/"
 
-    rm -rf "$INSTALL_DIR"
-    mkdir -p "$INSTALL_DIR"
-
-    cp -R "dist/KubeDeck/." "$INSTALL_DIR/"
-
-    echo
-    echo "Installed to:"
-    echo "$INSTALL_DIR"
-    ;;
+  echo
+  echo "Installed to:"
+  echo "$INSTALL_DIR"
+  ;;
 
 *)
 
-    echo
-    echo "Unsupported operating system:"
-    echo "$OS"
-    exit 1
-    ;;
+  echo
+  echo "Unsupported operating system:"
+  echo "$OS"
+  exit 1
+  ;;
 
 esac
 
@@ -714,12 +730,12 @@ echo "KubeDeck installed successfully!"
 echo "=========================================="
 echo
 echo "Built from GitHub branch:"
-echo "  $SELECTED_BRANCH"
+echo " $SELECTED_BRANCH"
 echo
 echo "Included:"
-echo "  ✓ Kubernetes Ops Mind"
-echo "  ✓ Google Web Speech voice input"
-echo "  ✓ PyAudio microphone support"
-echo "  ✓ Native FLAC support"
-echo "  ✓ AI operation history"
+echo " [OK] Kubernetes Ops Mind"
+echo " [OK] Google Web Speech voice input"
+echo " [OK] PyAudio microphone support"
+echo " [OK] Native FLAC support"
+echo " [OK] AI operation history"
 echo

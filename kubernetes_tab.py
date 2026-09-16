@@ -7,4272 +7,4274 @@ from datetime import datetime, timezone
 
 
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QLineEdit, QProgressBar, QTabWidget, QTreeWidget,
-    QTreeWidgetItem, QListWidget, QListWidgetItem, QTextEdit,
-    QSplitter, QFrame, QSpinBox, QHeaderView, QAbstractItemView,
-    QDialog, QVBoxLayout as _QVL, QDialogButtonBox, QMessageBox,
-    QMenu, QInputDialog, QApplication, QButtonGroup,
+  QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+  QComboBox, QLineEdit, QProgressBar, QTabWidget, QTreeWidget,
+  QTreeWidgetItem, QListWidget, QListWidgetItem, QTextEdit,
+  QSplitter, QFrame, QSpinBox, QHeaderView, QAbstractItemView,
+  QDialog, QVBoxLayout as _QVL, QDialogButtonBox, QMessageBox,
+  QMenu, QInputDialog, QApplication, QButtonGroup,
 )
 
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QProcess, QSize
 from PyQt5.QtGui import QColor, QFont, QFontDatabase
 from PyQt5.QtWidgets import QCompleter
 
+from ui_icons import set_icon, apply_text_icon, add_icon_tab, icon_button, icon_pixmap
 from themes import T, apply_qss_to, load_settings, save_settings
 from workers import CommandWorker, track_worker
 from dialogs import (
-    LogViewerDialog, ExecDialog, ManageTunnelServicesDialog,
-    ContainerPickerDialog, AIExplainDialog,
+  LogViewerDialog, ExecDialog, ManageTunnelServicesDialog,
+  ContainerPickerDialog, AIExplainDialog,
 )
 import ai_assist
 from k8s_ai_ops import K8sAIOpsWidget
 from k8s_cards import (
-    PodCardWidget, DeploymentCardWidget, ConfigCardWidget,
-    ServiceCardWidget, IngressCardWidget,
-    StatefulSetCardWidget, DaemonSetCardWidget, EventCardWidget,
-    HPACardWidget, PVCCardWidget, PVCardWidget, JobCardWidget,
-    CronJobCardWidget,
+  PodCardWidget, DeploymentCardWidget, ConfigCardWidget,
+  ServiceCardWidget, IngressCardWidget,
+  StatefulSetCardWidget, DaemonSetCardWidget, EventCardWidget,
+  HPACardWidget, PVCCardWidget, PVCardWidget, JobCardWidget,
+  CronJobCardWidget,
 )
 from utils import (
-    append_terminal_html, append_terminal_text,
-    load_tunnel_services, REMOTE_TUNNEL_CSV_PATH,
-    monospace_font,
+  append_terminal_html, append_terminal_text,
+  load_tunnel_services, REMOTE_TUNNEL_CSV_PATH,
+  monospace_font,
 )
 
 
 class KubernetesTab(QWidget):
-    status_msg = pyqtSignal(str)
-    # Emitted whenever the selected kubeconfig context changes. Other tabs
-    # (Dashboard, future observability views, etc.) can follow the same
-    # cluster without touching the jump host's global current-context.
-    context_changed = pyqtSignal(str)
-
-    # Cap on simultaneous tunnel-restart CommandWorkers. Each worker's
-    # run() opens TWO channels on the shared SSH transport (one exec_command
-    # to probe $HOME, one for the actual restart command) — see workers.py.
-    # sshd's default MaxSessions caps concurrent channels per connection at
-    # 10, so firing off every selected service's worker at once (previously
-    # all of them, unbounded) blew past that ceiling once more than ~5
-    # services were selected, and every worker past the limit failed with
-    # ChannelException(2, 'Connect failed') / "Unable to open channel."
-    # Staying at 4 concurrent workers (≤8 channels) keeps headroom under
-    # the default limit even on servers with other channels already open.
-    MAX_CONCURRENT_TUNNEL_RESTARTS = 4
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.ssh          = None
-        self._current_ns  = "default"
-        self._current_context = ""
-        self._cluster_available = False
-        self._cluster_probe_in_progress = False
-        self._contexts = []
-        self._contexts_pending_select = None
-        self._namespaces  = []
-        self._namespaces_pending_select = None
-        self._workers     = []
-        # Inline "✨ AI" button on pod cards (see _on_pod_card_ai_requested):
-        # single-flight state so a second click (on any card) while a
-        # diagnosis is already running for one pod just no-ops rather than
-        # overlapping requests / dialogs.
-        self._pod_ai_pod        = None   # name of the pod currently being diagnosed, if any
-        self._pod_ai_card       = None   # the PodCardWidget that started it, so its button can be re-enabled
-        self._pod_ai_log_worker = None
-        self._pod_ai_worker     = None
-        self._pod_ai_dialog     = None
-        self._events_raw  = ""
-        self._events_warnings_only = False
-        self._auto_refresh_timer = QTimer(self)
-        self._auto_refresh_timer.timeout.connect(self._auto_refresh)
-        # Local (client-side) connection details, used to run the SSH
-        # tunnel on the machine running this app rather than over the
-        # existing remote `self.ssh` session.
-        self._conn_host   = None
-        self._conn_port   = 22
-        self._conn_user   = None
-        self._conn_pem    = None
-        self._tunnel_services = []
-        self._tunnel_col_widths = (20, 20)
-        self._tunnel_process  = None
-        # "all" | "active" | "inactive" — set by the status-filter toggle
-        # in the Tunnels tab; combined with the text search in
-        # _filter_tunnel_services().
-        self._tunnel_status_filter = "all"
-        # Remote CSV path tunnel services are read from/written to — lets
-        # each person point this at their own file (e.g. a per-project or
-        # per-team convention) instead of being locked to the hardcoded
-        # default. Persisted across restarts via themes.save_settings.
-        self._tunnel_csv_path = load_settings().get("tunnel_csv_path") or REMOTE_TUNNEL_CSV_PATH
-        self._build_ui()
-
-    # ── Kubernetes context helpers ───────────────────────────
-    def _context_flag(self) -> str:
-        context = (self._current_context or "").strip()
-        return f"--context={shlex.quote(context)}" if context else ""
-
-    def _apply_context_to_command(self, cmd: str) -> str:
-        """Apply the selected context to a kubectl command."""
-        if not cmd or not self._current_context:
-            return cmd
-        stripped = cmd.lstrip()
-        if not re.match(r"^kubectl(?:\s|$)", stripped):
-            return cmd
-        if re.search(r"(?:^|\s)--context(?:=|\s)", stripped):
-            return cmd
-        prefix_len = len(cmd) - len(stripped)
-        return cmd[:prefix_len] + "kubectl " + self._context_flag() + stripped[len("kubectl"): ]
-
-    def _load_contexts(self):
-        """Load kubeconfig contexts, but do not start resource queries yet.
-
-        A machine may have kubectl/kubeconfig installed while the configured
-        cluster is unavailable.  In that case we only do the context lookup
-        and one cluster-health probe; resource tabs remain completely idle.
-        """
-        self._cluster_available = False
-        self._cluster_probe_in_progress = False
-        self._auto_refresh_timer.stop()
-        self._run_cmd(
-            "kubectl config get-contexts -o name",
-            self._populate_contexts,
-            apply_context=False,
-        )
-
-    def _populate_contexts(self, out: str):
-        contexts = [x.strip() for x in (out or "").splitlines() if x.strip()]
-        self._contexts = contexts
-        current = self._current_context
-
-        self.context_combo.blockSignals(True)
-        self.context_combo.clear()
-        self.context_combo.addItems(contexts)
-        chosen = current if current in contexts else (contexts[0] if contexts else "")
-        if chosen:
-            self.context_combo.setCurrentText(chosen)
-            self._current_context = chosen
-        self.context_combo.blockSignals(False)
-
-        if not self._current_context:
-            self._cluster_available = False
-            self._current_ns = ""
-            self.ns_combo.clear()
-            self.health_lbl.setText("● No Kubernetes Cluster Found")
-            self.health_lbl.setStyleSheet(f"color: {T['WARNING']}; font-size: 12px;")
-            return
-
-        self.health_lbl.setText(f"● Checking")
-        self.health_lbl.setStyleSheet(f"color: {T['WARNING']}; font-size: 12px;")
-        self._check_cluster_health()
-
-    def _on_context_change(self, context: str):
-        context = (context or "").strip()
-        if not context or context == self._current_context:
-            return
-
-        self._cluster_available = False
-        self._cluster_probe_in_progress = False
-        self._auto_refresh_timer.stop()
-        self._current_context = context
-        self.context_changed.emit(context)
-        self._current_ns = "default"
-        self.ns_combo.blockSignals(True)
-        self.ns_combo.clear()
-        self.ns_combo.addItem("Loading…")
-        self.ns_combo.blockSignals(False)
-        self.health_lbl.setText(f"● Checking")
-        self.health_lbl.setStyleSheet(f"color: {T['WARNING']}; font-size: 12px;")
-        self._check_cluster_health()
-
-    # ── Local connection info (for tunnelling) ────────────────
-    def set_connection_info(self, host, port, user, pem):
-        self._conn_host = host
-        self._conn_port = port or 22
-        self._conn_user = user
-        self._conn_pem  = pem
-
-    def clear_connection_info(self):
-        self._stop_tunnel()
-        self._conn_host = None
-        self._conn_port = 22
-        self._conn_user = None
-        self._conn_pem  = None
-        self._tunnel_services = []
-        self.tunnel_list.clear()
-        self.tunnel_cmd_preview.clear()
-
-    # ── SSH wiring ────────────────────────────────────────────
-    def set_ssh(self, ssh):
-        self.ssh = ssh
-        if hasattr(self, "k8s_ai_ops"):
-            self.k8s_ai_ops.set_ssh(ssh)
-
-        if ssh:
-            self._load_contexts()
-            self._load_tunnel_csv()      # Load from this VM
-        else:
-            self._clear_all()
-
-            self._tunnel_services = []
-            self.tunnel_list.clear()
-            self.tunnel_cmd_preview.clear()
-
-    # ── UI construction ───────────────────────────────────────
-    def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-
-        # Control bar
-        self.ctrl_bar = QWidget()
-        self.ctrl_bar.setFixedHeight(52)
-        self.ctrl_bar.setStyleSheet(
-            f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
-        )
-        cb = QHBoxLayout(self.ctrl_bar)
-        cb.setContentsMargins(12, 0, 12, 0)
-        cb.setSpacing(10)
-
-        # Kubernetes context picker — a jump host can have multiple clusters.
-        self.context_group = QWidget()
-        self.context_group.setObjectName("context_group")
-        self.context_group.setFixedHeight(40)
-        ctx_row = QHBoxLayout(self.context_group)
-        ctx_row.setContentsMargins(14, 0, 8, 0)
-        ctx_row.setSpacing(9)
-        self.context_dot = QLabel("●")
-        self.context_dot.setStyleSheet(f"color: {T['ACCENT2']}; font-size: 11px; background: transparent;")
-        ctx_row.addWidget(self.context_dot)
-        ctx_lbl = QLabel("CLUSTER")
-        ctx_lbl.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; background: transparent;")
-        ctx_row.addWidget(ctx_lbl)
-        self.context_combo = QComboBox()
-        self.context_combo.setObjectName("context_combo")
-        self.context_combo.setMinimumWidth(190)
-        self.context_combo.setFixedHeight(30)
-        self.context_combo.setMaxVisibleItems(12)
-        self.context_combo.setEditable(True)
-        self.context_combo.setInsertPolicy(QComboBox.NoInsert)
-        self.context_combo.completer().setCompletionMode(QCompleter.PopupCompletion)
-        self.context_combo.completer().setFilterMode(Qt.MatchContains)
-        self.context_combo.currentTextChanged.connect(self._on_context_change)
-        ctx_row.addWidget(self.context_combo)
-        self._style_context_group()
-        cb.addWidget(self.context_group)
-        self.context_refresh_btn = self._toolbar_btn("↻", tooltip="Refresh Kubernetes contexts")
-        self.context_refresh_btn.setFixedWidth(34)
-        self.context_refresh_btn.clicked.connect(self._load_contexts)
-        cb.addWidget(self.context_refresh_btn)
-
-        cb.addWidget(self._vline())
-
-        # Namespace picker, grouped into one rounded "chip" (dot + label +
-        # combo sharing a pill background) instead of three bare widgets
-        # floating loose on the toolbar — reads as a single catchy control
-        # rather than a thin, easy-to-miss dropdown.
-        self.ns_group = QWidget()
-        self.ns_group.setObjectName("ns_group")
-        self.ns_group.setFixedHeight(40)
-        ns_row = QHBoxLayout(self.ns_group)
-        ns_row.setContentsMargins(14, 0, 8, 0)
-        ns_row.setSpacing(9)
-        self.ns_dot = QLabel("●")
-        self.ns_dot.setStyleSheet(f"color: {T['ACCENT']}; font-size: 11px; background: transparent;")
-        ns_row.addWidget(self.ns_dot)
-        ns_lbl = QLabel("NAMESPACE")
-        ns_lbl.setStyleSheet(
-            f"color: {T['TEXT_DIM']}; font-size: 11px; font-weight: 700; "
-            f"letter-spacing: 0.5px; background: transparent;"
-        )
-        ns_row.addWidget(ns_lbl)
-        self.ns_combo = QComboBox()
-        self.ns_combo.setObjectName("ns_combo")
-        self.ns_combo.setMinimumWidth(190)
-        self.ns_combo.setFixedHeight(30)
-        self.ns_combo.setMaxVisibleItems(12)
-        self.ns_combo.setEditable(True)
-        self.ns_combo.setInsertPolicy(QComboBox.NoInsert)
-        self.ns_combo.completer().setCompletionMode(QCompleter.PopupCompletion)
-        self.ns_combo.completer().setFilterMode(Qt.MatchContains)
-        self.ns_combo.currentTextChanged.connect(self._on_ns_change)
-        ns_row.addWidget(self.ns_combo)
-        self._style_ns_group()
-        cb.addWidget(self.ns_group)
-
-        # Namespace create — small icon button living right next to the
-        # picker rather than buried in a menu, since switching is already
-        # the picker's job.
-        self.ns_new_btn = self._toolbar_btn("＋", tooltip="Create namespace…")
-        self.ns_new_btn.setFixedWidth(34)
-        self.ns_new_btn.clicked.connect(self._create_namespace)
-        cb.addWidget(self.ns_new_btn)
-
-        cb.addWidget(self._vline())
-
-        self.refresh_btn = self._toolbar_btn("↺  Refresh")
-        self.refresh_btn.clicked.connect(self._refresh_current_tab)
-        cb.addWidget(self.refresh_btn)
-
-        self.auto_btn = self._toolbar_btn("⏱  Auto (30 s)")
-        self.auto_btn.setCheckable(True)
-        self.auto_btn.toggled.connect(self._toggle_auto_refresh)
-        cb.addWidget(self.auto_btn)
-        cb.addWidget(self._vline())
-
-        self.health_lbl = QLabel("● Cluster")
-        self.health_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px;")
-        cb.addWidget(self.health_lbl)
-        cb.addStretch()
-
-        # self.kubectl_inp = QLineEdit()
-        # self.kubectl_inp.setPlaceholderText("kubectl …  (raw command)")
-        # self.kubectl_inp.setMaximumWidth(320)
-        # self.kubectl_inp.returnPressed.connect(self._run_kubectl)
-        # cb.addWidget(self.kubectl_inp)
-
-        # self.run_btn = self._toolbar_btn("Run")
-        # self.run_btn.clicked.connect(self._run_kubectl)
-        # cb.addWidget(self.run_btn)
-        # root.addWidget(self.ctrl_bar)
-        root.addWidget(self.ctrl_bar)
-
-        self.progress = QProgressBar()
-        self.progress.setFixedHeight(3)
-        self.progress.setRange(0, 0)
-        self.progress.hide()
-        root.addWidget(self.progress)
-
-        self.sub_tabs = QTabWidget()
-        self.sub_tabs.setTabPosition(QTabWidget.North)
-        self.sub_tabs.currentChanged.connect(self._refresh_current_tab)
-        root.addWidget(self.sub_tabs)
-
-        self._build_pods_tab()
-        self._build_deployments_tab()
-        self._build_statefulsets_tab()
-        self._build_daemonsets_tab()
-        self._build_hpa_tab()
-        self._build_services_tab()
-        self._build_ingress_tab()
-        self._build_jobs_tab()
-        self._build_storage_tab()
-        self._build_config_tab()
-        self._build_events_tab()
-        self._build_tunnels_tab()
-        self._build_terminal_tab()
-        self._build_ai_ops_tab()
-
-    def _vline(self):
-        f = QFrame()
-        f.setFrameShape(QFrame.VLine)
-        f.setStyleSheet(f"color: {T['BORDER']};")
-        f.setFixedWidth(1)
-        return f
-
-    def _style_context_group(self):
-        self.context_group.setStyleSheet(
-            f"QWidget#context_group {{ background: {T['BG_ITEM']}; border: 1px solid {T['BORDER']}; border-radius: 20px; }}"
-        )
-        self.context_combo.setStyleSheet(
-            f"QComboBox#context_combo {{ background: {T['BG_PANEL']}; color: {T['TEXT_PRIMARY']}; border: 1.5px solid {T['ACCENT2']}; border-radius: 15px; padding: 2px 30px 2px 14px; font-size: 13px; font-weight: 600; min-width: 190px; }}"
-            f"QComboBox#context_combo:hover {{ border-color: {T['ACCENT']}; background: {T['BG_HOVER']}; }}"
-            f"QComboBox#context_combo::drop-down {{ border: none; width: 26px; }}"
-        )
-
-    def _style_ns_group(self):
-        """Pill chip around the namespace picker + a bigger, bolder combo
-        box than the app-wide default. Set directly on the two widgets
-        (rather than in themes.py's global QComboBox rule) so every other
-        dropdown in the app keeps its normal size — only this one, the
-        most-used control on the tab, gets the larger treatment. Re-called
-        from apply_theme() on every theme switch since the colours below
-        are baked in as literal hex at call time."""
-        self._style_context_group()
-        self.ns_group.setStyleSheet(
-            f"QWidget#ns_group {{ background: {T['BG_ITEM']}; "
-            f"border: 1px solid {T['BORDER']}; border-radius: 20px; }}"
-        )
-        self.ns_combo.setStyleSheet(
-            f"QComboBox#ns_combo {{ background: {T['BG_PANEL']}; color: {T['TEXT_PRIMARY']}; "
-            f"border: 1.5px solid {T['ACCENT']}; border-radius: 15px; "
-            f"padding: 2px 30px 2px 14px; font-size: 13px; font-weight: 600; min-width: 190px; }}"
-            f"QComboBox#ns_combo:hover {{ border-color: {T['ACCENT2']}; background: {T['BG_HOVER']}; }}"
-            f"QComboBox#ns_combo::drop-down {{ border: none; width: 26px; }}"
-            f"QComboBox#ns_combo::down-arrow {{ width: 10px; height: 10px; }}"
-        )
-
-    def _toolbar_btn(self, label: str, object_name: str = None, tooltip: str = "") -> QPushButton:
-        """Build a toolbar action button with a uniform, fixed shape.
-
-        Buttons here mix plain text with emoji glyphs ("📋  Logs", "🔌  Tunnel",
-        "Run", …). Emoji fall back to a different font than the rest of the
-        label, and that fallback font's line-height isn't the same as
-        'Segoe UI' — so without a fixed height, buttons with an emoji end up
-        a few px taller than plain-text ones, and the shared border-radius
-        then reads as visually different corner shapes across the toolbar.
-        Forcing every button through this one helper keeps height, padding,
-        and radius identical everywhere regardless of label content.
-        """
-        btn = QPushButton(label)
-        if object_name:
-            btn.setObjectName(object_name)
-        if tooltip:
-            btn.setToolTip(tooltip)
-        btn.setFixedHeight(32)
-        btn.setStyleSheet("padding: 0 14px;")
-        return btn
-
-    def _set_count_badge(self, lbl: QLabel, text: str, color_key: str = "TEXT_DIM"):
-        """Style a QLabel as a small pill badge, matching the card badges
-        in k8s_cards.py, and set its text in one call."""
-        color = T.get(color_key, T["TEXT_DIM"])
-        r = int(color[1:3], 16)
-        g = int(color[3:5], 16)
-        b = int(color[5:7], 16)
-        lbl.setText(text)
-        lbl.setStyleSheet(
-            f"background: rgba({r},{g},{b},0.15); color: {color}; "
-            f"border: 1px solid rgba({r},{g},{b},0.4); border-radius: 9px; "
-            f"padding: 3px 10px; font-size: 12px; font-weight: 700;"
-        )
-
-    def _build_pods_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        tb = QHBoxLayout()
-        tb.setContentsMargins(10, 6, 10, 6)
-        tb.setSpacing(8)
-        self.pod_filter = QLineEdit()
-        self.pod_filter.setPlaceholderText("🔍  Filter pods…")
-        self.pod_filter.setMaximumWidth(200)
-        self.pod_filter.textChanged.connect(self._filter_pods)
-        tb.addWidget(self.pod_filter)
-
-        self.pod_count_lbl = QLabel("")
-        tb.addWidget(self.pod_count_lbl)
-        tb.addStretch()
-
-        # Safe, frequent actions live inside one clustered pill; the
-        # destructive action (Delete) sits outside it with a gap, so it
-        # can never be misclicked as "just another button in the row".
-        cluster = QFrame()
-        cluster.setObjectName("action_cluster")
-        cl = QHBoxLayout(cluster)
-        cl.setContentsMargins(4, 4, 4, 4)
-        cl.setSpacing(2)
-        for label, obj, slot in [
-            ("📋  Logs",    "pod_logs_btn",    self._pod_logs),
-            ("💻  Exec",    "pod_exec_btn",    self._pod_exec),
-            ("↺  Restart",  "pod_restart_btn", self._pod_restart),
-        ]:
-            btn = self._toolbar_btn(label)
-            btn.setFlat(True)
-            btn.setStyleSheet("border: none; padding: 0 14px; background: transparent;")
-            setattr(self, obj, btn)
-            btn.clicked.connect(slot)
-            cl.addWidget(btn)
-        tb.addWidget(cluster)
-        self.pod_action_cluster = cluster
-
-        self.pod_del_btn = self._toolbar_btn("🗑  Delete", object_name="danger")
-        self.pod_del_btn.clicked.connect(self._pod_delete)
-        tb.addWidget(self.pod_del_btn)
-
-        cluster.setStyleSheet(
-            f"QFrame#action_cluster {{ background: {T['BG_ITEM']}; border-radius: 8px; }}"
-        )
-
-        tb_widget = QWidget()
-        tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
-        tb_widget.setLayout(tb)
-        lay.addWidget(tb_widget)
-        self.pods_toolbar = tb_widget
-
-        # Pods render as cards (see k8s_cards.py) rather than table rows —
-        # each card carries its own meta dict via Qt.UserRole, the same
-        # "meta dict + setItemWidget()" pattern file_widgets.py already uses
-        # for the file list. Namespace is folded into a chip on the card
-        # itself (only shown in "(all namespaces)" view) instead of a
-        # dedicated hidden column.
-        self.pod_list = QListWidget()
-        self.pod_list.setSpacing(6)
-        self.pod_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.pod_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.pod_list.customContextMenuRequested.connect(self._pod_ctx_menu)
-        self.pod_list.itemDoubleClicked.connect(self._on_pod_double_click)
-        self.pod_list.currentItemChanged.connect(self._on_pod_selection_changed)
-        self.pod_list.setStyleSheet(
-            "QListWidget { background: transparent; border: none; padding: 8px; }"
-            "QListWidget::item { border: none; padding: 0; margin: 0; }"
-        )
-        lay.addWidget(self.pod_list)
-        self.sub_tabs.addTab(w, "🐳  Pods")
-
-    def _build_deployments_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        tb = QHBoxLayout()
-        tb.setContentsMargins(10, 6, 10, 6)
-        tb.setSpacing(8)
-        self.deploy_filter = QLineEdit()
-        self.deploy_filter.setPlaceholderText("🔍  Filter deployments…")
-        self.deploy_filter.setMaximumWidth(200)
-        self.deploy_filter.textChanged.connect(self._filter_deployments)
-        tb.addWidget(self.deploy_filter)
-
-        self.deploy_count_lbl = QLabel("")
-        tb.addWidget(self.deploy_count_lbl)
-        tb.addStretch()
-
-        self.scale_spin = QSpinBox()
-        self.scale_spin.setRange(0, 100)
-        self.scale_spin.setValue(1)
-        self.scale_spin.setFixedWidth(70)
-        self.scale_spin.setToolTip("Replicas")
-        tb.addWidget(QLabel("Replicas:"))
-
-        self.scale_minus_btn = self._toolbar_btn(
-            "−", tooltip="Scale down by 1 replica (applies immediately)")
-        self.scale_minus_btn.setFixedWidth(32)
-        # _toolbar_btn's shared style adds 14px of padding on each side,
-        # which at this button's width left almost nothing for the glyph
-        # itself — override it so "−"/"+" actually render, centered.
-        self.scale_minus_btn.setStyleSheet("padding: 0; font-size: 16px; font-weight: 600;")
-        self.scale_minus_btn.clicked.connect(lambda: self._deploy_scale_step(-1))
-        tb.addWidget(self.scale_minus_btn)
-
-        tb.addWidget(self.scale_spin)
-
-        self.scale_plus_btn = self._toolbar_btn(
-            "+", tooltip="Scale up by 1 replica (applies immediately)")
-        self.scale_plus_btn.setFixedWidth(32)
-        self.scale_plus_btn.setStyleSheet("padding: 0; font-size: 16px; font-weight: 600;")
-        self.scale_plus_btn.clicked.connect(lambda: self._deploy_scale_step(1))
-        tb.addWidget(self.scale_plus_btn)
-
-        for label, obj, slot in [
-            ("⇅  Scale",    "dep_scale_btn",   self._deploy_scale),
-            ("↺  Restart",  "dep_restart_btn",  self._deploy_restart),
-            ("📋  Describe", "dep_desc_btn",    self._deploy_describe),
-            ("🗑  Delete",   "dep_del_btn",     self._deploy_delete),
-        ]:
-            obj_name = "danger" if "Delete" in label else ("primary" if "" in label else None)
-            btn = self._toolbar_btn(label, object_name=obj_name)
-            setattr(self, obj, btn)
-            btn.clicked.connect(slot)
-            tb.addWidget(btn)
-
-        tb_widget = QWidget()
-        tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
-        tb_widget.setLayout(tb)
-        lay.addWidget(tb_widget)
-        self.deploy_toolbar = tb_widget
-
-        # Same card-list treatment as Pods — see k8s_cards.py.
-        self.deploy_list = QListWidget()
-        self.deploy_list.setSpacing(6)
-        self.deploy_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.deploy_list.itemClicked.connect(self._on_deploy_click)
-        self.deploy_list.itemDoubleClicked.connect(self._on_deploy_double_click)
-        self.deploy_list.currentItemChanged.connect(self._on_deploy_selection_changed)
-        self.deploy_list.setStyleSheet(
-            "QListWidget { background: transparent; border: none; padding: 8px; }"
-            "QListWidget::item { border: none; padding: 0; margin: 0; }"
-        )
-        lay.addWidget(self.deploy_list)
-        self.sub_tabs.addTab(w, "🚀  Deployments")
-
-    def _build_statefulsets_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        tb = QHBoxLayout()
-        tb.setContentsMargins(10, 6, 10, 6)
-        tb.setSpacing(8)
-        self.sts_filter = QLineEdit()
-        self.sts_filter.setPlaceholderText("🔍  Filter statefulsets…")
-        self.sts_filter.setMaximumWidth(200)
-        self.sts_filter.textChanged.connect(self._filter_statefulsets)
-        tb.addWidget(self.sts_filter)
-
-        self.sts_count_lbl = QLabel("")
-        tb.addWidget(self.sts_count_lbl)
-        tb.addStretch()
-
-        self.sts_scale_spin = QSpinBox()
-        self.sts_scale_spin.setRange(0, 100)
-        self.sts_scale_spin.setValue(1)
-        self.sts_scale_spin.setFixedWidth(70)
-        self.sts_scale_spin.setToolTip("Replicas")
-        tb.addWidget(QLabel("Replicas:"))
-        tb.addWidget(self.sts_scale_spin)
-
-        for label, obj, slot in [
-            ("⇅  Scale",     "sts_scale_btn",   self._sts_scale),
-            ("↺  Restart",   "sts_restart_btn", self._sts_restart),
-            ("📋  Describe",  "sts_desc_btn",    self._sts_describe),
-            ("🗑  Delete",    "sts_del_btn",     self._sts_delete),
-        ]:
-            obj_name = "danger" if "Delete" in label else None
-            btn = self._toolbar_btn(label, object_name=obj_name)
-            setattr(self, obj, btn)
-            btn.clicked.connect(slot)
-            tb.addWidget(btn)
-
-        tb_widget = QWidget()
-        tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
-        tb_widget.setLayout(tb)
-        lay.addWidget(tb_widget)
-        self.sts_toolbar = tb_widget
-
-        self.sts_list = QListWidget()
-        self.sts_list.setSpacing(6)
-        self.sts_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.sts_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.sts_list.customContextMenuRequested.connect(self._sts_ctx_menu)
-        self.sts_list.itemClicked.connect(self._on_sts_click)
-        self.sts_list.itemDoubleClicked.connect(self._on_sts_double_click)
-        self.sts_list.currentItemChanged.connect(self._on_sts_selection_changed)
-        self.sts_list.setStyleSheet(
-            "QListWidget { background: transparent; border: none; padding: 8px; }"
-            "QListWidget::item { border: none; padding: 0; margin: 0; }"
-        )
-        lay.addWidget(self.sts_list)
-        self.sub_tabs.addTab(w, "📚  StatefulSets")
-
-    def _build_daemonsets_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        tb = QHBoxLayout()
-        tb.setContentsMargins(10, 6, 10, 6)
-        tb.setSpacing(8)
-        self.ds_filter = QLineEdit()
-        self.ds_filter.setPlaceholderText("🔍  Filter daemonsets…")
-        self.ds_filter.setMaximumWidth(200)
-        self.ds_filter.textChanged.connect(self._filter_daemonsets)
-        tb.addWidget(self.ds_filter)
-
-        self.ds_count_lbl = QLabel("")
-        tb.addWidget(self.ds_count_lbl)
-        tb.addStretch()
-
-        # No Scale control — DaemonSets run exactly one pod per matching
-        # node, so "replica count" isn't a thing a person can set here.
-        for label, obj, slot in [
-            ("↺  Restart",   "ds_restart_btn", self._ds_restart),
-            ("📋  Describe",  "ds_desc_btn",    self._ds_describe),
-            ("🗑  Delete",    "ds_del_btn",     self._ds_delete),
-        ]:
-            obj_name = "danger" if "Delete" in label else None
-            btn = self._toolbar_btn(label, object_name=obj_name)
-            setattr(self, obj, btn)
-            btn.clicked.connect(slot)
-            tb.addWidget(btn)
-
-        tb_widget = QWidget()
-        tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
-        tb_widget.setLayout(tb)
-        lay.addWidget(tb_widget)
-        self.ds_toolbar = tb_widget
-
-        self.ds_list = QListWidget()
-        self.ds_list.setSpacing(6)
-        self.ds_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.ds_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.ds_list.customContextMenuRequested.connect(self._ds_ctx_menu)
-        self.ds_list.itemDoubleClicked.connect(self._on_ds_double_click)
-        self.ds_list.currentItemChanged.connect(self._on_ds_selection_changed)
-        self.ds_list.setStyleSheet(
-            "QListWidget { background: transparent; border: none; padding: 8px; }"
-            "QListWidget::item { border: none; padding: 0; margin: 0; }"
-        )
-        lay.addWidget(self.ds_list)
-        self.sub_tabs.addTab(w, "🛡  DaemonSets")
-
-    def _build_hpa_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        tb = QHBoxLayout()
-        tb.setContentsMargins(10, 6, 10, 6)
-        tb.setSpacing(8)
-        self.hpa_filter = QLineEdit()
-        self.hpa_filter.setPlaceholderText("🔍  Filter autoscalers…")
-        self.hpa_filter.setMaximumWidth(200)
-        self.hpa_filter.textChanged.connect(self._filter_hpas)
-        tb.addWidget(self.hpa_filter)
-
-        self.hpa_count_lbl = QLabel("")
-        tb.addWidget(self.hpa_count_lbl)
-        tb.addStretch()
-
-        # Read-only status view — no Scale button, since an HPA's whole
-        # point is that it decides replica counts itself. Describe/Delete
-        # are still useful (Delete to hand control back to a manual
-        # `kubectl scale`, Describe to see the full condition history
-        # behind why it hasn't scaled).
-        self.hpa_desc_btn = self._toolbar_btn("📋  Describe")
-        self.hpa_desc_btn.clicked.connect(self._hpa_describe)
-        tb.addWidget(self.hpa_desc_btn)
-
-        self.hpa_del_btn = self._toolbar_btn("🗑  Delete", object_name="danger")
-        self.hpa_del_btn.clicked.connect(self._hpa_delete)
-        tb.addWidget(self.hpa_del_btn)
-
-        tb_widget = QWidget()
-        tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
-        tb_widget.setLayout(tb)
-        lay.addWidget(tb_widget)
-        self.hpa_toolbar = tb_widget
-
-        self.hpa_list = QListWidget()
-        self.hpa_list.setSpacing(6)
-        self.hpa_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.hpa_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.hpa_list.customContextMenuRequested.connect(self._hpa_ctx_menu)
-        self.hpa_list.itemDoubleClicked.connect(self._on_hpa_double_click)
-        self.hpa_list.currentItemChanged.connect(self._on_hpa_selection_changed)
-        self.hpa_list.setStyleSheet(
-            "QListWidget { background: transparent; border: none; padding: 8px; }"
-            "QListWidget::item { border: none; padding: 0; margin: 0; }"
-        )
-        lay.addWidget(self.hpa_list)
-        self.sub_tabs.addTab(w, "📈  HPA")
-
-    def _build_services_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        tb = QHBoxLayout()
-        tb.setContentsMargins(10, 6, 10, 6)
-        tb.setSpacing(8)
-        self.svc_filter = QLineEdit()
-        self.svc_filter.setPlaceholderText("🔍  Filter services…")
-        self.svc_filter.setMaximumWidth(200)
-        self.svc_filter.textChanged.connect(self._filter_services)
-        tb.addWidget(self.svc_filter)
-
-        self.svc_count_lbl = QLabel("")
-        tb.addWidget(self.svc_count_lbl)
-        tb.addStretch()
-
-        self.svc_desc_btn = self._toolbar_btn("📋  Describe")
-        self.svc_desc_btn.clicked.connect(self._svc_describe)
-        tb.addWidget(self.svc_desc_btn)
-
-        self.svc_del_btn = self._toolbar_btn("🗑  Delete", object_name="danger")
-        self.svc_del_btn.clicked.connect(self._svc_delete)
-        tb.addWidget(self.svc_del_btn)
-
-        tb_widget = QWidget()
-        tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
-        tb_widget.setLayout(tb)
-        lay.addWidget(tb_widget)
-        self.svc_toolbar = tb_widget
-
-        # Same card-list treatment as Pods/Deployments — see k8s_cards.py.
-        self.svc_list = QListWidget()
-        self.svc_list.setSpacing(6)
-        self.svc_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.svc_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.svc_list.customContextMenuRequested.connect(self._svc_ctx_menu)
-        self.svc_list.itemDoubleClicked.connect(self._on_svc_double_click)
-        self.svc_list.currentItemChanged.connect(self._on_svc_selection_changed)
-        self.svc_list.setStyleSheet(
-            "QListWidget { background: transparent; border: none; padding: 8px; }"
-            "QListWidget::item { border: none; padding: 0; margin: 0; }"
-        )
-        lay.addWidget(self.svc_list)
-        self.sub_tabs.addTab(w, "🧭  Services")
-
-    def _build_ingress_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        tb = QHBoxLayout()
-        tb.setContentsMargins(10, 6, 10, 6)
-        tb.setSpacing(8)
-        self.ing_filter = QLineEdit()
-        self.ing_filter.setPlaceholderText("🔍  Filter ingress…")
-        self.ing_filter.setMaximumWidth(200)
-        self.ing_filter.textChanged.connect(self._filter_ingress)
-        tb.addWidget(self.ing_filter)
-
-        self.ing_count_lbl = QLabel("")
-        tb.addWidget(self.ing_count_lbl)
-        tb.addStretch()
-
-        self.ing_desc_btn = self._toolbar_btn("📋  Describe")
-        self.ing_desc_btn.clicked.connect(self._ing_describe)
-        tb.addWidget(self.ing_desc_btn)
-
-        self.ing_del_btn = self._toolbar_btn("🗑  Delete", object_name="danger")
-        self.ing_del_btn.clicked.connect(self._ing_delete)
-        tb.addWidget(self.ing_del_btn)
-
-        tb_widget = QWidget()
-        tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
-        tb_widget.setLayout(tb)
-        lay.addWidget(tb_widget)
-        self.ing_toolbar = tb_widget
-
-        self.ing_list = QListWidget()
-        self.ing_list.setSpacing(6)
-        self.ing_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.ing_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.ing_list.customContextMenuRequested.connect(self._ing_ctx_menu)
-        self.ing_list.itemDoubleClicked.connect(self._on_ing_double_click)
-        self.ing_list.currentItemChanged.connect(self._on_ing_selection_changed)
-        self.ing_list.setStyleSheet(
-            "QListWidget { background: transparent; border: none; padding: 8px; }"
-            "QListWidget::item { border: none; padding: 0; margin: 0; }"
-        )
-        lay.addWidget(self.ing_list)
-        self.sub_tabs.addTab(w, "🌐  Ingress")
-
-
-    def _build_ai_ops_tab(self):
-        """Natural-language Kubernetes operations powered by AI."""
-
-        w = QWidget()
-
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        self.k8s_ai_ops = K8sAIOpsWidget(
-            kube_context_getter=lambda: self._current_context,
-            ssh=self.ssh,
-            namespace_getter=lambda: self._current_ns,
-            context_getter=self._ai_ops_context,
-            parent=w,
-        )
-
-        self.k8s_ai_ops.operation_finished.connect(
-            self._on_ai_ops_operation_finished
-        )
-
-        lay.addWidget(self.k8s_ai_ops)
-
-        self.sub_tabs.addTab(
-            w,
-            "✨  Ops Mind",
-        )
-
-    def _ai_ops_context(self):
-        """Give Ops Mind a small amount of useful UI context.
-
-        The AI still has to identify the resource explicitly unless the user
-        gives enough information. This context is only there to improve
-        interpretation.
-        """
-
-        parts = []
-
-        # Current namespace.
-        parts.append(
-            f"Selected namespace: {self._current_ns or 'default'}"
-        )
-
-        # Selected deployment, if any.
-        try:
-            item = self.deploy_list.currentItem()
-
-            if item is not None:
-                meta = item.data(Qt.UserRole) or {}
-
-                name = meta.get("name")
-                namespace = meta.get("namespace")
-
-                if name:
-                    parts.append(
-                        f"Selected deployment: {name}"
-                    )
-
-                if namespace:
-                    parts.append(
-                        f"Selected deployment namespace: {namespace}"
-                    )
-        except Exception:
-            pass
-
-        # Selected pod, if any.
-        try:
-            item = self.pod_list.currentItem()
-
-            if item is not None:
-                meta = item.data(Qt.UserRole) or {}
-
-                name = meta.get("name")
-                namespace = meta.get("namespace")
-
-                if name:
-                    parts.append(
-                        f"Selected pod: {name}"
-                    )
-
-                if namespace:
-                    parts.append(
-                        f"Selected pod namespace: {namespace}"
-                    )
-        except Exception:
-            pass
-
-        return "\n".join(parts)
-
-    def _on_ai_ops_operation_finished(self):
-        """Refresh the visible Kubernetes resource list after an AI operation."""
-
-        try:
-            self._refresh_current_tab()
-        except Exception:
-            pass
-
-    # ── Jobs & CronJobs ───────────────────────────────────────
-    def _build_jobs_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setHandleWidth(1)
-
-        left = QWidget()
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(0, 0, 0, 0)
-        ll.setSpacing(0)
-
-        self.wl_type_bar = QWidget()
-        self.wl_type_bar.setFixedHeight(58)
-        self.wl_type_bar.setStyleSheet(
-            f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
-        )
-        tb_lay = QHBoxLayout(self.wl_type_bar)
-        tb_lay.setContentsMargins(12, 10, 12, 10)
-        tb_lay.setSpacing(10)
-
-        self.wl_type_toggle = QWidget()
-        self.wl_type_toggle.setObjectName("wl_type_toggle")
-        self.wl_type_toggle.setFixedHeight(36)
-        toggle_lay = QHBoxLayout(self.wl_type_toggle)
-        toggle_lay.setContentsMargins(3, 3, 3, 3)
-        toggle_lay.setSpacing(2)
-        self.wl_type_jobs_btn = QPushButton("⚙  Jobs")
-        self.wl_type_cron_btn = QPushButton("⏰  CronJobs")
-        for btn in (self.wl_type_jobs_btn, self.wl_type_cron_btn):
-            btn.setCheckable(True)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setFixedHeight(30)
-            toggle_lay.addWidget(btn)
-        self.wl_type_jobs_btn.setChecked(True)
-        self.wl_type_jobs_btn.clicked.connect(lambda: self._set_workload_type("Jobs"))
-        self.wl_type_cron_btn.clicked.connect(lambda: self._set_workload_type("CronJobs"))
-        self._workload_type = "Jobs"
-        self._style_toggle(self.wl_type_toggle, (self.wl_type_jobs_btn, self.wl_type_cron_btn))
-        tb_lay.addWidget(self.wl_type_toggle)
-
-        self.wl_filter = QLineEdit()
-        self.wl_filter.setPlaceholderText("🔍  Filter…")
-        self.wl_filter.textChanged.connect(self._filter_workloads)
-        tb_lay.addWidget(self.wl_filter, 1)
-
-        self.wl_count_lbl = QLabel("")
-        tb_lay.addWidget(self.wl_count_lbl)
-        ll.addWidget(self.wl_type_bar)
-
-        wl_actions = QHBoxLayout()
-        wl_actions.setContentsMargins(10, 6, 10, 6)
-        wl_actions.setSpacing(8)
-
-        self.wl_trigger_btn = self._toolbar_btn("▶  Trigger Now", object_name="primary",
-                                                  tooltip="Manually run this CronJob now")
-        self.wl_trigger_btn.clicked.connect(self._workload_trigger_now)
-        wl_actions.addWidget(self.wl_trigger_btn)
-
-        self.wl_suspend_btn = self._toolbar_btn("⏸  Suspend",
-                                                  tooltip="Toggle Suspend/Resume for this CronJob")
-        self.wl_suspend_btn.clicked.connect(self._workload_toggle_suspend)
-        wl_actions.addWidget(self.wl_suspend_btn)
-
-        wl_actions.addStretch()
-
-        self.wl_desc_btn = self._toolbar_btn("📋  Describe")
-        self.wl_desc_btn.clicked.connect(self._workload_describe)
-        wl_actions.addWidget(self.wl_desc_btn)
-
-        self.wl_del_btn = self._toolbar_btn("🗑  Delete", object_name="danger")
-        self.wl_del_btn.clicked.connect(self._workload_delete)
-        wl_actions.addWidget(self.wl_del_btn)
-
-        wl_actions_widget = QWidget()
-        wl_actions_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
-        wl_actions_widget.setLayout(wl_actions)
-        ll.addWidget(wl_actions_widget)
-        self.wl_toolbar = wl_actions_widget
-
-        self.wl_list = QListWidget()
-        self.wl_list.setSpacing(6)
-        self.wl_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.wl_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.wl_list.customContextMenuRequested.connect(self._workload_ctx_menu)
-        self.wl_list.itemDoubleClicked.connect(self._on_workload_double_click)
-        self.wl_list.currentItemChanged.connect(self._on_workload_selection_changed)
-        self.wl_list.setStyleSheet(
-            "QListWidget { background: transparent; border: none; padding: 8px; }"
-            "QListWidget::item { border: none; padding: 0; margin: 0; }"
-        )
-        ll.addWidget(self.wl_list)
-        splitter.addWidget(left)
-
-        right = QWidget()
-        rl = QVBoxLayout(right)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.setSpacing(0)
-
-        self.wl_history_hdr = QLabel("  Run History")
-        self.wl_history_hdr.setFixedHeight(34)
-        self.wl_history_hdr.setStyleSheet(
-            f"background: {T['BG_PANEL']}; color: {T['TEXT_DIM']}; font-size: 13px; "
-            f"font-weight: 700; border-bottom: 1px solid {T['BORDER']}; padding-left: 14px;"
-        )
-        rl.addWidget(self.wl_history_hdr)
-
-        self.wl_history_hint = QLabel("  Select a CronJob to see its recent Job runs.")
-        self.wl_history_hint.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px; padding: 12px;")
-        self.wl_history_hint.setWordWrap(True)
-        rl.addWidget(self.wl_history_hint)
-
-        self.wl_history_list = QListWidget()
-        self.wl_history_list.setSpacing(6)
-        self.wl_history_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.wl_history_list.itemDoubleClicked.connect(self._on_wl_history_double_click)
-        self.wl_history_list.setStyleSheet(
-            "QListWidget { background: transparent; border: none; padding: 8px; }"
-            "QListWidget::item { border: none; padding: 0; margin: 0; }"
-        )
-        rl.addWidget(self.wl_history_list)
-
-        splitter.addWidget(right)
-        splitter.setSizes([440, 480])
-        lay.addWidget(splitter)
-        self.sub_tabs.addTab(w, "⚙️  Jobs & CronJobs")
-        self._update_workload_action_visibility()
-
-    def _style_toggle(self, widget, buttons):
-        """Generic segmented-toggle styling shared by every ConfigMaps/
-        Secrets-style two-way switch on this tab (Config's own toggle
-        keeps its dedicated _style_cfg_toggle since it existed first —
-        this is for the newer Storage/Jobs toggles so their CSS doesn't
-        have to be copy-pasted per tab). Re-called from apply_theme()."""
-        widget.setStyleSheet(
-            f"QWidget#{widget.objectName()} {{ background: {T['BG_ITEM']}; "
-            f"border: 1px solid {T['BORDER']}; border-radius: 18px; }}"
-        )
-        btn_css = f"""
-            QPushButton {{
-                background: transparent; color: {T['TEXT_DIM']};
-                border: none; border-radius: 15px; padding: 0 16px;
-                font-size: 12px; font-weight: 700;
-            }}
-            QPushButton:hover:!checked {{ background: {T['BG_HOVER']}; color: {T['TEXT_PRIMARY']}; }}
-            QPushButton:checked {{ background: {T['ACCENT']}; color: white; }}
-        """
-        for b in buttons:
-            b.setStyleSheet(btn_css)
-
-    def _update_workload_action_visibility(self):
-        """Trigger Now / Suspend only make sense for CronJobs — Jobs are
-        one-shot and have no schedule to suspend."""
-        is_cron = (self._workload_type == "CronJobs")
-        self.wl_trigger_btn.setVisible(is_cron)
-        self.wl_suspend_btn.setVisible(is_cron)
-        self.wl_history_hdr.setVisible(is_cron)
-        self.wl_history_hint.setVisible(is_cron)
-        self.wl_history_list.setVisible(is_cron)
-        if not is_cron:
-            self.wl_history_list.clear()
-
-    def _set_workload_type(self, name: str):
-        self._workload_type = name
-        self.wl_type_jobs_btn.setChecked(name == "Jobs")
-        self.wl_type_cron_btn.setChecked(name == "CronJobs")
-        self._update_workload_action_visibility()
-        self._load_workloads()
-
-    def _load_workloads(self, _=None):
-        if self._workload_type == "CronJobs":
-            self._load_cronjobs()
-        else:
-            self._load_jobs()
-
-    @staticmethod
-    def _job_status(status: dict, spec: dict) -> str:
-        conditions = status.get("conditions") or []
-        for c in conditions:
-            if c.get("type") == "Complete" and c.get("status") == "True":
-                return "Complete"
-            if c.get("type") == "Failed" and c.get("status") == "True":
-                return "Failed"
-        if status.get("active"):
-            return "Running"
-        if status.get("succeeded"):
-            return "Complete"
-        if status.get("failed"):
-            return "Failed"
-        return "Pending"
-
-    @staticmethod
-    def _job_duration(status: dict) -> str:
-        start = status.get("startTime")
-        end   = status.get("completionTime")
-        if not start:
-            return "-"
-        try:
-            t0 = datetime.strptime(start, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        except Exception:
-            return "-"
-        t1 = datetime.now(timezone.utc)
-        if end:
-            try:
-                t1 = datetime.strptime(end, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-            except Exception:
-                pass
-        secs = max(0, int((t1 - t0).total_seconds()))
-        if secs < 60:
-            return f"{secs}s"
-        mins = secs // 60
-        if mins < 60:
-            return f"{mins}m{secs % 60}s"
-        hours = mins // 60
-        return f"{hours}h{mins % 60}m"
-
-    def _load_jobs(self):
-        self._run_cmd(f"kubectl get jobs {self._ns_flag()} -o json 2>&1", self._populate_jobs)
-
-    def _job_meta_from_item(self, it: dict) -> dict:
-        meta_o = it.get("metadata") or {}
-        spec   = it.get("spec") or {}
-        status = it.get("status") or {}
-        completions = spec.get("completions", 1)
-        succeeded   = status.get("succeeded", 0)
-        owner = ""
-        for ref in meta_o.get("ownerReferences") or []:
-            if ref.get("kind") == "CronJob":
-                owner = ref.get("name", "")
-                break
-        return {
-            "namespace":   meta_o.get("namespace", ""),
-            "name":        meta_o.get("name", ""),
-            "status":      self._job_status(status, spec),
-            "completions": f"{succeeded}/{completions}",
-            "duration":    self._job_duration(status),
-            "owner":       owner,
-            "age":         self._humanize_age(meta_o.get("creationTimestamp", "")),
-        }
-
-    def _populate_jobs(self, out: str):
-        self.wl_list.clear()
-        all_ns = (self._current_ns == "(all namespaces)")
-        try:
-            items = json.loads(out).get("items", [])
-        except Exception:
-            items = []
-        for it in items:
-            meta = self._job_meta_from_item(it)
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, {**meta, "kind": "job"})
-            item.setSizeHint(QSize(0, JobCardWidget.CARD_HEIGHT))
-            self.wl_list.addItem(item)
-            self.wl_list.setItemWidget(item, JobCardWidget(meta, all_ns))
-        total = len(items)
-        color_key = "TEXT_MUTED" if total == 0 else "INFO"
-        self._set_count_badge(self.wl_count_lbl, f"{total} job{'s' if total != 1 else ''}", color_key)
-        self._filter_workloads(self.wl_filter.text())
-
-    def _load_cronjobs(self):
-        self._run_cmd(f"kubectl get cronjobs {self._ns_flag()} -o json 2>&1", self._populate_cronjobs)
-
-    def _populate_cronjobs(self, out: str):
-        self.wl_list.clear()
-        all_ns = (self._current_ns == "(all namespaces)")
-        try:
-            items = json.loads(out).get("items", [])
-        except Exception:
-            items = []
-        for it in items:
-            meta_o = it.get("metadata") or {}
-            spec   = it.get("spec") or {}
-            status = it.get("status") or {}
-            meta = {
-                "namespace":     meta_o.get("namespace", ""),
-                "name":          meta_o.get("name", ""),
-                "schedule":      spec.get("schedule", "-"),
-                "suspend":       bool(spec.get("suspend", False)),
-                "active":        len(status.get("active") or []),
-                "last_schedule": self._humanize_age(status.get("lastScheduleTime", "")) if status.get("lastScheduleTime") else "never",
-                "age":           self._humanize_age(meta_o.get("creationTimestamp", "")),
-            }
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, {**meta, "kind": "cronjob"})
-            item.setSizeHint(QSize(0, CronJobCardWidget.CARD_HEIGHT))
-            self.wl_list.addItem(item)
-            self.wl_list.setItemWidget(item, CronJobCardWidget(meta, all_ns))
-        total = len(items)
-        color_key = "TEXT_MUTED" if total == 0 else "INFO"
-        self._set_count_badge(self.wl_count_lbl, f"{total} cronjob{'s' if total != 1 else ''}", color_key)
-        self._filter_workloads(self.wl_filter.text())
-
-    def _filter_workloads(self, text: str):
-        q = text.lower()
-        for i in range(self.wl_list.count()):
-            item = self.wl_list.item(i)
-            meta = item.data(Qt.UserRole) or {}
-            item.setHidden(q not in meta.get("name", "").lower())
-
-    def _selected_workload(self) -> tuple:  # (Optional[dict])
-        item = self.wl_list.currentItem()
-        if not item:
-            QMessageBox.warning(self, "No selection", "Select a job or cronjob first.")
-            return None
-        return item.data(Qt.UserRole) or {}
-
-    def _on_workload_double_click(self, item):
+  status_msg = pyqtSignal(str)
+  # Emitted whenever the selected kubeconfig context changes. Other tabs
+  # (Dashboard, future observability views, etc.) can follow the same
+  # cluster without touching the jump host's global current-context.
+  context_changed = pyqtSignal(str)
+
+  # Cap on simultaneous tunnel-restart CommandWorkers. Each worker's
+  # run() opens TWO channels on the shared SSH transport (one exec_command
+  # to probe $HOME, one for the actual restart command) — see workers.py.
+  # sshd's default MaxSessions caps concurrent channels per connection at
+  # 10, so firing off every selected service's worker at once (previously
+  # all of them, unbounded) blew past that ceiling once more than ~5
+  # services were selected, and every worker past the limit failed with
+  # ChannelException(2, 'Connect failed') / "Unable to open channel."
+  # Staying at 4 concurrent workers (≤8 channels) keeps headroom under
+  # the default limit even on servers with other channels already open.
+  MAX_CONCURRENT_TUNNEL_RESTARTS = 4
+
+  def __init__(self, parent=None):
+    super().__init__(parent)
+    self.ssh     = None
+    self._current_ns = "default"
+    self._current_context = ""
+    self._cluster_available = False
+    self._cluster_probe_in_progress = False
+    self._contexts = []
+    self._contexts_pending_select = None
+    self._namespaces = []
+    self._namespaces_pending_select = None
+    self._workers   = []
+    # Inline " AI" button on pod cards (see _on_pod_card_ai_requested):
+    # single-flight state so a second click (on any card) while a
+    # diagnosis is already running for one pod just no-ops rather than
+    # overlapping requests / dialogs.
+    self._pod_ai_pod    = None  # name of the pod currently being diagnosed, if any
+    self._pod_ai_card    = None  # the PodCardWidget that started it, so its button can be re-enabled
+    self._pod_ai_log_worker = None
+    self._pod_ai_worker   = None
+    self._pod_ai_dialog   = None
+    self._events_raw = ""
+    self._events_warnings_only = False
+    self._auto_refresh_timer = QTimer(self)
+    self._auto_refresh_timer.timeout.connect(self._auto_refresh)
+    # Local (client-side) connection details, used to run the SSH
+    # tunnel on the machine running this app rather than over the
+    # existing remote `self.ssh` session.
+    self._conn_host  = None
+    self._conn_port  = 22
+    self._conn_user  = None
+    self._conn_pem  = None
+    self._tunnel_services = []
+    self._tunnel_col_widths = (20, 20)
+    self._tunnel_process = None
+    # "all" | "active" | "inactive" — set by the status-filter toggle
+    # in the Tunnels tab; combined with the text search in
+    # _filter_tunnel_services().
+    self._tunnel_status_filter = "all"
+    # Remote CSV path tunnel services are read from/written to — lets
+    # each person point this at their own file (e.g. a per-project or
+    # per-team convention) instead of being locked to the hardcoded
+    # default. Persisted across restarts via themes.save_settings.
+    self._tunnel_csv_path = load_settings().get("tunnel_csv_path") or REMOTE_TUNNEL_CSV_PATH
+    self._build_ui()
+
+  # ── Kubernetes context helpers ───────────────────────────
+  def _context_flag(self) -> str:
+    context = (self._current_context or "").strip()
+    return f"--context={shlex.quote(context)}" if context else ""
+
+  def _apply_context_to_command(self, cmd: str) -> str:
+    """Apply the selected context to a kubectl command."""
+    if not cmd or not self._current_context:
+      return cmd
+    stripped = cmd.lstrip()
+    if not re.match(r"^kubectl(?:\s|$)", stripped):
+      return cmd
+    if re.search(r"(?:^|\s)--context(?:=|\s)", stripped):
+      return cmd
+    prefix_len = len(cmd) - len(stripped)
+    return cmd[:prefix_len] + "kubectl " + self._context_flag() + stripped[len("kubectl"): ]
+
+  def _load_contexts(self):
+    """Load kubeconfig contexts, but do not start resource queries yet.
+
+    A machine may have kubectl/kubeconfig installed while the configured
+    cluster is unavailable. In that case we only do the context lookup
+    and one cluster-health probe; resource tabs remain completely idle.
+    """
+    self._cluster_available = False
+    self._cluster_probe_in_progress = False
+    self._auto_refresh_timer.stop()
+    self._run_cmd(
+      "kubectl config get-contexts -o name",
+      self._populate_contexts,
+      apply_context=False,
+    )
+
+  def _populate_contexts(self, out: str):
+    contexts = [x.strip() for x in (out or "").splitlines() if x.strip()]
+    self._contexts = contexts
+    current = self._current_context
+
+    self.context_combo.blockSignals(True)
+    self.context_combo.clear()
+    self.context_combo.addItems(contexts)
+    chosen = current if current in contexts else (contexts[0] if contexts else "")
+    if chosen:
+      self.context_combo.setCurrentText(chosen)
+      self._current_context = chosen
+    self.context_combo.blockSignals(False)
+
+    if not self._current_context:
+      self._cluster_available = False
+      self._current_ns = ""
+      self.ns_combo.clear()
+      self.health_lbl.setText("● No Kubernetes Cluster Found")
+      self.health_lbl.setStyleSheet(f"color: {T['WARNING']}; font-size: 12px;")
+      return
+
+    self.health_lbl.setText(f"● Checking")
+    self.health_lbl.setStyleSheet(f"color: {T['WARNING']}; font-size: 12px;")
+    self._check_cluster_health()
+
+  def _on_context_change(self, context: str):
+    context = (context or "").strip()
+    if not context or context == self._current_context:
+      return
+
+    self._cluster_available = False
+    self._cluster_probe_in_progress = False
+    self._auto_refresh_timer.stop()
+    self._current_context = context
+    self.context_changed.emit(context)
+    self._current_ns = "default"
+    self.ns_combo.blockSignals(True)
+    self.ns_combo.clear()
+    self.ns_combo.addItem("Loading…")
+    self.ns_combo.blockSignals(False)
+    self.health_lbl.setText(f"● Checking")
+    self.health_lbl.setStyleSheet(f"color: {T['WARNING']}; font-size: 12px;")
+    self._check_cluster_health()
+
+  # ── Local connection info (for tunnelling) ────────────────
+  def set_connection_info(self, host, port, user, pem):
+    self._conn_host = host
+    self._conn_port = port or 22
+    self._conn_user = user
+    self._conn_pem = pem
+
+  def clear_connection_info(self):
+    self._stop_tunnel()
+    self._conn_host = None
+    self._conn_port = 22
+    self._conn_user = None
+    self._conn_pem = None
+    self._tunnel_services = []
+    self.tunnel_list.clear()
+    self.tunnel_cmd_preview.clear()
+
+  # ── SSH wiring ────────────────────────────────────────────
+  def set_ssh(self, ssh):
+    self.ssh = ssh
+    if hasattr(self, "k8s_ai_ops"):
+      self.k8s_ai_ops.set_ssh(ssh)
+
+    if ssh:
+      self._load_contexts()
+      self._load_tunnel_csv()   # Load from this VM
+    else:
+      self._clear_all()
+
+      self._tunnel_services = []
+      self.tunnel_list.clear()
+      self.tunnel_cmd_preview.clear()
+
+  # ── UI construction ───────────────────────────────────────
+  def _build_ui(self):
+    root = QVBoxLayout(self)
+    root.setContentsMargins(0, 0, 0, 0)
+    root.setSpacing(0)
+
+    # Control bar
+    self.ctrl_bar = QWidget()
+    self.ctrl_bar.setFixedHeight(52)
+    self.ctrl_bar.setStyleSheet(
+      f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
+    )
+    cb = QHBoxLayout(self.ctrl_bar)
+    cb.setContentsMargins(12, 0, 12, 0)
+    cb.setSpacing(10)
+
+    # Kubernetes context picker — a jump host can have multiple clusters.
+    self.context_group = QWidget()
+    self.context_group.setObjectName("context_group")
+    self.context_group.setFixedHeight(40)
+    ctx_row = QHBoxLayout(self.context_group)
+    ctx_row.setContentsMargins(14, 0, 8, 0)
+    ctx_row.setSpacing(9)
+    self.context_dot = QLabel("●")
+    self.context_dot.setStyleSheet(f"color: {T['ACCENT2']}; font-size: 11px; background: transparent;")
+    ctx_row.addWidget(self.context_dot)
+    ctx_lbl = QLabel("CLUSTER")
+    ctx_lbl.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; background: transparent;")
+    ctx_row.addWidget(ctx_lbl)
+    self.context_combo = QComboBox()
+    self.context_combo.setObjectName("context_combo")
+    self.context_combo.setMinimumWidth(190)
+    self.context_combo.setFixedHeight(30)
+    self.context_combo.setMaxVisibleItems(12)
+    self.context_combo.setEditable(True)
+    self.context_combo.setInsertPolicy(QComboBox.NoInsert)
+    self.context_combo.completer().setCompletionMode(QCompleter.PopupCompletion)
+    self.context_combo.completer().setFilterMode(Qt.MatchContains)
+    self.context_combo.currentTextChanged.connect(self._on_context_change)
+    ctx_row.addWidget(self.context_combo)
+    self._style_context_group()
+    cb.addWidget(self.context_group)
+    self.context_refresh_btn = self._toolbar_btn("↻", tooltip="Refresh Kubernetes contexts")
+    self.context_refresh_btn.setFixedWidth(34)
+    self.context_refresh_btn.clicked.connect(self._load_contexts)
+    cb.addWidget(self.context_refresh_btn)
+
+    cb.addWidget(self._vline())
+
+    # Namespace picker, grouped into one rounded "chip" (dot + label +
+    # combo sharing a pill background) instead of three bare widgets
+    # floating loose on the toolbar — reads as a single catchy control
+    # rather than a thin, easy-to-miss dropdown.
+    self.ns_group = QWidget()
+    self.ns_group.setObjectName("ns_group")
+    self.ns_group.setFixedHeight(40)
+    ns_row = QHBoxLayout(self.ns_group)
+    ns_row.setContentsMargins(14, 0, 8, 0)
+    ns_row.setSpacing(9)
+    self.ns_dot = QLabel("●")
+    self.ns_dot.setStyleSheet(f"color: {T['ACCENT']}; font-size: 11px; background: transparent;")
+    ns_row.addWidget(self.ns_dot)
+    ns_lbl = QLabel("NAMESPACE")
+    ns_lbl.setStyleSheet(
+      f"color: {T['TEXT_DIM']}; font-size: 11px; font-weight: 700; "
+      f"letter-spacing: 0.5px; background: transparent;"
+    )
+    ns_row.addWidget(ns_lbl)
+    self.ns_combo = QComboBox()
+    self.ns_combo.setObjectName("ns_combo")
+    self.ns_combo.setMinimumWidth(190)
+    self.ns_combo.setFixedHeight(30)
+    self.ns_combo.setMaxVisibleItems(12)
+    self.ns_combo.setEditable(True)
+    self.ns_combo.setInsertPolicy(QComboBox.NoInsert)
+    self.ns_combo.completer().setCompletionMode(QCompleter.PopupCompletion)
+    self.ns_combo.completer().setFilterMode(Qt.MatchContains)
+    self.ns_combo.currentTextChanged.connect(self._on_ns_change)
+    ns_row.addWidget(self.ns_combo)
+    self._style_ns_group()
+    cb.addWidget(self.ns_group)
+
+    # Namespace create — small icon button living right next to the
+    # picker rather than buried in a menu, since switching is already
+    # the picker's job.
+    self.ns_new_btn = self._toolbar_btn("＋", tooltip="Create namespace…")
+    self.ns_new_btn.setFixedWidth(34)
+    self.ns_new_btn.clicked.connect(self._create_namespace)
+    cb.addWidget(self.ns_new_btn)
+
+    cb.addWidget(self._vline())
+
+    self.refresh_btn = self._toolbar_btn("↺ Refresh")
+    self.refresh_btn.clicked.connect(self._refresh_current_tab)
+    cb.addWidget(self.refresh_btn)
+
+    self.auto_btn = self._toolbar_btn("⏱ Auto (30 s)")
+    self.auto_btn.setCheckable(True)
+    self.auto_btn.toggled.connect(self._toggle_auto_refresh)
+    cb.addWidget(self.auto_btn)
+    cb.addWidget(self._vline())
+
+    self.health_lbl = QLabel("● Cluster")
+    self.health_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px;")
+    cb.addWidget(self.health_lbl)
+    cb.addStretch()
+
+    # self.kubectl_inp = QLineEdit()
+    # self.kubectl_inp.setPlaceholderText("kubectl … (raw command)")
+    # self.kubectl_inp.setMaximumWidth(320)
+    # self.kubectl_inp.returnPressed.connect(self._run_kubectl)
+    # cb.addWidget(self.kubectl_inp)
+
+    # self.run_btn = self._toolbar_btn("Run")
+    # self.run_btn.clicked.connect(self._run_kubectl)
+    # cb.addWidget(self.run_btn)
+    # root.addWidget(self.ctrl_bar)
+    root.addWidget(self.ctrl_bar)
+
+    self.progress = QProgressBar()
+    self.progress.setFixedHeight(3)
+    self.progress.setRange(0, 0)
+    self.progress.hide()
+    root.addWidget(self.progress)
+
+    self.sub_tabs = QTabWidget()
+    self.sub_tabs.setTabPosition(QTabWidget.North)
+    self.sub_tabs.currentChanged.connect(self._refresh_current_tab)
+    root.addWidget(self.sub_tabs)
+
+    self._build_pods_tab()
+    self._build_deployments_tab()
+    self._build_statefulsets_tab()
+    self._build_daemonsets_tab()
+    self._build_hpa_tab()
+    self._build_services_tab()
+    self._build_ingress_tab()
+    self._build_jobs_tab()
+    self._build_storage_tab()
+    self._build_config_tab()
+    self._build_events_tab()
+    self._build_tunnels_tab()
+    self._build_terminal_tab()
+    self._build_ai_ops_tab()
+
+  def _vline(self):
+    f = QFrame()
+    f.setFrameShape(QFrame.VLine)
+    f.setStyleSheet(f"color: {T['BORDER']};")
+    f.setFixedWidth(1)
+    return f
+
+  def _style_context_group(self):
+    self.context_group.setStyleSheet(
+      f"QWidget#context_group {{ background: {T['BG_ITEM']}; border: 1px solid {T['BORDER']}; border-radius: 20px; }}"
+    )
+    self.context_combo.setStyleSheet(
+      f"QComboBox#context_combo {{ background: {T['BG_PANEL']}; color: {T['TEXT_PRIMARY']}; border: 1.5px solid {T['ACCENT2']}; border-radius: 15px; padding: 2px 30px 2px 14px; font-size: 13px; font-weight: 600; min-width: 190px; }}"
+      f"QComboBox#context_combo:hover {{ border-color: {T['ACCENT']}; background: {T['BG_HOVER']}; }}"
+      f"QComboBox#context_combo::drop-down {{ border: none; width: 26px; }}"
+    )
+
+  def _style_ns_group(self):
+    """Pill chip around the namespace picker + a bigger, bolder combo
+    box than the app-wide default. Set directly on the two widgets
+    (rather than in themes.py's global QComboBox rule) so every other
+    dropdown in the app keeps its normal size — only this one, the
+    most-used control on the tab, gets the larger treatment. Re-called
+    from apply_theme() on every theme switch since the colours below
+    are baked in as literal hex at call time."""
+    self._style_context_group()
+    self.ns_group.setStyleSheet(
+      f"QWidget#ns_group {{ background: {T['BG_ITEM']}; "
+      f"border: 1px solid {T['BORDER']}; border-radius: 20px; }}"
+    )
+    self.ns_combo.setStyleSheet(
+      f"QComboBox#ns_combo {{ background: {T['BG_PANEL']}; color: {T['TEXT_PRIMARY']}; "
+      f"border: 1.5px solid {T['ACCENT']}; border-radius: 15px; "
+      f"padding: 2px 30px 2px 14px; font-size: 13px; font-weight: 600; min-width: 190px; }}"
+      f"QComboBox#ns_combo:hover {{ border-color: {T['ACCENT2']}; background: {T['BG_HOVER']}; }}"
+      f"QComboBox#ns_combo::drop-down {{ border: none; width: 26px; }}"
+      f"QComboBox#ns_combo::down-arrow {{ width: 10px; height: 10px; }}"
+    )
+
+  def _toolbar_btn(self, label: str, object_name: str = None, tooltip: str = "") -> QPushButton:
+    """Build a toolbar action button with a uniform, fixed shape.
+
+    Buttons here mix plain text with emoji glyphs (" Logs", " Tunnel",
+    "Run", …). Emoji fall back to a different font than the rest of the
+    label, and that fallback font's line-height isn't the same as
+    'Segoe UI' — so without a fixed height, buttons with an emoji end up
+    a few px taller than plain-text ones, and the shared border-radius
+    then reads as visually different corner shapes across the toolbar.
+    Forcing every button through this one helper keeps height, padding,
+    and radius identical everywhere regardless of label content.
+    """
+    btn = QPushButton()
+    apply_text_icon(btn, label)
+    if object_name:
+      btn.setObjectName(object_name)
+    if tooltip:
+      btn.setToolTip(tooltip)
+    btn.setFixedHeight(32)
+    btn.setStyleSheet("padding: 0 14px;")
+    return btn
+
+  def _set_count_badge(self, lbl: QLabel, text: str, color_key: str = "TEXT_DIM"):
+    """Style a QLabel as a small pill badge, matching the card badges
+    in k8s_cards.py, and set its text in one call."""
+    color = T.get(color_key, T["TEXT_DIM"])
+    r = int(color[1:3], 16)
+    g = int(color[3:5], 16)
+    b = int(color[5:7], 16)
+    lbl.setText(text)
+    lbl.setStyleSheet(
+      f"background: rgba({r},{g},{b},0.15); color: {color}; "
+      f"border: 1px solid rgba({r},{g},{b},0.4); border-radius: 9px; "
+      f"padding: 3px 10px; font-size: 12px; font-weight: 700;"
+    )
+
+  def _build_pods_tab(self):
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+
+    tb = QHBoxLayout()
+    tb.setContentsMargins(10, 6, 10, 6)
+    tb.setSpacing(8)
+    self.pod_filter = QLineEdit()
+    self.pod_filter.setPlaceholderText(" Filter pods…")
+    self.pod_filter.setMaximumWidth(200)
+    self.pod_filter.textChanged.connect(self._filter_pods)
+    tb.addWidget(self.pod_filter)
+
+    self.pod_count_lbl = QLabel("")
+    tb.addWidget(self.pod_count_lbl)
+    tb.addStretch()
+
+    # Safe, frequent actions live inside one clustered pill; the
+    # destructive action (Delete) sits outside it with a gap, so it
+    # can never be misclicked as "just another button in the row".
+    cluster = QFrame()
+    cluster.setObjectName("action_cluster")
+    cl = QHBoxLayout(cluster)
+    cl.setContentsMargins(4, 4, 4, 4)
+    cl.setSpacing(2)
+    for label, obj, slot in [
+      (" Logs",  "pod_logs_btn",  self._pod_logs),
+      (" Exec",  "pod_exec_btn",  self._pod_exec),
+      ("↺ Restart", "pod_restart_btn", self._pod_restart),
+    ]:
+      btn = self._toolbar_btn(label)
+      btn.setFlat(True)
+      btn.setStyleSheet("border: none; padding: 0 14px; background: transparent;")
+      setattr(self, obj, btn)
+      btn.clicked.connect(slot)
+      cl.addWidget(btn)
+    tb.addWidget(cluster)
+    self.pod_action_cluster = cluster
+
+    self.pod_del_btn = self._toolbar_btn(" Delete", object_name="danger")
+    self.pod_del_btn.clicked.connect(self._pod_delete)
+    tb.addWidget(self.pod_del_btn)
+
+    cluster.setStyleSheet(
+      f"QFrame#action_cluster {{ background: {T['BG_ITEM']}; border-radius: 8px; }}"
+    )
+
+    tb_widget = QWidget()
+    tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
+    tb_widget.setLayout(tb)
+    lay.addWidget(tb_widget)
+    self.pods_toolbar = tb_widget
+
+    # Pods render as cards (see k8s_cards.py) rather than table rows —
+    # each card carries its own meta dict via Qt.UserRole, the same
+    # "meta dict + setItemWidget()" pattern file_widgets.py already uses
+    # for the file list. Namespace is folded into a chip on the card
+    # itself (only shown in "(all namespaces)" view) instead of a
+    # dedicated hidden column.
+    self.pod_list = QListWidget()
+    self.pod_list.setSpacing(6)
+    self.pod_list.setSelectionMode(QAbstractItemView.SingleSelection)
+    self.pod_list.setContextMenuPolicy(Qt.CustomContextMenu)
+    self.pod_list.customContextMenuRequested.connect(self._pod_ctx_menu)
+    self.pod_list.itemDoubleClicked.connect(self._on_pod_double_click)
+    self.pod_list.currentItemChanged.connect(self._on_pod_selection_changed)
+    self.pod_list.setStyleSheet(
+      "QListWidget { background: transparent; border: none; padding: 8px; }"
+      "QListWidget::item { border: none; padding: 0; margin: 0; }"
+    )
+    lay.addWidget(self.pod_list)
+    add_icon_tab(self.sub_tabs, w, " Pods")
+
+  def _build_deployments_tab(self):
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+
+    tb = QHBoxLayout()
+    tb.setContentsMargins(10, 6, 10, 6)
+    tb.setSpacing(8)
+    self.deploy_filter = QLineEdit()
+    self.deploy_filter.setPlaceholderText(" Filter deployments…")
+    self.deploy_filter.setMaximumWidth(200)
+    self.deploy_filter.textChanged.connect(self._filter_deployments)
+    tb.addWidget(self.deploy_filter)
+
+    self.deploy_count_lbl = QLabel("")
+    tb.addWidget(self.deploy_count_lbl)
+    tb.addStretch()
+
+    self.scale_spin = QSpinBox()
+    self.scale_spin.setRange(0, 100)
+    self.scale_spin.setValue(1)
+    self.scale_spin.setFixedWidth(70)
+    self.scale_spin.setToolTip("Replicas")
+    tb.addWidget(QLabel("Replicas:"))
+
+    self.scale_minus_btn = self._toolbar_btn(
+      "−", tooltip="Scale down by 1 replica (applies immediately)")
+    self.scale_minus_btn.setFixedWidth(32)
+    # _toolbar_btn's shared style adds 14px of padding on each side,
+    # which at this button's width left almost nothing for the glyph
+    # itself — override it so "−"/"+" actually render, centered.
+    self.scale_minus_btn.setStyleSheet("padding: 0; font-size: 16px; font-weight: 600;")
+    self.scale_minus_btn.clicked.connect(lambda: self._deploy_scale_step(-1))
+    tb.addWidget(self.scale_minus_btn)
+
+    tb.addWidget(self.scale_spin)
+
+    self.scale_plus_btn = self._toolbar_btn(
+      "+", tooltip="Scale up by 1 replica (applies immediately)")
+    self.scale_plus_btn.setFixedWidth(32)
+    self.scale_plus_btn.setStyleSheet("padding: 0; font-size: 16px; font-weight: 600;")
+    self.scale_plus_btn.clicked.connect(lambda: self._deploy_scale_step(1))
+    tb.addWidget(self.scale_plus_btn)
+
+    for label, obj, slot in [
+      ("⇅ Scale",  "dep_scale_btn",  self._deploy_scale),
+      ("↺ Restart", "dep_restart_btn", self._deploy_restart),
+      (" Describe", "dep_desc_btn",  self._deploy_describe),
+      (" Delete",  "dep_del_btn",   self._deploy_delete),
+    ]:
+      obj_name = "danger" if "Delete" in label else ("primary" if "" in label else None)
+      btn = self._toolbar_btn(label, object_name=obj_name)
+      setattr(self, obj, btn)
+      btn.clicked.connect(slot)
+      tb.addWidget(btn)
+
+    tb_widget = QWidget()
+    tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
+    tb_widget.setLayout(tb)
+    lay.addWidget(tb_widget)
+    self.deploy_toolbar = tb_widget
+
+    # Same card-list treatment as Pods — see k8s_cards.py.
+    self.deploy_list = QListWidget()
+    self.deploy_list.setSpacing(6)
+    self.deploy_list.setSelectionMode(QAbstractItemView.SingleSelection)
+    self.deploy_list.itemClicked.connect(self._on_deploy_click)
+    self.deploy_list.itemDoubleClicked.connect(self._on_deploy_double_click)
+    self.deploy_list.currentItemChanged.connect(self._on_deploy_selection_changed)
+    self.deploy_list.setStyleSheet(
+      "QListWidget { background: transparent; border: none; padding: 8px; }"
+      "QListWidget::item { border: none; padding: 0; margin: 0; }"
+    )
+    lay.addWidget(self.deploy_list)
+    add_icon_tab(self.sub_tabs, w, " Deployments")
+
+  def _build_statefulsets_tab(self):
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+
+    tb = QHBoxLayout()
+    tb.setContentsMargins(10, 6, 10, 6)
+    tb.setSpacing(8)
+    self.sts_filter = QLineEdit()
+    self.sts_filter.setPlaceholderText(" Filter statefulsets…")
+    self.sts_filter.setMaximumWidth(200)
+    self.sts_filter.textChanged.connect(self._filter_statefulsets)
+    tb.addWidget(self.sts_filter)
+
+    self.sts_count_lbl = QLabel("")
+    tb.addWidget(self.sts_count_lbl)
+    tb.addStretch()
+
+    self.sts_scale_spin = QSpinBox()
+    self.sts_scale_spin.setRange(0, 100)
+    self.sts_scale_spin.setValue(1)
+    self.sts_scale_spin.setFixedWidth(70)
+    self.sts_scale_spin.setToolTip("Replicas")
+    tb.addWidget(QLabel("Replicas:"))
+    tb.addWidget(self.sts_scale_spin)
+
+    for label, obj, slot in [
+      ("⇅ Scale",   "sts_scale_btn",  self._sts_scale),
+      ("↺ Restart",  "sts_restart_btn", self._sts_restart),
+      (" Describe", "sts_desc_btn",  self._sts_describe),
+      (" Delete",  "sts_del_btn",   self._sts_delete),
+    ]:
+      obj_name = "danger" if "Delete" in label else None
+      btn = self._toolbar_btn(label, object_name=obj_name)
+      setattr(self, obj, btn)
+      btn.clicked.connect(slot)
+      tb.addWidget(btn)
+
+    tb_widget = QWidget()
+    tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
+    tb_widget.setLayout(tb)
+    lay.addWidget(tb_widget)
+    self.sts_toolbar = tb_widget
+
+    self.sts_list = QListWidget()
+    self.sts_list.setSpacing(6)
+    self.sts_list.setSelectionMode(QAbstractItemView.SingleSelection)
+    self.sts_list.setContextMenuPolicy(Qt.CustomContextMenu)
+    self.sts_list.customContextMenuRequested.connect(self._sts_ctx_menu)
+    self.sts_list.itemClicked.connect(self._on_sts_click)
+    self.sts_list.itemDoubleClicked.connect(self._on_sts_double_click)
+    self.sts_list.currentItemChanged.connect(self._on_sts_selection_changed)
+    self.sts_list.setStyleSheet(
+      "QListWidget { background: transparent; border: none; padding: 8px; }"
+      "QListWidget::item { border: none; padding: 0; margin: 0; }"
+    )
+    lay.addWidget(self.sts_list)
+    add_icon_tab(self.sub_tabs, w, " StatefulSets")
+
+  def _build_daemonsets_tab(self):
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+
+    tb = QHBoxLayout()
+    tb.setContentsMargins(10, 6, 10, 6)
+    tb.setSpacing(8)
+    self.ds_filter = QLineEdit()
+    self.ds_filter.setPlaceholderText(" Filter daemonsets…")
+    self.ds_filter.setMaximumWidth(200)
+    self.ds_filter.textChanged.connect(self._filter_daemonsets)
+    tb.addWidget(self.ds_filter)
+
+    self.ds_count_lbl = QLabel("")
+    tb.addWidget(self.ds_count_lbl)
+    tb.addStretch()
+
+    # No Scale control — DaemonSets run exactly one pod per matching
+    # node, so "replica count" isn't a thing a person can set here.
+    for label, obj, slot in [
+      ("↺ Restart",  "ds_restart_btn", self._ds_restart),
+      (" Describe", "ds_desc_btn",  self._ds_describe),
+      (" Delete",  "ds_del_btn",   self._ds_delete),
+    ]:
+      obj_name = "danger" if "Delete" in label else None
+      btn = self._toolbar_btn(label, object_name=obj_name)
+      setattr(self, obj, btn)
+      btn.clicked.connect(slot)
+      tb.addWidget(btn)
+
+    tb_widget = QWidget()
+    tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
+    tb_widget.setLayout(tb)
+    lay.addWidget(tb_widget)
+    self.ds_toolbar = tb_widget
+
+    self.ds_list = QListWidget()
+    self.ds_list.setSpacing(6)
+    self.ds_list.setSelectionMode(QAbstractItemView.SingleSelection)
+    self.ds_list.setContextMenuPolicy(Qt.CustomContextMenu)
+    self.ds_list.customContextMenuRequested.connect(self._ds_ctx_menu)
+    self.ds_list.itemDoubleClicked.connect(self._on_ds_double_click)
+    self.ds_list.currentItemChanged.connect(self._on_ds_selection_changed)
+    self.ds_list.setStyleSheet(
+      "QListWidget { background: transparent; border: none; padding: 8px; }"
+      "QListWidget::item { border: none; padding: 0; margin: 0; }"
+    )
+    lay.addWidget(self.ds_list)
+    add_icon_tab(self.sub_tabs, w, " DaemonSets")
+
+  def _build_hpa_tab(self):
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+
+    tb = QHBoxLayout()
+    tb.setContentsMargins(10, 6, 10, 6)
+    tb.setSpacing(8)
+    self.hpa_filter = QLineEdit()
+    self.hpa_filter.setPlaceholderText(" Filter autoscalers…")
+    self.hpa_filter.setMaximumWidth(200)
+    self.hpa_filter.textChanged.connect(self._filter_hpas)
+    tb.addWidget(self.hpa_filter)
+
+    self.hpa_count_lbl = QLabel("")
+    tb.addWidget(self.hpa_count_lbl)
+    tb.addStretch()
+
+    # Read-only status view — no Scale button, since an HPA's whole
+    # point is that it decides replica counts itself. Describe/Delete
+    # are still useful (Delete to hand control back to a manual
+    # `kubectl scale`, Describe to see the full condition history
+    # behind why it hasn't scaled).
+    self.hpa_desc_btn = self._toolbar_btn(" Describe")
+    self.hpa_desc_btn.clicked.connect(self._hpa_describe)
+    tb.addWidget(self.hpa_desc_btn)
+
+    self.hpa_del_btn = self._toolbar_btn(" Delete", object_name="danger")
+    self.hpa_del_btn.clicked.connect(self._hpa_delete)
+    tb.addWidget(self.hpa_del_btn)
+
+    tb_widget = QWidget()
+    tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
+    tb_widget.setLayout(tb)
+    lay.addWidget(tb_widget)
+    self.hpa_toolbar = tb_widget
+
+    self.hpa_list = QListWidget()
+    self.hpa_list.setSpacing(6)
+    self.hpa_list.setSelectionMode(QAbstractItemView.SingleSelection)
+    self.hpa_list.setContextMenuPolicy(Qt.CustomContextMenu)
+    self.hpa_list.customContextMenuRequested.connect(self._hpa_ctx_menu)
+    self.hpa_list.itemDoubleClicked.connect(self._on_hpa_double_click)
+    self.hpa_list.currentItemChanged.connect(self._on_hpa_selection_changed)
+    self.hpa_list.setStyleSheet(
+      "QListWidget { background: transparent; border: none; padding: 8px; }"
+      "QListWidget::item { border: none; padding: 0; margin: 0; }"
+    )
+    lay.addWidget(self.hpa_list)
+    add_icon_tab(self.sub_tabs, w, " HPA")
+
+  def _build_services_tab(self):
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+
+    tb = QHBoxLayout()
+    tb.setContentsMargins(10, 6, 10, 6)
+    tb.setSpacing(8)
+    self.svc_filter = QLineEdit()
+    self.svc_filter.setPlaceholderText(" Filter services…")
+    self.svc_filter.setMaximumWidth(200)
+    self.svc_filter.textChanged.connect(self._filter_services)
+    tb.addWidget(self.svc_filter)
+
+    self.svc_count_lbl = QLabel("")
+    tb.addWidget(self.svc_count_lbl)
+    tb.addStretch()
+
+    self.svc_desc_btn = self._toolbar_btn(" Describe")
+    self.svc_desc_btn.clicked.connect(self._svc_describe)
+    tb.addWidget(self.svc_desc_btn)
+
+    self.svc_del_btn = self._toolbar_btn(" Delete", object_name="danger")
+    self.svc_del_btn.clicked.connect(self._svc_delete)
+    tb.addWidget(self.svc_del_btn)
+
+    tb_widget = QWidget()
+    tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
+    tb_widget.setLayout(tb)
+    lay.addWidget(tb_widget)
+    self.svc_toolbar = tb_widget
+
+    # Same card-list treatment as Pods/Deployments — see k8s_cards.py.
+    self.svc_list = QListWidget()
+    self.svc_list.setSpacing(6)
+    self.svc_list.setSelectionMode(QAbstractItemView.SingleSelection)
+    self.svc_list.setContextMenuPolicy(Qt.CustomContextMenu)
+    self.svc_list.customContextMenuRequested.connect(self._svc_ctx_menu)
+    self.svc_list.itemDoubleClicked.connect(self._on_svc_double_click)
+    self.svc_list.currentItemChanged.connect(self._on_svc_selection_changed)
+    self.svc_list.setStyleSheet(
+      "QListWidget { background: transparent; border: none; padding: 8px; }"
+      "QListWidget::item { border: none; padding: 0; margin: 0; }"
+    )
+    lay.addWidget(self.svc_list)
+    add_icon_tab(self.sub_tabs, w, " Services")
+
+  def _build_ingress_tab(self):
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+
+    tb = QHBoxLayout()
+    tb.setContentsMargins(10, 6, 10, 6)
+    tb.setSpacing(8)
+    self.ing_filter = QLineEdit()
+    self.ing_filter.setPlaceholderText(" Filter ingress…")
+    self.ing_filter.setMaximumWidth(200)
+    self.ing_filter.textChanged.connect(self._filter_ingress)
+    tb.addWidget(self.ing_filter)
+
+    self.ing_count_lbl = QLabel("")
+    tb.addWidget(self.ing_count_lbl)
+    tb.addStretch()
+
+    self.ing_desc_btn = self._toolbar_btn(" Describe")
+    self.ing_desc_btn.clicked.connect(self._ing_describe)
+    tb.addWidget(self.ing_desc_btn)
+
+    self.ing_del_btn = self._toolbar_btn(" Delete", object_name="danger")
+    self.ing_del_btn.clicked.connect(self._ing_delete)
+    tb.addWidget(self.ing_del_btn)
+
+    tb_widget = QWidget()
+    tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
+    tb_widget.setLayout(tb)
+    lay.addWidget(tb_widget)
+    self.ing_toolbar = tb_widget
+
+    self.ing_list = QListWidget()
+    self.ing_list.setSpacing(6)
+    self.ing_list.setSelectionMode(QAbstractItemView.SingleSelection)
+    self.ing_list.setContextMenuPolicy(Qt.CustomContextMenu)
+    self.ing_list.customContextMenuRequested.connect(self._ing_ctx_menu)
+    self.ing_list.itemDoubleClicked.connect(self._on_ing_double_click)
+    self.ing_list.currentItemChanged.connect(self._on_ing_selection_changed)
+    self.ing_list.setStyleSheet(
+      "QListWidget { background: transparent; border: none; padding: 8px; }"
+      "QListWidget::item { border: none; padding: 0; margin: 0; }"
+    )
+    lay.addWidget(self.ing_list)
+    add_icon_tab(self.sub_tabs, w, " Ingress")
+
+
+  def _build_ai_ops_tab(self):
+    """Natural-language Kubernetes operations powered by AI."""
+
+    w = QWidget()
+
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+
+    self.k8s_ai_ops = K8sAIOpsWidget(
+      kube_context_getter=lambda: self._current_context,
+      ssh=self.ssh,
+      namespace_getter=lambda: self._current_ns,
+      context_getter=self._ai_ops_context,
+      parent=w,
+    )
+
+    self.k8s_ai_ops.operation_finished.connect(
+      self._on_ai_ops_operation_finished
+    )
+
+    lay.addWidget(self.k8s_ai_ops)
+
+    self.sub_tabs.addTab(
+      w,
+      " Ops Mind",
+    )
+
+  def _ai_ops_context(self):
+    """Give Ops Mind a small amount of useful UI context.
+
+    The AI still has to identify the resource explicitly unless the user
+    gives enough information. This context is only there to improve
+    interpretation.
+    """
+
+    parts = []
+
+    # Current namespace.
+    parts.append(
+      f"Selected namespace: {self._current_ns or 'default'}"
+    )
+
+    # Selected deployment, if any.
+    try:
+      item = self.deploy_list.currentItem()
+
+      if item is not None:
         meta = item.data(Qt.UserRole) or {}
-        self._describe(meta.get("kind", "job"), meta.get("name"), meta.get("namespace") or "default")
 
-    def _on_workload_selection_changed(self, current, previous):
-        if previous is not None:
-            w = self.wl_list.itemWidget(previous)
-            if w:
-                w.set_selected(False)
-        if current is None:
-            self.wl_history_list.clear()
-            return
-        w = self.wl_list.itemWidget(current)
-        if w:
-            w.set_selected(True)
-        meta = current.data(Qt.UserRole) or {}
-        if meta.get("kind") == "cronjob":
-            self._load_job_history(meta.get("namespace") or "default", meta.get("name"))
-        else:
-            self.wl_history_list.clear()
-
-    def _load_job_history(self, ns: str, cronjob_name: str):
-        self._history_cronjob = cronjob_name
-        self._run_cmd(f"kubectl get jobs -n {ns} -o json 2>&1",
-                      lambda o: self._populate_job_history(o, cronjob_name))
-
-    def _populate_job_history(self, out: str, cronjob_name: str):
-        # The selection may have moved on to a different CronJob (or off
-        # CronJobs entirely) while this command was in flight — drop a
-        # stale result rather than showing the wrong run history.
-        if getattr(self, "_history_cronjob", None) != cronjob_name:
-            return
-        self.wl_history_list.clear()
-        try:
-            items = json.loads(out).get("items", [])
-        except Exception:
-            items = []
-        runs = []
-        for it in items:
-            owners = (it.get("metadata") or {}).get("ownerReferences") or []
-            if any(r.get("kind") == "CronJob" and r.get("name") == cronjob_name for r in owners):
-                runs.append(it)
-        # Most recent run first.
-        runs.sort(key=lambda it: (it.get("metadata") or {}).get("creationTimestamp", ""), reverse=True)
-        for it in runs:
-            meta = self._job_meta_from_item(it)
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, {**meta, "kind": "job"})
-            item.setSizeHint(QSize(0, JobCardWidget.CARD_HEIGHT))
-            self.wl_history_list.addItem(item)
-            self.wl_history_list.setItemWidget(item, JobCardWidget(meta, False))
-        if not runs:
-            self.wl_history_list.addItem(QListWidgetItem("  No runs yet."))
-
-    def _on_wl_history_double_click(self, item):
-        meta = item.data(Qt.UserRole)
-        if not meta:
-            return
-        self._describe("job", meta.get("name"), meta.get("namespace") or "default")
-
-    def _workload_describe(self):
-        meta = self._selected_workload()
-        if meta:
-            self._describe(meta.get("kind", "job"), meta.get("name"), meta.get("namespace") or "default")
-
-    def _workload_delete(self):
-        meta = self._selected_workload()
-        if not meta:
-            return
-        kind = meta.get("kind", "job")
         name = meta.get("name")
-        ns   = meta.get("namespace") or "default"
-        label = "CronJob" if kind == "cronjob" else "Job"
-        if QMessageBox.question(self, f"Delete {label}", f'Delete {label.lower()} "{name}"?',
-                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            self._run_cmd(f"kubectl delete {kind} {name} -n {ns} 2>&1",
-                          lambda o: (self._log(o), self._load_workloads()))
+        namespace = meta.get("namespace")
 
-    def _workload_trigger_now(self):
-        meta = self._selected_workload()
-        if not meta:
-            return
-        if meta.get("kind") != "cronjob":
-            QMessageBox.information(self, "Trigger Now", "Select a CronJob to trigger.")
-            return
-        name = meta.get("name")
-        ns   = meta.get("namespace") or "default"
-        job_name = f"{name}-manual-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-
-        def on_done(out):
-            self._log(out)
-            self._load_job_history(ns, name)
-            self._load_cronjobs()
-
-        self._run_cmd(
-            f"kubectl create job {job_name} --from=cronjob/{name} -n {ns} 2>&1", on_done)
-
-    def _workload_toggle_suspend(self):
-        meta = self._selected_workload()
-        if not meta:
-            return
-        if meta.get("kind") != "cronjob":
-            QMessageBox.information(self, "Suspend / Resume", "Select a CronJob first.")
-            return
-        name = meta.get("name")
-        ns   = meta.get("namespace") or "default"
-        new_suspend = not meta.get("suspend")
-        patch = '{"spec":{"suspend":%s}}' % ("true" if new_suspend else "false")
-        self._run_cmd(
-            f"kubectl patch cronjob {name} -n {ns} -p '{patch}' --type=merge 2>&1",
-            lambda o: (self._log(o), self._load_cronjobs()))
-
-    def _workload_ctx_menu(self, pos):
-        item = self.wl_list.itemAt(pos)
-        if not item:
-            return
-        self.wl_list.setCurrentItem(item)
-        meta = item.data(Qt.UserRole) or {}
-        kind = meta.get("kind", "job")
-        menu = QMenu(self)
-        menu.addAction("📄  Describe", self._workload_describe)
-        if kind == "cronjob":
-            menu.addAction("▶  Trigger Now", self._workload_trigger_now)
-            suspend_label = "▶  Resume" if meta.get("suspend") else "⏸  Suspend"
-            menu.addAction(suspend_label, self._workload_toggle_suspend)
-        menu.addSeparator()
-        menu.addAction("🗑  Delete", self._workload_delete)
-        menu.exec_(self.wl_list.viewport().mapToGlobal(pos))
-
-    # ── Storage: PersistentVolumeClaims / PersistentVolumes ────
-    def _build_storage_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        self.pvx_type_bar = QWidget()
-        self.pvx_type_bar.setFixedHeight(58)
-        self.pvx_type_bar.setStyleSheet(
-            f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
-        )
-        tb_lay = QHBoxLayout(self.pvx_type_bar)
-        tb_lay.setContentsMargins(12, 10, 12, 10)
-        tb_lay.setSpacing(10)
-
-        self.pvx_type_toggle = QWidget()
-        self.pvx_type_toggle.setObjectName("pvx_type_toggle")
-        self.pvx_type_toggle.setFixedHeight(36)
-        toggle_lay = QHBoxLayout(self.pvx_type_toggle)
-        toggle_lay.setContentsMargins(3, 3, 3, 3)
-        toggle_lay.setSpacing(2)
-        self.pvx_type_pvc_btn = QPushButton("📄  Claims (PVC)")
-        self.pvx_type_pv_btn  = QPushButton("💽  Volumes (PV)")
-        for btn in (self.pvx_type_pvc_btn, self.pvx_type_pv_btn):
-            btn.setCheckable(True)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setFixedHeight(30)
-            toggle_lay.addWidget(btn)
-        self.pvx_type_pvc_btn.setChecked(True)
-        self.pvx_type_pvc_btn.clicked.connect(lambda: self._set_storage_type("PVC"))
-        self.pvx_type_pv_btn.clicked.connect(lambda: self._set_storage_type("PV"))
-        self._storage_type = "PVC"
-        self._style_toggle(self.pvx_type_toggle, (self.pvx_type_pvc_btn, self.pvx_type_pv_btn))
-        tb_lay.addWidget(self.pvx_type_toggle)
-
-        self.pvx_filter = QLineEdit()
-        self.pvx_filter.setPlaceholderText("🔍  Filter…")
-        self.pvx_filter.textChanged.connect(self._filter_storage)
-        tb_lay.addWidget(self.pvx_filter, 1)
-
-        self.pvx_count_lbl = QLabel("")
-        tb_lay.addWidget(self.pvx_count_lbl)
-        lay.addWidget(self.pvx_type_bar)
-
-        pvx_actions = QHBoxLayout()
-        pvx_actions.setContentsMargins(10, 6, 10, 6)
-        pvx_actions.setSpacing(8)
-        pvx_actions.addStretch()
-
-        self.pvx_desc_btn = self._toolbar_btn("📋  Describe")
-        self.pvx_desc_btn.clicked.connect(self._storage_describe)
-        pvx_actions.addWidget(self.pvx_desc_btn)
-
-        self.pvx_del_btn = self._toolbar_btn("🗑  Delete", object_name="danger")
-        self.pvx_del_btn.clicked.connect(self._storage_delete)
-        pvx_actions.addWidget(self.pvx_del_btn)
-
-        pvx_actions_widget = QWidget()
-        pvx_actions_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
-        pvx_actions_widget.setLayout(pvx_actions)
-        lay.addWidget(pvx_actions_widget)
-        self.pvx_toolbar = pvx_actions_widget
-
-        self.pvx_list = QListWidget()
-        self.pvx_list.setSpacing(6)
-        self.pvx_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.pvx_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.pvx_list.customContextMenuRequested.connect(self._storage_ctx_menu)
-        self.pvx_list.itemDoubleClicked.connect(self._on_storage_double_click)
-        self.pvx_list.currentItemChanged.connect(self._on_storage_selection_changed)
-        self.pvx_list.setStyleSheet(
-            "QListWidget { background: transparent; border: none; padding: 8px; }"
-            "QListWidget::item { border: none; padding: 0; margin: 0; }"
-        )
-        lay.addWidget(self.pvx_list)
-        self.sub_tabs.addTab(w, "💾  Storage")
-
-    def _set_storage_type(self, name: str):
-        self._storage_type = name
-        self.pvx_type_pvc_btn.setChecked(name == "PVC")
-        self.pvx_type_pv_btn.setChecked(name == "PV")
-        self._load_storage()
-
-    def _load_storage(self, _=None):
-        if self._storage_type == "PV":
-            self._load_pvs()
-        else:
-            self._load_pvcs()
-
-    def _load_pvcs(self):
-        self._run_cmd(f"kubectl get pvc {self._ns_flag()} -o json 2>&1", self._populate_pvcs)
-
-    def _populate_pvcs(self, out: str):
-        self.pvx_list.clear()
-        all_ns = (self._current_ns == "(all namespaces)")
-        try:
-            items = json.loads(out).get("items", [])
-        except Exception:
-            items = []
-        for it in items:
-            meta_o = it.get("metadata") or {}
-            spec   = it.get("spec") or {}
-            status = it.get("status") or {}
-            capacity = (status.get("capacity") or {}).get("storage", "-")
-            meta = {
-                "namespace":     meta_o.get("namespace", ""),
-                "name":          meta_o.get("name", ""),
-                "status":        status.get("phase", "Unknown"),
-                "volume":        spec.get("volumeName", "-") or "-",
-                "capacity":      capacity,
-                "access_modes":  ", ".join(spec.get("accessModes") or []) or "-",
-                "storage_class": spec.get("storageClassName", "-") or "-",
-                "age":           self._humanize_age(meta_o.get("creationTimestamp", "")),
-            }
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, {**meta, "kind": "pvc"})
-            item.setSizeHint(QSize(0, PVCCardWidget.CARD_HEIGHT))
-            self.pvx_list.addItem(item)
-            self.pvx_list.setItemWidget(item, PVCCardWidget(meta, all_ns))
-        total = len(items)
-        color_key = "TEXT_MUTED" if total == 0 else "INFO"
-        self._set_count_badge(self.pvx_count_lbl, f"{total} claim{'s' if total != 1 else ''}", color_key)
-        self._filter_storage(self.pvx_filter.text())
-
-    def _load_pvs(self):
-        # PersistentVolumes are cluster-scoped — no namespace flag applies.
-        self._run_cmd("kubectl get pv -o json 2>&1", self._populate_pvs)
-
-    def _populate_pvs(self, out: str):
-        self.pvx_list.clear()
-        try:
-            items = json.loads(out).get("items", [])
-        except Exception:
-            items = []
-        for it in items:
-            meta_o = it.get("metadata") or {}
-            spec   = it.get("spec") or {}
-            status = it.get("status") or {}
-            claim_ref = spec.get("claimRef") or {}
-            claim = (f"{claim_ref.get('namespace', '')}/{claim_ref.get('name', '')}"
-                     if claim_ref.get("name") else "-")
-            meta = {
-                "name":           meta_o.get("name", ""),
-                "capacity":       (spec.get("capacity") or {}).get("storage", "-"),
-                "access_modes":   ", ".join(spec.get("accessModes") or []) or "-",
-                "reclaim_policy": spec.get("persistentVolumeReclaimPolicy", "-") or "-",
-                "status":         status.get("phase", "Unknown"),
-                "claim":          claim,
-                "storage_class":  spec.get("storageClassName", "-") or "-",
-                "age":            self._humanize_age(meta_o.get("creationTimestamp", "")),
-            }
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, {**meta, "kind": "pv"})
-            item.setSizeHint(QSize(0, PVCardWidget.CARD_HEIGHT))
-            self.pvx_list.addItem(item)
-            self.pvx_list.setItemWidget(item, PVCardWidget(meta))
-        total = len(items)
-        color_key = "TEXT_MUTED" if total == 0 else "INFO"
-        self._set_count_badge(self.pvx_count_lbl, f"{total} volume{'s' if total != 1 else ''}", color_key)
-        self._filter_storage(self.pvx_filter.text())
-
-    def _filter_storage(self, text: str):
-        q = text.lower()
-        for i in range(self.pvx_list.count()):
-            item = self.pvx_list.item(i)
-            meta = item.data(Qt.UserRole) or {}
-            item.setHidden(q not in meta.get("name", "").lower())
-
-    def _selected_storage(self):
-        item = self.pvx_list.currentItem()
-        if not item:
-            QMessageBox.warning(self, "No selection", "Select a claim or volume first.")
-            return None
-        return item.data(Qt.UserRole) or {}
-
-    def _on_storage_double_click(self, item):
-        meta = item.data(Qt.UserRole) or {}
-        kind = "pvc" if meta.get("kind") == "pvc" else "pv"
-        self._describe(kind, meta.get("name"), meta.get("namespace") or "default")
-
-    def _on_storage_selection_changed(self, current, previous):
-        if previous is not None:
-            w = self.pvx_list.itemWidget(previous)
-            if w:
-                w.set_selected(False)
-        if current is not None:
-            w = self.pvx_list.itemWidget(current)
-            if w:
-                w.set_selected(True)
-
-    def _storage_describe(self):
-        meta = self._selected_storage()
-        if meta:
-            kind = "pvc" if meta.get("kind") == "pvc" else "pv"
-            self._describe(kind, meta.get("name"), meta.get("namespace") or "default")
-
-    def _storage_delete(self):
-        meta = self._selected_storage()
-        if not meta:
-            return
-        is_pvc = meta.get("kind") == "pvc"
-        name = meta.get("name")
-        ns   = meta.get("namespace") or "default"
-        label = "PersistentVolumeClaim" if is_pvc else "PersistentVolume"
-        if QMessageBox.question(self, f"Delete {label}", f'Delete {label} "{name}"?',
-                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            if is_pvc:
-                cmd = f"kubectl delete pvc {name} -n {ns} 2>&1"
-            else:
-                cmd = f"kubectl delete pv {name} 2>&1"
-            self._run_cmd(cmd, lambda o: (self._log(o), self._load_storage()))
-
-    def _storage_ctx_menu(self, pos):
-        item = self.pvx_list.itemAt(pos)
-        if not item:
-            return
-        self.pvx_list.setCurrentItem(item)
-        meta = item.data(Qt.UserRole) or {}
-        kind = "pvc" if meta.get("kind") == "pvc" else "pv"
-        name = meta.get("name")
-        ns   = meta.get("namespace") or "default"
-        menu = QMenu(self)
-        menu.addAction("📄  Describe", lambda: self._describe(kind, name, ns))
-        menu.addSeparator()
-        menu.addAction("🗑  Delete", self._storage_delete)
-        menu.exec_(self.pvx_list.viewport().mapToGlobal(pos))
-
-    def _build_config_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setHandleWidth(1)
-
-        # Left: type toggle + list
-        left = QWidget()
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(0, 0, 0, 0)
-        ll.setSpacing(0)
-
-        # Taller toolbar with real breathing room — the old 42px bar packed
-        # a combo box and filter field edge-to-edge with almost no margin,
-        # which is most of what read as "congested".
-        self.cfg_type_bar = QWidget()
-        self.cfg_type_bar.setFixedHeight(58)
-        self.cfg_type_bar.setStyleSheet(
-            f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
-        )
-        tb_lay = QHBoxLayout(self.cfg_type_bar)
-        tb_lay.setContentsMargins(12, 10, 12, 10)
-        tb_lay.setSpacing(10)
-
-        # ConfigMaps/Secrets is a binary choice, not a long list — a
-        # segmented two-button toggle reads faster than opening a dropdown
-        # for one of two options, and gives the "big, catchy" control the
-        # namespace picker also got, instead of a thin QComboBox.
-        self.cfg_type_toggle = QWidget()
-        self.cfg_type_toggle.setObjectName("cfg_type_toggle")
-        self.cfg_type_toggle.setFixedHeight(36)
-        toggle_lay = QHBoxLayout(self.cfg_type_toggle)
-        toggle_lay.setContentsMargins(3, 3, 3, 3)
-        toggle_lay.setSpacing(2)
-        self.cfg_type_cm_btn = QPushButton("📦  ConfigMaps")
-        self.cfg_type_secret_btn = QPushButton("🔐  Secrets")
-        for btn in (self.cfg_type_cm_btn, self.cfg_type_secret_btn):
-            btn.setCheckable(True)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setFixedHeight(30)
-            toggle_lay.addWidget(btn)
-        self.cfg_type_cm_btn.setChecked(True)
-        self.cfg_type_cm_btn.clicked.connect(lambda: self._set_cfg_type("ConfigMaps"))
-        self.cfg_type_secret_btn.clicked.connect(lambda: self._set_cfg_type("Secrets"))
-        self._cfg_type = "ConfigMaps"
-        self._style_cfg_toggle()
-        tb_lay.addWidget(self.cfg_type_toggle)
-
-        self.cfg_filter = QLineEdit()
-        self.cfg_filter.setPlaceholderText("🔍  Filter…")
-        self.cfg_filter.textChanged.connect(self._filter_configs)
-        tb_lay.addWidget(self.cfg_filter, 1)
-        ll.addWidget(self.cfg_type_bar)
-
-        # Cards instead of bare text rows — icon, name, and a ConfigMap/
-        # Secret pill per entry, spaced out like the Pods/Deployments
-        # lists (k8s_cards.py) instead of one dense column of names.
-        self.cfg_list = QListWidget()
-        self.cfg_list.setSpacing(6)
-        self.cfg_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.cfg_list.currentItemChanged.connect(self._on_cfg_selection_changed)
-        self.cfg_list.setStyleSheet(
-            "QListWidget { background: transparent; border: none; padding: 10px; }"
-            "QListWidget::item { border: none; padding: 0; margin: 0; }"
-        )
-        ll.addWidget(self.cfg_list)
-        splitter.addWidget(left)
-
-        # Right: detail + raw yaml
-        right = QWidget()
-        rl = QVBoxLayout(right)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.setSpacing(0)
-
-        self.cfg_detail_hdr = QLabel("  Data")
-        self.cfg_detail_hdr.setFixedHeight(34)
-        self.cfg_detail_hdr.setStyleSheet(
-            f"background: {T['BG_PANEL']}; color: {T['TEXT_DIM']}; font-size: 13px; "
-            f"font-weight: 700; border-bottom: 1px solid {T['BORDER']}; padding-left: 14px;"
-        )
-        rl.addWidget(self.cfg_detail_hdr)
-
-        self.cfg_detail = QTreeWidget()
-        self._style_tree(self.cfg_detail)
-        self.cfg_detail.setRootIsDecorated(False)
-        self.cfg_detail.setAlternatingRowColors(True)
-        self.cfg_detail.setColumnCount(2)
-        self.cfg_detail.setHeaderLabels(["Key", "Value"])
-        self.cfg_detail.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.cfg_detail.header().setSectionResizeMode(1, QHeaderView.Stretch)
-        rl.addWidget(self.cfg_detail)
-
-        self.cfg_raw_lbl = QLabel("  Structured View")
-        self.cfg_raw_lbl.setFixedHeight(34)
-        self.cfg_raw_lbl.setStyleSheet(
-            f"background: {T['BG_PANEL']}; color: {T['TEXT_DIM']}; font-size: 13px; "
-            f"font-weight: 700; border-top: 1px solid {T['BORDER']}; "
-            f"border-bottom: 1px solid {T['BORDER']}; padding-left: 14px;"
-        )
-        rl.addWidget(self.cfg_raw_lbl)
-
-        self.cfg_raw = QTextEdit()
-        self.cfg_raw.setReadOnly(True)
-        self.cfg_raw.setFont(monospace_font(11))
-        self.cfg_raw.setMinimumHeight(220)
-        self.cfg_raw.setStyleSheet(f"padding: 10px; border: none; background: {T['BG_DARK']};")
-        rl.addWidget(self.cfg_raw)
-
-        splitter.addWidget(right)
-        splitter.setSizes([320, 620])
-        lay.addWidget(splitter)
-        self.sub_tabs.addTab(w, "🔧  Config & Secrets")
-
-    def _style_cfg_toggle(self):
-        """Pill-shaped container + two checkable buttons that look like one
-        segmented control (selected side lit with the accent colour).
-        Re-called from apply_theme() since colours are literal hex here."""
-        self.cfg_type_toggle.setStyleSheet(
-            f"QWidget#cfg_type_toggle {{ background: {T['BG_ITEM']}; "
-            f"border: 1px solid {T['BORDER']}; border-radius: 18px; }}"
-        )
-        btn_css = f"""
-            QPushButton {{
-                background: transparent; color: {T['TEXT_DIM']};
-                border: none; border-radius: 15px; padding: 0 16px;
-                font-size: 12px; font-weight: 700;
-            }}
-            QPushButton:hover:!checked {{ background: {T['BG_HOVER']}; color: {T['TEXT_PRIMARY']}; }}
-            QPushButton:checked {{ background: {T['ACCENT']}; color: white; }}
-        """
-        self.cfg_type_cm_btn.setStyleSheet(btn_css)
-        self.cfg_type_secret_btn.setStyleSheet(btn_css)
-
-    def _set_cfg_type(self, name: str):
-        """Click handler for the ConfigMaps/Secrets segmented toggle —
-        keeps the two buttons mutually exclusive (QPushButton's own
-        setCheckable doesn't do this on its own outside a QButtonGroup)
-        and reloads the list for the newly-selected type."""
-        self._cfg_type = name
-        self.cfg_type_cm_btn.setChecked(name == "ConfigMaps")
-        self.cfg_type_secret_btn.setChecked(name == "Secrets")
-        self._load_config_resources()
-
-    def _build_events_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        tb = QHBoxLayout()
-        tb.setContentsMargins(10, 6, 10, 6)
-        tb.setSpacing(8)
-        self.event_filter = QLineEdit()
-        self.event_filter.setPlaceholderText("🔍  Filter events (reason / object / message)…")
-        self.event_filter.setMaximumWidth(280)
-        self.event_filter.textChanged.connect(self._filter_events)
-        tb.addWidget(self.event_filter)
-
-        self.event_count_lbl = QLabel("")
-        tb.addWidget(self.event_count_lbl)
-        tb.addStretch()
-
-        self.event_warn_btn = self._toolbar_btn("⚠  Warnings only")
-        self.event_warn_btn.setCheckable(True)
-        self.event_warn_btn.toggled.connect(self._toggle_events_warnings_only)
-        tb.addWidget(self.event_warn_btn)
-
-        tb_widget = QWidget()
-        tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
-        tb_widget.setLayout(tb)
-        lay.addWidget(tb_widget)
-        self.events_toolbar = tb_widget
-
-        # Newest first, warnings visually distinct — see EventCardWidget
-        # (k8s_cards.py) for the accent-color logic.
-        self.event_list = QListWidget()
-        self.event_list.setSpacing(4)
-        self.event_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.event_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.event_list.customContextMenuRequested.connect(self._event_ctx_menu)
-        self.event_list.itemDoubleClicked.connect(self._on_event_double_click)
-        self.event_list.currentItemChanged.connect(self._on_event_selection_changed)
-        self.event_list.setStyleSheet(
-            "QListWidget { background: transparent; border: none; padding: 8px; }"
-            "QListWidget::item { border: none; padding: 0; margin: 0; }"
-        )
-        lay.addWidget(self.event_list)
-        self.sub_tabs.addTab(w, "📡  Events")
-
-    def _build_terminal_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(8)
-
-        self.k8s_terminal = QTextEdit()
-        self.k8s_terminal.setReadOnly(True)
-        self.k8s_terminal.setFont(monospace_font(11))
-        self.k8s_terminal.setStyleSheet(
-            f"background: #0d0d1a; color: {T['SUCCESS']}; border: none; padding: 8px;"
-        )
-        self.k8s_terminal.setPlaceholderText("kubectl output appears here…")
-        lay.addWidget(self.k8s_terminal)
-
-        inp_row = QHBoxLayout()
-        self.k8s_inp = QLineEdit()
-        self.k8s_inp.setPlaceholderText("kubectl …")
-        self.k8s_inp.returnPressed.connect(self._run_kubectl_terminal)
-        inp_row.addWidget(self.k8s_inp)
-
-        clr = self._toolbar_btn("Clear")
-        clr.clicked.connect(self.k8s_terminal.clear)
-        inp_row.addWidget(clr)
-
-        run = self._toolbar_btn("Run", object_name="primary")
-        run.clicked.connect(self._run_kubectl_terminal)
-        inp_row.addWidget(run)
-        lay.addLayout(inp_row)
-        self.sub_tabs.addTab(w, "⌨  Terminal")
-
-    def _build_tunnels_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        # Toolbar: CSV path + reload + select-all/clear
-        tb = QHBoxLayout()
-        tb.setContentsMargins(10, 6, 10, 6)
-        tb.setSpacing(8)
-
-        self.tunnel_path_lbl = QLabel(f"📄  {self._tunnel_csv_path}  (on VM)")
-        self.tunnel_path_lbl.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 13px;")
-        tb.addWidget(self.tunnel_path_lbl)
-        tb.addStretch()
-
-        change_file_btn = self._toolbar_btn(
-            "📂  Change File",
-            tooltip=(
-                "Point at a different tunnel-services CSV on the connected VM\n"
-                "(e.g. a personal or per-project file instead of the shared default).\n"
-                "Remembered for next time."
-            ),
-        )
-        change_file_btn.clicked.connect(self._change_tunnel_csv_path)
-        tb.addWidget(change_file_btn)
-
-        reload_btn = self._toolbar_btn("↺  Reload CSV")
-        reload_btn.clicked.connect(self._load_tunnel_csv)
-        tb.addWidget(reload_btn)
-
-        manage_btn = self._toolbar_btn(
-            "⚙️  Manage Services",
-            tooltip="Add, edit, or remove tunnel services stored on the connected VM",
-        )
-        manage_btn.clicked.connect(self._open_manage_tunnel_services)
-        tb.addWidget(manage_btn)
-
-        refresh_status_btn = self._toolbar_btn(
-            "🔄  Refresh Status",
-            tooltip=(
-                "Check which services' ports are currently listening on the VM\n"
-                "(🟢 exposed / 🔴 not exposed), without reloading the CSV."
-            ),
-        )
-        refresh_status_btn.clicked.connect(self._refresh_tunnel_status)
-        tb.addWidget(refresh_status_btn)
-
-        selall_btn = self._toolbar_btn("☑  Select All")
-        selall_btn.clicked.connect(lambda: self._set_all_tunnel_checks(True))
-        tb.addWidget(selall_btn)
-
-        clear_btn = self._toolbar_btn("☐  Clear")
-        clear_btn.clicked.connect(lambda: self._set_all_tunnel_checks(False))
-        tb.addWidget(clear_btn)
-
-        tb_widget = QWidget()
-        tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
-        tb_widget.setLayout(tb)
-        lay.addWidget(tb_widget)
-        self.tunnel_toolbar = tb_widget
-        
-        search_row = QHBoxLayout()
-        search_row.setContentsMargins(10, 6, 10, 6)
-        search_row.setSpacing(8)
-
-        self.tunnel_search = QLineEdit()
-        self.tunnel_search.setPlaceholderText("🔍  Filter services...")
-        self.tunnel_search.setClearButtonEnabled(True)
-        self.tunnel_search.setMaximumHeight(34)
-        self.tunnel_search.textChanged.connect(self._filter_tunnel_services)
-        search_row.addWidget(self.tunnel_search, 1)
-
-        # Status toggle — All / Active (🟢) / Inactive (🔴). Mutually
-        # exclusive via QButtonGroup, combined with the text search above
-        # in _filter_tunnel_services() rather than replacing it.
-        self.tunnel_filter_all_btn = self._toolbar_btn(
-            "All", tooltip="Show every service, regardless of status")
-        self.tunnel_filter_active_btn = self._toolbar_btn(
-            "🟢  Active", tooltip="Show only services currently exposed on the VM")
-        self.tunnel_filter_inactive_btn = self._toolbar_btn(
-            "🔴  Inactive", tooltip="Show only services not currently exposed on the VM")
-
-        self._tunnel_filter_keys = {}
-        self.tunnel_filter_group = QButtonGroup(self)
-        self.tunnel_filter_group.setExclusive(True)
-        for btn, key in (
-            (self.tunnel_filter_all_btn, "all"),
-            (self.tunnel_filter_active_btn, "active"),
-            (self.tunnel_filter_inactive_btn, "inactive"),
-        ):
-            btn.setCheckable(True)
-            self.tunnel_filter_group.addButton(btn)
-            self._tunnel_filter_keys[btn] = key
-            search_row.addWidget(btn)
-        self.tunnel_filter_all_btn.setChecked(True)
-        self.tunnel_filter_group.buttonClicked.connect(self._on_tunnel_status_filter_clicked)
-
-        lay.addLayout(search_row)
-        # Service checklist
-        self.tunnel_list = QListWidget()
-        self.tunnel_list.setAlternatingRowColors(True)
-        self.tunnel_list.itemChanged.connect(self._update_tunnel_cmd_preview)
-        self.tunnel_list.setStyleSheet("""
-        QListWidget {
-            font-size: 13px;
-        }
-        QListWidget::item {
-            height: 38px;
-        }
-        QListWidget::indicator {
-            width: 22px;
-            height: 22px;
-        }
-        """)
-        lay.addWidget(self.tunnel_list, 1)
-
-        # Command preview (read-only, for transparency/debugging)
-        preview_row = QHBoxLayout()
-        preview_row.setContentsMargins(10, 8, 10, 4)
-        preview_row.addWidget(QLabel("Command:"))
-        self.tunnel_cmd_preview = QLineEdit()
-        self.tunnel_cmd_preview.setReadOnly(True)
-        self.tunnel_cmd_preview.setFont(monospace_font(10))
-        self.tunnel_cmd_preview.setPlaceholderText("Select service(s) below to preview the SSH tunnel command…")
-        preview_row.addWidget(self.tunnel_cmd_preview, 1)
-        lay.addLayout(preview_row)
-
-        # Controls: status + start/stop
-        ctrl_row = QHBoxLayout()
-        ctrl_row.setContentsMargins(10, 4, 10, 10)
-        ctrl_row.setSpacing(8)
-
-        self.tunnel_status_lbl = QLabel("●  Not tunnelling")
-        self.tunnel_status_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px;")
-        ctrl_row.addWidget(self.tunnel_status_lbl)
-        ctrl_row.addStretch()
-
-        self.tunnel_start_btn = self._toolbar_btn("🔌  Tunnel", object_name="primary")
-        self.tunnel_start_btn.clicked.connect(self._start_tunnel)
-        ctrl_row.addWidget(self.tunnel_start_btn)
-
-        self.tunnel_stop_btn = self._toolbar_btn("⏹  Stop", object_name="danger")
-        self.tunnel_stop_btn.setEnabled(False)
-        self.tunnel_stop_btn.clicked.connect(self._stop_tunnel)
-        ctrl_row.addWidget(self.tunnel_stop_btn)
-
-        self.port_kill = self._toolbar_btn("✖ Kill Port", object_name="danger")
-        self.port_kill.clicked.connect(self._kill_selected_ports)
-        ctrl_row.addWidget(self.port_kill)
-
-        self.tunnel_restart_btn = self._toolbar_btn(
-            "↻  Restart Tunneling",
-            tooltip=(
-                "Runs 'kubectl port-forward' directly on the connected VM for each\n"
-                "selected service, e.g.:\n"
-                "nohup kubectl -n <namespace> port-forward svc/<name> <port>:<port> &\n\n"
-                "This is separate from the local SSH tunnel above — use both together:\n"
-                "this exposes the service on the VM's own localhost, and the SSH\n"
-                "tunnel forwards that port to your machine."
-            ),
-        )
-        self.tunnel_restart_btn.clicked.connect(self._restart_kubectl_tunnels)
-        ctrl_row.addWidget(self.tunnel_restart_btn)
-
-        lay.addLayout(ctrl_row)
-
-        # Process log (ssh stdout/stderr, merged)
-        self.tunnel_log = QTextEdit()
-        self.tunnel_log.setReadOnly(True)
-        self.tunnel_log.setFont(monospace_font(10))
-        self.tunnel_log.setFixedHeight(130)
-        self.tunnel_log.setPlaceholderText("Tunnel process output appears here…")
-        self.tunnel_log.setStyleSheet(
-            f"background: #0d0d1a; color: {T['TEXT_DIM']}; border: none; padding: 8px;"
-        )
-        lay.addWidget(self.tunnel_log)
-
-        self.sub_tabs.addTab(w, "🔀  Tunnels")
-        # self._load_tunnel_csv()
-
-        # Apply whatever tab-visibility choices were saved in Settings
-        # (defaults to "everything visible" the first time the app runs).
-        self._apply_saved_hidden_tabs()
-
-    # ── Tab visibility (Settings → Kubernetes Tabs) ────────────
-    def visible_tab_titles(self) -> list:
-        """The exact tab-bar strings currently in sub_tabs, in order —
-        used by SettingsDialog to build its show/hide checklist and as
-        the stable keys stored in settings.json."""
-        return [self.sub_tabs.tabText(i) for i in range(self.sub_tabs.count())]
-
-    def apply_hidden_tabs(self, hidden_titles):
-        """Hide/show sub-tabs by title. Safe to call at any time (e.g.
-        right after the user saves new choices in Settings) — QTabWidget
-        keeps a hidden tab's contents alive, it just isn't selectable
-        from the tab bar."""
-        hidden = set(hidden_titles or [])
-        for i in range(self.sub_tabs.count()):
-            self.sub_tabs.setTabVisible(i, self.sub_tabs.tabText(i) not in hidden)
-
-    def _apply_saved_hidden_tabs(self):
-        self.apply_hidden_tabs(load_settings().get("k8s_hidden_tabs", []))
-
-    # ── Theme refresh ─────────────────────────────────────────
-    def apply_theme(self):
-        self.ctrl_bar.setStyleSheet(
-            f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
-        )
-        self.health_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px;")
-        self.ns_dot.setStyleSheet(f"color: {T['ACCENT']}; font-size: 11px; background: transparent;")
-        self._style_ns_group()
-        if hasattr(self, "pod_action_cluster"):
-            self.pod_action_cluster.setStyleSheet(
-                f"QFrame#action_cluster {{ background: {T['BG_ITEM']}; border-radius: 8px; }}"
-            )
-        self.k8s_terminal.setStyleSheet(
-            f"background: #0d0d1a; color: {T['SUCCESS']}; border: none; padding: 8px;"
-        )
-        toolbar_style = f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
-        for bar in (getattr(self, "pods_toolbar", None), getattr(self, "deploy_toolbar", None),
-                    getattr(self, "sts_toolbar", None), getattr(self, "ds_toolbar", None),
-                    getattr(self, "hpa_toolbar", None),
-                    getattr(self, "svc_toolbar", None), getattr(self, "ing_toolbar", None),
-                    getattr(self, "events_toolbar", None), getattr(self, "tunnel_toolbar", None),
-                    getattr(self, "wl_toolbar", None), getattr(self, "wl_type_bar", None),
-                    getattr(self, "pvx_toolbar", None), getattr(self, "pvx_type_bar", None)):
-            if bar is not None:
-                bar.setStyleSheet(toolbar_style)
-        if getattr(self, "wl_type_toggle", None) is not None:
-            self._style_toggle(self.wl_type_toggle, (self.wl_type_jobs_btn, self.wl_type_cron_btn))
-        if getattr(self, "pvx_type_toggle", None) is not None:
-            self._style_toggle(self.pvx_type_toggle, (self.pvx_type_pvc_btn, self.pvx_type_pv_btn))
-        if getattr(self, "wl_history_hdr", None) is not None:
-            self.wl_history_hdr.setStyleSheet(
-                f"background: {T['BG_PANEL']}; color: {T['TEXT_DIM']}; font-size: 13px; "
-                f"font-weight: 700; border-bottom: 1px solid {T['BORDER']}; padding-left: 14px;"
-            )
-        if getattr(self, "wl_history_hint", None) is not None:
-            self.wl_history_hint.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px; padding: 12px;")
-        if getattr(self, "tunnel_log", None) is not None:
-            self.tunnel_log.setStyleSheet(
-                f"background: #0d0d1a; color: {T['TEXT_DIM']}; border: none; padding: 8px;"
-            )
-        if getattr(self, "tunnel_path_lbl", None) is not None:
-            self.tunnel_path_lbl.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 13px;")
-        if getattr(self, "tunnel_status_lbl", None) is not None:
-            running = self._tunnel_process is not None and self._tunnel_process.state() != QProcess.NotRunning
-            color = T['SUCCESS'] if running else T['TEXT_MUTED']
-            self.tunnel_status_lbl.setStyleSheet(f"color: {color}; font-size: 12px;")
-        if getattr(self, "cfg_detail_hdr", None) is not None:
-            self.cfg_detail_hdr.setStyleSheet(
-                f"background: {T['BG_PANEL']}; color: {T['TEXT_DIM']}; font-size: 13px; "
-                f"font-weight: 700; border-bottom: 1px solid {T['BORDER']}; padding-left: 14px;"
-            )
-        if getattr(self, "cfg_type_bar", None) is not None:
-            self.cfg_type_bar.setStyleSheet(
-                f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
-            )
-        if getattr(self, "cfg_type_toggle", None) is not None:
-            self._style_cfg_toggle()
-        if getattr(self, "cfg_raw", None) is not None:
-            self.cfg_raw.setStyleSheet(f"padding: 10px; border: none; background: {T['BG_DARK']};")
-        if getattr(self, "cfg_raw_lbl", None) is not None:
-            self.cfg_raw_lbl.setStyleSheet(
-                f"background: {T['BG_PANEL']}; color: {T['TEXT_DIM']}; font-size: 13px; "
-                f"font-weight: 700; border-top: 1px solid {T['BORDER']}; "
-                f"border-bottom: 1px solid {T['BORDER']}; padding-left: 14px;"
-            )
-        if self.ssh and self._current_context:
-            self._check_cluster_health()
-            # Pod/deployment cards (k8s_cards.py) bake T's colors in at
-            # construction time rather than re-reading them live, so a
-            # theme switch needs a rebuild of whichever list is on screen
-            # for its cards to pick up the new palette.
-            self._refresh_current_tab()
-
-    def _style_tree(self, tree):
-        font = monospace_font(13)
-        tree.setFont(font)
-
-        tree.setStyleSheet("""
-        QTreeWidget {
-            font-size: 13px;
-        }
-
-        QTreeWidget::item {
-            height: 38px;
-        }
-        """)
-
-        hdr = tree.header()
-        header_font = QFont("Segoe UI", 12)
-        header_font.setBold(True)
-        hdr.setFont(header_font)
-        hdr.setMinimumHeight(42)
-
-    def _filter_tunnel_services(self, _text=None):
-        """
-        Filter tunnel services by service name, namespace or port, AND by
-        the Active/Inactive status toggle. Both conditions must pass for a
-        row to be shown. Preserves the checkbox state.
-
-        `_text` is accepted (and ignored) so this can be connected directly
-        to QLineEdit.textChanged as well as called with no arguments from
-        the status-toggle handler and after a status refresh.
-        """
-        text = self.tunnel_search.text().strip().lower()
-
-        for i in range(self.tunnel_list.count()):
-            item = self.tunnel_list.item(i)
-
-            svc = item.data(Qt.UserRole)
-            if svc is None:
-                continue
-
-            searchable = (
-                f"{svc['name']} "
-                f"{svc['namespace']} "
-                f"{svc['port']}"
-            ).lower()
-            text_match = text in searchable
-
-            exposed = item.data(self.TUNNEL_STATUS_ROLE)
-            if self._tunnel_status_filter == "active":
-                status_match = exposed is True
-            elif self._tunnel_status_filter == "inactive":
-                status_match = exposed is False
-            else:
-                status_match = True
-
-            item.setHidden(not (text_match and status_match))
-
-    def _on_tunnel_status_filter_clicked(self, btn):
-        self._tunnel_status_filter = self._tunnel_filter_keys.get(btn, "all")
-        self._filter_tunnel_services()
-
-    # ── Namespace helpers ─────────────────────────────────────
-    def _load_namespaces(self):
-        self._run_cmd(
-            "kubectl get namespaces -o jsonpath='{.items[*].metadata.name}'",
-            self._populate_namespaces,
-        )
-
-    def _populate_namespaces(self, out: str):
-        names = out.strip().strip("'").split()
-        self._namespaces = names
-        current = self.ns_combo.currentText()
-        # A just-created namespace (see _create_namespace) takes priority
-        # over whatever was selected before, so the picker lands on the
-        # namespace that was just created instead of silently staying put.
-        pending = self._namespaces_pending_select
-        self._namespaces_pending_select = None
-        self.ns_combo.blockSignals(True)
-        self.ns_combo.clear()
-        self.ns_combo.addItem("(all namespaces)")
-        self.ns_combo.addItems(names)
-        if pending and pending in names:
-            self.ns_combo.setCurrentText(pending)
-        elif current in names:
-            self.ns_combo.setCurrentText(current)
-        elif "default" in names:
-            self.ns_combo.setCurrentText("default")
-        self.ns_combo.blockSignals(False)
-        self._current_ns = self.ns_combo.currentText()
-        if self._cluster_available:
-            self._refresh_current_tab()
-
-    def _on_ns_change(self, ns: str):
-        self._current_ns = ns
-        self._refresh_current_tab()
-
-    def _ns_flag(self) -> str:
-        ns = self._current_ns
-        if ns == "(all namespaces)" or not ns:
-            return "--all-namespaces"
-        return f"-n {ns}"
-
-    def _create_namespace(self):
-        if not self.ssh:
-            return
-        name, ok = QInputDialog.getText(self, "Create Namespace", "Namespace name:")
-        name = (name or "").strip()
-        if not ok or not name:
-            return
-        if not re.match(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", name):
-            QMessageBox.warning(
-                self, "Invalid name",
-                "Namespace names must be lowercase alphanumeric or '-', "
-                "and must start/end with an alphanumeric character."
-            )
-            return
-
-        def on_done(out):
-            self._log(out)
-            self._namespaces_pending_select = name
-            self._load_namespaces()
-
-        self._run_cmd(f"kubectl create namespace {name} 2>&1", on_done)
-
-    # ── Cluster health ────────────────────────────────────────
-    def _check_cluster_health(self):
-        """Probe the selected context before allowing any resource command."""
-        if not self.ssh or not self._current_context:
-            self._cluster_available = False
-            return
-        if self._cluster_probe_in_progress:
-            return
-
-        self._cluster_probe_in_progress = True
-        self._run_cmd(
-            "kubectl cluster-info --request-timeout=3s 2>&1 | head -3",
-            self._update_health,
-        )
-
-    def _update_health(self, out: str):
-        self._cluster_probe_in_progress = False
-        text = (out or "").lower()
-        healthy = (
-            "running" in text
-            or "control plane" in text
-            or "kubernetes control plane" in text
-        ) and not any(
-            bad in text
-            for bad in (
-                "unable to connect",
-                "connection refused",
-                "connection timed out",
-                "i/o timeout",
-                "no such host",
-                "context deadline exceeded",
-                "the server doesn't have a resource type",
-            )
-        )
-
-        self._cluster_available = healthy
-
-        if healthy:
-            self.health_lbl.setText("● Cluster OK")
-            self.health_lbl.setStyleSheet(f"color: {T['SUCCESS']}; font-size: 12px;")
-            self._load_namespaces()
-        else:
-            self._auto_refresh_timer.stop()
-            self.auto_btn.setChecked(False)
-            self.auto_btn.setText("⏱  Auto (30 s)")
-            self.health_lbl.setText("● Cluster unavailable")
-            self.health_lbl.setStyleSheet(f"color: {T['DANGER']}; font-size: 12px;")
-            self._clear_all(keep_context=True)
-
-    def _toggle_auto_refresh(self, on: bool):
-        if on:
-            self._auto_refresh_timer.start(30000)
-            self.auto_btn.setText("⏱  Auto ON")
-        else:
-            self._auto_refresh_timer.stop()
-            self.auto_btn.setText("⏱  Auto (30 s)")
-
-    def _auto_refresh(self):
-        if not self.ssh or not self._cluster_available or not self._current_context:
-            self._auto_refresh_timer.stop()
-            self.auto_btn.setChecked(False)
-            self.auto_btn.setText("⏱  Auto (30 s)")
-            return
-        self._refresh_current_tab()
-
-    def _clear_all(self, keep_context=False):
-        self.pod_list.clear()
-        self.deploy_list.clear()
-        self.pod_count_lbl.setText("")
-        self.pod_count_lbl.setStyleSheet("")
-        self.deploy_count_lbl.setText("")
-        self.deploy_count_lbl.setStyleSheet("")
-        self.sts_list.clear()
-        self.sts_count_lbl.setText("")
-        self.sts_count_lbl.setStyleSheet("")
-        self.ds_list.clear()
-        self.ds_count_lbl.setText("")
-        self.ds_count_lbl.setStyleSheet("")
-        self.hpa_list.clear()
-        self.hpa_count_lbl.setText("")
-        self.hpa_count_lbl.setStyleSheet("")
-        self.svc_list.clear()
-        self.svc_count_lbl.setText("")
-        self.svc_count_lbl.setStyleSheet("")
-        self.ing_list.clear()
-        self.ing_count_lbl.setText("")
-        self.ing_count_lbl.setStyleSheet("")
-        self.wl_list.clear()
-        self.wl_history_list.clear()
-        self.wl_count_lbl.setText("")
-        self.wl_count_lbl.setStyleSheet("")
-        self.pvx_list.clear()
-        self.pvx_count_lbl.setText("")
-        self.pvx_count_lbl.setStyleSheet("")
-        self.cfg_list.clear()
-        self.cfg_detail.clear()
-        self.cfg_raw.clear()
-        self.event_list.clear()
-        self.event_count_lbl.setText("")
-        self.event_count_lbl.setStyleSheet("")
-        self._events_raw = ""
-        if getattr(self, "event_warn_btn", None) is not None:
-            self.event_warn_btn.setChecked(False)
-        self.ns_combo.clear()
-        if not keep_context:
-            self.context_combo.clear()
-            self._contexts = []
-            self._current_context = ""
-        self.health_lbl.setText("● Cluster")
-        self.health_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px;")
-
-    def _refresh_current_tab(self, _=None):
-        # Never issue resource-level kubectl commands until the selected
-        # context has passed the cluster-health probe.  This also prevents
-        # tab changes and auto-refresh from generating unwanted commands on
-        # machines that have no reachable Kubernetes cluster.
-        if not self.ssh or not self._cluster_available or not self._current_context:
-            return
-
-        idx = self.sub_tabs.currentIndex()
-        if   idx == 0: self._load_pods()
-        elif idx == 1: self._load_deployments()
-        elif idx == 2: self._load_statefulsets()
-        elif idx == 3: self._load_daemonsets()
-        elif idx == 4: self._load_hpas()
-        elif idx == 5: self._load_services()
-        elif idx == 6: self._load_ingress()
-        elif idx == 7: self._load_workloads()
-        elif idx == 8: self._load_storage()
-        elif idx == 9: self._load_config_resources()
-        elif idx == 10: self._load_events()
-        elif idx == 11: self._refresh_tunnel_status()
-
-    # ── Pods ──────────────────────────────────────────────────
-    # `kubectl get pods -o wide` renders the RESTARTS column as a plain
-    # number ("0") normally, but as "N (Ndhm ago)" — a single logical
-    # value containing a space — for any pod whose last restart was
-    # recent enough for kubectl to bother annotating it. line.split()
-    # blows that annotation into two extra whitespace-separated tokens
-    # ("(22d", "ago)"), which silently shifts every fixed-position column
-    # after it (AGE/IP/NODE) by two — the misalignment seen when a
-    # recently-restarted pod's IP/Node show up empty or wrong while an
-    # untouched pod in the same table lines up fine. _split_pod_line
-    # detects that two-token annotation before the fixed-offset slicing
-    # below runs, pulls it out into its own "Last Restart" value (rather
-    # than just discarding it — it's genuinely useful info), and returns
-    # the remaining tokens so the real columns land back in place.
-    _PAREN_OPEN_RE  = re.compile(r"^\(\S*$")
-    _PAREN_CLOSE_RE = re.compile(r"^\S*\)$")
-
-    @staticmethod
-    def _split_pod_line(line: str):
-        """Returns (cleaned_parts, last_restart). last_restart is e.g.
-        "22d ago", or "" if this pod has never restarted (or kubectl's
-        RESTARTS column didn't include the annotation)."""
-        parts = line.split()
-        cleaned = []
-        last_restart = ""
-        i = 0
-        while i < len(parts):
-            if (KubernetesTab._PAREN_OPEN_RE.match(parts[i]) and i + 1 < len(parts)
-                    and KubernetesTab._PAREN_CLOSE_RE.match(parts[i + 1])):
-                # "(22d" + "ago)" -> "22d ago"
-                last_restart = f"{parts[i][1:]} {parts[i + 1][:-1]}"
-                i += 2
-                continue
-            cleaned.append(parts[i])
-            i += 1
-        return cleaned, last_restart
-
-    def _load_pods(self):
-        self._run_cmd(f"kubectl get pods {self._ns_flag()} -o wide 2>&1", self._populate_pods)
-
-    def _populate_pods(self, out: str):
-        self.pod_list.clear()
-        all_ns = (self._current_ns == "(all namespaces)")
-        total   = 0
-        running = 0
-        # The namespace chip on each card is only shown in "(all namespaces)"
-        # view (i.e. rows can differ) — when one namespace is selected it's
-        # implied by ns_combo already, so the chip would just repeat itself.
-        for line in out.strip().splitlines()[1:]:
-            parts, last_restart = self._split_pod_line(line)
-            if all_ns:
-                # `kubectl get pods --all-namespaces -o wide` prepends NAMESPACE.
-                if len(parts) < 6:
-                    continue
-                ns, name, ready, status, restarts, age = parts[:6]
-                ip   = parts[6] if len(parts) > 6 else "-"
-                node = parts[7] if len(parts) > 7 else "-"
-            else:
-                if len(parts) < 5:
-                    continue
-                ns = self._current_ns or "default"
-                name, ready, status, restarts, age = parts[:5]
-                ip   = parts[5] if len(parts) > 5 else "-"
-                node = parts[6] if len(parts) > 6 else "-"
-            meta = {
-                "namespace": ns, "name": name, "ready": ready, "status": status,
-                "restarts": restarts, "last_restart": last_restart or "-",
-                "age": age, "ip": ip, "node": node,
-            }
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, meta)
-            item.setSizeHint(QSize(0, PodCardWidget.CARD_HEIGHT))
-            self.pod_list.addItem(item)
-            card = PodCardWidget(meta, all_ns)
-            card.ai_requested.connect(self._on_pod_card_ai_requested)
-            self.pod_list.setItemWidget(item, card)
-            if meta.get("name") == self._pod_ai_pod:
-                # A refresh landed while this pod's diagnosis was still in
-                # flight — the old card (and its "✨ …" busy state) just got
-                # thrown away, so re-point the busy state at its replacement.
-                self._pod_ai_card = card
-                card.set_ai_busy(True)
-            total += 1
-            if "running" in status.lower():
-                running += 1
-        if total == 0:
-            color_key = "TEXT_MUTED"
-        elif running == total:
-            color_key = "SUCCESS"
-        elif running == 0:
-            color_key = "DANGER"
-        else:
-            color_key = "WARNING"
-        self._set_count_badge(self.pod_count_lbl, f"{running}/{total} running", color_key)
-        # Refreshing rebuilds every row from scratch, which would otherwise
-        # silently show everything again even though the filter box still
-        # has text in it — reapply whatever's currently typed there.
-        self._filter_pods(self.pod_filter.text())
-
-    def _filter_pods(self, text: str):
-        q = text.lower()
-        for i in range(self.pod_list.count()):
-            item = self.pod_list.item(i)
-            meta = item.data(Qt.UserRole) or {}
-            item.setHidden(q not in meta.get("name", "").lower())
-
-    def _selected_pod(self) -> tuple:  # (Optional[str], str)
-        item = self.pod_list.currentItem()
-        if not item:
-            QMessageBox.warning(self, "No selection", "Select a pod first.")
-            return None, ""
-        meta = item.data(Qt.UserRole) or {}
-        return meta.get("name"), meta.get("namespace") or "default"
-
-    def _on_pod_double_click(self, item):
-        """Double-clicking a pod card is a shortcut for Describe — reads
-        name/namespace off the card that was actually double-clicked rather
-        than relying on _selected_pod()'s currentItem(), since a
-        double-click's second press is what sets the current item and
-        there's no reason to depend on that timing."""
-        meta = item.data(Qt.UserRole) or {}
-        self._describe("pod", meta.get("name"), meta.get("namespace") or "default")
-
-    def _on_pod_selection_changed(self, current, previous):
-        """Cards paint their own selected state (they fully cover the
-        QListWidgetItem's rect, so the list's native selection styling
-        never shows through) — forward selection changes into them."""
-        if previous is not None:
-            w = self.pod_list.itemWidget(previous)
-            if w:
-                w.set_selected(False)
-        if current is not None:
-            w = self.pod_list.itemWidget(current)
-            if w:
-                w.set_selected(True)
-
-    def _pod_logs(self):
-        pod, ns = self._selected_pod()
-        if pod:
-            self._logs_pod(pod, ns)
-
-
-    def _logs_pod(self, pod: str, ns: str):
-        """Look up the pod containers before opening LogViewerDialog.
-
-        Single-container pods open directly. Multi-container pods require an
-        explicit container selection so logs are never taken from the wrong
-        sidecar/container by accident.
-        """
-        self._run_cmd(
-            f"kubectl get pod -n {ns} {pod} "
-            f"-o jsonpath='{{.spec.containers[*].name}}' 2>&1",
-            lambda out, pod=pod, ns=ns:
-                self._on_logs_containers_fetched(out, pod, ns),
-        )
-
-
-    def _on_logs_containers_fetched(self, out: str, pod: str, ns: str):
-        # Same trailing-quote defensiveness as the Exec container lookup.
-        containers = out.strip().strip("'").split()
-
-        if len(containers) <= 1:
-            LogViewerDialog(
-                self,
-                self.ssh,
-                ns,
-                pod,
-                containers[0] if containers else None
-            ).exec_()
-            return
-
-        dlg = ContainerPickerDialog(
-            self,
-            pod,
-            containers,
-            action="Logs"
-        )
-
-        if dlg.exec_() == QDialog.Accepted:
-            LogViewerDialog(
-                self,
-                self.ssh,
-                ns,
-                pod,
-                dlg.selected_container()
-            ).exec_()
-
-    # ── Inline "✨ AI" button on troubled pod cards ─────────────
-    # Same diagnosis flow as LogViewerDialog's "Analyze with AI" button
-    # (fetch logs -> ai_assist.AIExplainWorker -> AIExplainDialog), just
-    # entered straight from the card instead of requiring the user to open
-    # the full log viewer first. Single-flight: only one card's request
-    # runs at a time (see the self._pod_ai_* state in __init__).
-    def _on_pod_card_ai_requested(self, meta: dict):
-        if self._pod_ai_pod is not None:
-            return  # a diagnosis is already running — button is disabled meanwhile, but be defensive
-
-        if not self.ssh:
-            QMessageBox.warning(self, "Not connected", "Connect to the instance first.")
-            return
-
-        provider = ai_assist.get_provider()
-        api_key  = ai_assist.get_api_key(provider)
-        if not api_key:
-            label = ai_assist.PROVIDERS.get(provider, {}).get("label", provider)
-            QMessageBox.information(
-                self, "No API key set",
-                f"Add a {label} API key in Settings → 🤖 AI to use this feature."
-            )
-            return
-
-        pod    = meta.get("name")
-        ns     = meta.get("namespace") or "default"
-        status = meta.get("status", "") or ""
-
-        self._pod_ai_pod  = pod
-        self._pod_ai_card = self.sender() if isinstance(self.sender(), PodCardWidget) else None
-        if self._pod_ai_card is not None:
-            self._pod_ai_card.set_ai_busy(True)
-
-        self._pod_ai_dialog = AIExplainDialog(self, f"AI diagnosis — {pod}")
-        self._pod_ai_dialog.body.setPlainText("Fetching logs…")
-        self._pod_ai_dialog.show()
-
-        # A pod that's actively crash-looping usually has nothing useful in
-        # its *current* container's logs (it just restarted) — the actual
-        # error is in the previous container's log instead. A pod with
-        # restarts>0 but currently Running already fell back to this same
-        # heuristic on the card itself (see k8s_cards._pod_in_trouble), so
-        # mirror it here rather than re-deriving it from restarts alone.
-        use_previous = "crash" in status.lower()
-        prev = "--previous" if use_previous else ""
-        inner = f"kubectl {self._context_flag()} logs --tail=200 -n {ns} {prev} {pod} 2>&1".replace("kubectl  logs", "kubectl logs")
-        cmd = f"bash -lc {shlex.quote(inner)}"
-
-        worker = CommandWorker(self.ssh, cmd)
-        worker.done.connect(lambda out, pod=pod, ns=ns: self._on_pod_ai_logs_fetched(pod, ns, out))
-        worker.error.connect(lambda err: self._on_pod_ai_logs_error(err))
-        self._pod_ai_log_worker = worker
-        track_worker(self._workers, worker)
-        worker.start()
-
-    def _on_pod_ai_logs_fetched(self, pod: str, ns: str, log_text: str):
-        self._pod_ai_log_worker = None
-        log_text = (log_text or "").strip()
-        if not log_text:
-            self._on_pod_ai_logs_error("No log output for this pod.")
-            return
-
-        if self._pod_ai_dialog is not None:
-            self._pod_ai_dialog.set_source_context(
-                f"Pod: {pod}\nNamespace: {ns}\n\nLogs/evidence:\n{log_text}"
-            )
-            self._pod_ai_dialog.set_loading()
-
-        provider = ai_assist.get_provider()
-        worker = ai_assist.AIExplainWorker(
-            provider, ai_assist.get_api_key(provider), ai_assist.get_model(provider),
-            pod, ns, None, log_text,
-        )
-        worker.done.connect(self._on_pod_ai_done)
-        worker.error.connect(self._on_pod_ai_error)
-        worker.finished.connect(self._on_pod_ai_finished)
-        self._pod_ai_worker = worker
-        worker.start()
-
-    def _on_pod_ai_logs_error(self, message: str):
-        self._pod_ai_log_worker = None
-        if self._pod_ai_dialog is not None:
-            self._pod_ai_dialog.set_error(f"Couldn't fetch logs: {message}")
-        self._on_pod_ai_finished()
-
-    def _on_pod_ai_done(self, text: str):
-        if self._pod_ai_dialog is not None:
-            self._pod_ai_dialog.set_markdown(text)
-
-    def _on_pod_ai_error(self, message: str):
-        if self._pod_ai_dialog is not None:
-            self._pod_ai_dialog.set_error(message)
-
-    def _on_pod_ai_finished(self):
-        self._pod_ai_worker = None
-        self._pod_ai_pod    = None
-        if self._pod_ai_card is not None:
-            self._pod_ai_card.set_ai_busy(False)
-        self._pod_ai_card = None
-
-    def _pod_exec(self):
-        pod, ns = self._selected_pod()
-        if pod:
-            self._exec_pod(pod, ns)
-
-    def _exec_pod(self, pod: str, ns: str):
-        """Look up the pod's container names before opening ExecDialog —
-        see ContainerPickerDialog's docstring for why. Single-container
-        pods (the common case) skip straight to ExecDialog with no extra
-        click."""
-        self._run_cmd(
-            f"kubectl get pod -n {ns} {pod} "
-            f"-o jsonpath='{{.spec.containers[*].name}}' 2>&1",
-            lambda out, pod=pod, ns=ns: self._on_exec_containers_fetched(out, pod, ns),
-        )
-
-    def _on_exec_containers_fetched(self, out: str, pod: str, ns: str):
-        # Same trailing-quote defensiveness as _populate_namespaces.
-        containers = out.strip().strip("'").split()
-        if len(containers) <= 1:
-            ExecDialog(self, self.ssh, ns, pod, containers[0] if containers else None,
-                       context=self._current_context).exec_()
-            return
-        dlg = ContainerPickerDialog(self, pod, containers)
-        if dlg.exec_() == QDialog.Accepted:
-            ExecDialog(self, self.ssh, ns, pod, dlg.selected_container(),
-                       context=self._current_context).exec_()
-
-    def _pod_delete(self):
-        pod, ns = self._selected_pod()
-        if not pod:
-            return
-        if QMessageBox.question(self, "Delete Pod", f'Delete pod "{pod}"?',
-                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            self._run_cmd(f"kubectl delete pod -n {ns} {pod} 2>&1",
-                          lambda o: (self._log(o), self._load_pods()))
-
-    def _pod_restart(self):
-        pod, ns = self._selected_pod()
-        if pod:
-            self._run_cmd(f"kubectl delete pod -n {ns} {pod} 2>&1",
-                          lambda o: (self._log(o), self._load_pods()))
-
-    def _pod_ctx_menu(self, pos):
-        item = self.pod_list.itemAt(pos)
-        if not item:
-            return
-        self.pod_list.setCurrentItem(item)
-        meta = item.data(Qt.UserRole) or {}
-        pod  = meta.get("name")
-        ns   = meta.get("namespace") or "default"
-        menu = QMenu(self)
-        menu.addAction("📋  View Logs",  lambda: self._logs_pod(pod, ns))
-        menu.addAction("💻  Exec Shell", lambda: self._exec_pod(pod, ns))
-        menu.addAction("📄  Describe",   lambda: self._describe("pod", pod, ns))
-        menu.addSeparator()
-        menu.addAction("🗑  Delete", self._pod_delete)
-        menu.exec_(self.pod_list.viewport().mapToGlobal(pos))
-
-    # ── Deployments ───────────────────────────────────────────
-    def _load_deployments(self):
-        self._run_cmd(f"kubectl get deployments {self._ns_flag()} -o wide 2>&1",
-                      self._populate_deployments)
-
-    def _populate_deployments(self, out: str):
-        self.deploy_list.clear()
-        all_ns = (self._current_ns == "(all namespaces)")
-        total = 0
-        ready_count = 0
-        for line in out.strip().splitlines()[1:]:
-            parts = line.split()
-            if all_ns:
-                # `kubectl get deployments --all-namespaces -o wide` prepends
-                # NAMESPACE — without accounting for it, every column below
-                # silently shifts left by one (Name shows the namespace,
-                # Ready shows the name, and so on).
-                if len(parts) < 6:
-                    continue
-                ns, name, ready, upd, avail, age = parts[:6]
-                imgs = " | ".join(parts[6:]) if len(parts) > 6 else "-"
-            else:
-                if len(parts) < 5:
-                    continue
-                ns = self._current_ns or "default"
-                name, ready, upd, avail, age = parts[:5]
-                imgs = " | ".join(parts[5:]) if len(parts) > 5 else "-"
-            meta = {
-                "namespace": ns, "name": name, "ready": ready,
-                "up_to_date": upd, "available": avail, "age": age, "images": imgs,
-            }
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, meta)
-            item.setSizeHint(QSize(0, DeploymentCardWidget.CARD_HEIGHT))
-            self.deploy_list.addItem(item)
-            self.deploy_list.setItemWidget(item, DeploymentCardWidget(meta, all_ns))
-            total += 1
-            try:
-                cur, desired = ready.split("/")
-                if cur == desired:
-                    ready_count += 1
-            except Exception:
-                pass
-        if total == 0:
-            color_key = "TEXT_MUTED"
-        elif ready_count == total:
-            color_key = "SUCCESS"
-        elif ready_count == 0:
-            color_key = "DANGER"
-        else:
-            color_key = "WARNING"
-        self._set_count_badge(self.deploy_count_lbl, f"{total} deployment{'s' if total != 1 else ''} · {ready_count} ready", color_key)
-        # Same reasoning as _populate_pods: rebuild wipes the visual filter
-        # state even though the filter box still has text — reapply it.
-        self._filter_deployments(self.deploy_filter.text())
-
-    def _on_deploy_click(self, item):
-        meta = item.data(Qt.UserRole) or {}
-        try:
-            _, desired = meta.get("ready", "").split("/")
-            self.scale_spin.setValue(int(desired))
-        except Exception:
-            pass
-
-    def _on_deploy_double_click(self, item):
-        """Double-clicking a deployment card is a shortcut for Describe —
-        reads name/namespace off the card that was actually double-clicked,
-        same reasoning as _on_pod_double_click above."""
-        meta = item.data(Qt.UserRole) or {}
-        self._describe("deployment", meta.get("name"), meta.get("namespace") or "default")
-
-    def _on_deploy_selection_changed(self, current, previous):
-        """Same reasoning as _on_pod_selection_changed above."""
-        if previous is not None:
-            w = self.deploy_list.itemWidget(previous)
-            if w:
-                w.set_selected(False)
-        if current is not None:
-            w = self.deploy_list.itemWidget(current)
-            if w:
-                w.set_selected(True)
-
-    def _filter_deployments(self, text: str):
-        q = text.lower()
-        for i in range(self.deploy_list.count()):
-            item = self.deploy_list.item(i)
-            meta = item.data(Qt.UserRole) or {}
-            item.setHidden(q not in meta.get("name", "").lower())
-
-    def _selected_deploy(self) -> tuple:  # (Optional[str], str)
-        item = self.deploy_list.currentItem()
-        if not item:
-            QMessageBox.warning(self, "No selection", "Select a deployment first.")
-            return None, ""
-        meta = item.data(Qt.UserRole) or {}
-        return meta.get("name"), meta.get("namespace") or "default"
-
-    def _deploy_scale(self):
-        dep, ns = self._selected_deploy()
-        if not dep:
-            return
-        replicas = self.scale_spin.value()
-        if QMessageBox.question(self, "Scale", f'Scale "{dep}" to {replicas} replica(s)?',
-                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            self._run_cmd(f"kubectl scale deployment {dep} -n {ns} --replicas={replicas} 2>&1",
-                          lambda o: (self._log(o), self._load_deployments()))
-
-    def _deploy_scale_step(self, delta: int):
-        """Quick +1/-1 scale, applied immediately (no confirmation dialog —
-        this is the fast stepper next to the Replicas spinbox, distinct
-        from the "⇅ Scale" button which jumps straight to whatever number
-        is typed into the spinbox). Keeps the spinbox in sync so both
-        controls always agree on the current target."""
-        dep, ns = self._selected_deploy()
-        if not dep:
-            return
-        replicas = max(self.scale_spin.minimum(),
-                       min(self.scale_spin.maximum(), self.scale_spin.value() + delta))
-        self.scale_spin.setValue(replicas)
-        self._run_cmd(f"kubectl scale deployment {dep} -n {ns} --replicas={replicas} 2>&1",
-                      lambda o: (self._log(o), self._load_deployments()))
-
-    def _deploy_restart(self):
-        dep, ns = self._selected_deploy()
-        if dep:
-            self._run_cmd(f"kubectl rollout restart deployment/{dep} -n {ns} 2>&1",
-                          lambda o: (self._log(o), self._load_deployments()))
-
-    def _deploy_describe(self):
-        dep, ns = self._selected_deploy()
-        if dep:
-            self._describe("deployment", dep, ns)
-
-    def _deploy_delete(self):
-        dep, ns = self._selected_deploy()
-        if not dep:
-            return
-        if QMessageBox.question(self, "Delete Deployment",
-                                f'Delete deployment "{dep}"?\nThis will remove all its pods.',
-                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            self._run_cmd(f"kubectl delete deployment {dep} -n {ns} 2>&1",
-                          lambda o: (self._log(o), self._load_deployments()))
-
-    # ── StatefulSets ──────────────────────────────────────────
-    def _load_statefulsets(self):
-        self._run_cmd(f"kubectl get statefulsets {self._ns_flag()} -o wide 2>&1",
-                      self._populate_statefulsets)
-
-    def _populate_statefulsets(self, out: str):
-        self.sts_list.clear()
-        all_ns = (self._current_ns == "(all namespaces)")
-        total = 0
-        ready_count = 0
-        for line in out.strip().splitlines()[1:]:
-            parts = line.split()
-            # `kubectl get statefulsets -o wide` columns: NAME READY AGE
-            # CONTAINERS IMAGES (NAMESPACE prepended in --all-namespaces).
-            if all_ns:
-                if len(parts) < 4:
-                    continue
-                ns, name, ready, age = parts[:4]
-                imgs = " | ".join(parts[4:]) if len(parts) > 4 else "-"
-            else:
-                if len(parts) < 3:
-                    continue
-                ns = self._current_ns or "default"
-                name, ready, age = parts[:3]
-                imgs = " | ".join(parts[3:]) if len(parts) > 3 else "-"
-            meta = {
-                "namespace": ns, "name": name, "ready": ready,
-                "age": age, "images": imgs,
-            }
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, meta)
-            item.setSizeHint(QSize(0, StatefulSetCardWidget.CARD_HEIGHT))
-            self.sts_list.addItem(item)
-            self.sts_list.setItemWidget(item, StatefulSetCardWidget(meta, all_ns))
-            total += 1
-            try:
-                cur, desired = ready.split("/")
-                if cur == desired:
-                    ready_count += 1
-            except Exception:
-                pass
-        if total == 0:
-            color_key = "TEXT_MUTED"
-        elif ready_count == total:
-            color_key = "SUCCESS"
-        elif ready_count == 0:
-            color_key = "DANGER"
-        else:
-            color_key = "WARNING"
-        self._set_count_badge(self.sts_count_lbl, f"{total} statefulset{'s' if total != 1 else ''} · {ready_count} ready", color_key)
-        self._filter_statefulsets(self.sts_filter.text())
-
-    def _on_sts_click(self, item):
-        meta = item.data(Qt.UserRole) or {}
-        try:
-            _, desired = meta.get("ready", "").split("/")
-            self.sts_scale_spin.setValue(int(desired))
-        except Exception:
-            pass
-
-    def _on_sts_double_click(self, item):
-        meta = item.data(Qt.UserRole) or {}
-        self._describe("statefulset", meta.get("name"), meta.get("namespace") or "default")
-
-    def _on_sts_selection_changed(self, current, previous):
-        if previous is not None:
-            w = self.sts_list.itemWidget(previous)
-            if w:
-                w.set_selected(False)
-        if current is not None:
-            w = self.sts_list.itemWidget(current)
-            if w:
-                w.set_selected(True)
-
-    def _filter_statefulsets(self, text: str):
-        q = text.lower()
-        for i in range(self.sts_list.count()):
-            item = self.sts_list.item(i)
-            meta = item.data(Qt.UserRole) or {}
-            item.setHidden(q not in meta.get("name", "").lower())
-
-    def _selected_sts(self) -> tuple:  # (Optional[str], str)
-        item = self.sts_list.currentItem()
-        if not item:
-            QMessageBox.warning(self, "No selection", "Select a statefulset first.")
-            return None, ""
-        meta = item.data(Qt.UserRole) or {}
-        return meta.get("name"), meta.get("namespace") or "default"
-
-    def _sts_scale(self):
-        sts, ns = self._selected_sts()
-        if not sts:
-            return
-        replicas = self.sts_scale_spin.value()
-        if QMessageBox.question(self, "Scale", f'Scale "{sts}" to {replicas} replica(s)?',
-                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            self._run_cmd(f"kubectl scale statefulset {sts} -n {ns} --replicas={replicas} 2>&1",
-                          lambda o: (self._log(o), self._load_statefulsets()))
-
-    def _sts_restart(self):
-        sts, ns = self._selected_sts()
-        if sts:
-            self._run_cmd(f"kubectl rollout restart statefulset/{sts} -n {ns} 2>&1",
-                          lambda o: (self._log(o), self._load_statefulsets()))
-
-    def _sts_describe(self):
-        sts, ns = self._selected_sts()
-        if sts:
-            self._describe("statefulset", sts, ns)
-
-    def _sts_delete(self):
-        sts, ns = self._selected_sts()
-        if not sts:
-            return
-        if QMessageBox.question(self, "Delete StatefulSet",
-                                f'Delete statefulset "{sts}"?\nThis will remove all its pods.',
-                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            self._run_cmd(f"kubectl delete statefulset {sts} -n {ns} 2>&1",
-                          lambda o: (self._log(o), self._load_statefulsets()))
-
-    def _sts_ctx_menu(self, pos):
-        item = self.sts_list.itemAt(pos)
-        if not item:
-            return
-        self.sts_list.setCurrentItem(item)
-        meta = item.data(Qt.UserRole) or {}
-        name = meta.get("name")
-        ns   = meta.get("namespace") or "default"
-        menu = QMenu(self)
-        menu.addAction("↺  Restart",  self._sts_restart)
-        menu.addAction("📄  Describe", lambda: self._describe("statefulset", name, ns))
-        menu.addSeparator()
-        menu.addAction("🗑  Delete", self._sts_delete)
-        menu.exec_(self.sts_list.viewport().mapToGlobal(pos))
-
-    # ── DaemonSets ────────────────────────────────────────────
-    def _load_daemonsets(self):
-        self._run_cmd(f"kubectl get daemonsets {self._ns_flag()} -o wide 2>&1",
-                      self._populate_daemonsets)
-
-    def _populate_daemonsets(self, out: str):
-        self.ds_list.clear()
-        all_ns = (self._current_ns == "(all namespaces)")
-        total = 0
-        ready_count = 0
-        for line in out.strip().splitlines()[1:]:
-            parts = line.split()
-            # `kubectl get daemonsets -o wide` columns: NAME DESIRED CURRENT
-            # READY UP-TO-DATE AVAILABLE NODE-SELECTOR AGE CONTAINERS IMAGES
-            # SELECTOR (NAMESPACE prepended in --all-namespaces). NODE-SELECTOR
-            # renders as a single space-free token ("<none>" or a real
-            # selector expression), so straight positional split() still
-            # lines the fixed columns up correctly.
-            if all_ns:
-                if len(parts) < 9:
-                    continue
-                ns, name, desired, current, ready, upd, avail, node_sel, age = parts[:9]
-                imgs = " | ".join(parts[9:]) if len(parts) > 9 else "-"
-            else:
-                if len(parts) < 8:
-                    continue
-                ns = self._current_ns or "default"
-                name, desired, current, ready, upd, avail, node_sel, age = parts[:8]
-                imgs = " | ".join(parts[8:]) if len(parts) > 8 else "-"
-            meta = {
-                "namespace": ns, "name": name, "desired": desired, "current": current,
-                "ready": ready, "up_to_date": upd, "available": avail,
-                "node_selector": node_sel, "age": age, "images": imgs,
-            }
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, meta)
-            item.setSizeHint(QSize(0, DaemonSetCardWidget.CARD_HEIGHT))
-            self.ds_list.addItem(item)
-            self.ds_list.setItemWidget(item, DaemonSetCardWidget(meta, all_ns))
-            total += 1
-            if desired == ready or desired == "0":
-                ready_count += 1
-        if total == 0:
-            color_key = "TEXT_MUTED"
-        elif ready_count == total:
-            color_key = "SUCCESS"
-        elif ready_count == 0:
-            color_key = "DANGER"
-        else:
-            color_key = "WARNING"
-        self._set_count_badge(self.ds_count_lbl, f"{total} daemonset{'s' if total != 1 else ''} · {ready_count} ready", color_key)
-        self._filter_daemonsets(self.ds_filter.text())
-
-    def _on_ds_double_click(self, item):
-        meta = item.data(Qt.UserRole) or {}
-        self._describe("daemonset", meta.get("name"), meta.get("namespace") or "default")
-
-    def _on_ds_selection_changed(self, current, previous):
-        if previous is not None:
-            w = self.ds_list.itemWidget(previous)
-            if w:
-                w.set_selected(False)
-        if current is not None:
-            w = self.ds_list.itemWidget(current)
-            if w:
-                w.set_selected(True)
-
-    def _filter_daemonsets(self, text: str):
-        q = text.lower()
-        for i in range(self.ds_list.count()):
-            item = self.ds_list.item(i)
-            meta = item.data(Qt.UserRole) or {}
-            item.setHidden(q not in meta.get("name", "").lower())
-
-    def _selected_ds(self) -> tuple:  # (Optional[str], str)
-        item = self.ds_list.currentItem()
-        if not item:
-            QMessageBox.warning(self, "No selection", "Select a daemonset first.")
-            return None, ""
-        meta = item.data(Qt.UserRole) or {}
-        return meta.get("name"), meta.get("namespace") or "default"
-
-    def _ds_restart(self):
-        ds, ns = self._selected_ds()
-        if ds:
-            self._run_cmd(f"kubectl rollout restart daemonset/{ds} -n {ns} 2>&1",
-                          lambda o: (self._log(o), self._load_daemonsets()))
-
-    def _ds_describe(self):
-        ds, ns = self._selected_ds()
-        if ds:
-            self._describe("daemonset", ds, ns)
-
-    def _ds_delete(self):
-        ds, ns = self._selected_ds()
-        if not ds:
-            return
-        if QMessageBox.question(self, "Delete DaemonSet",
-                                f'Delete daemonset "{ds}"?\nThis will remove it from every node.',
-                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            self._run_cmd(f"kubectl delete daemonset {ds} -n {ns} 2>&1",
-                          lambda o: (self._log(o), self._load_daemonsets()))
-
-    def _ds_ctx_menu(self, pos):
-        item = self.ds_list.itemAt(pos)
-        if not item:
-            return
-        self.ds_list.setCurrentItem(item)
-        meta = item.data(Qt.UserRole) or {}
-        name = meta.get("name")
-        ns   = meta.get("namespace") or "default"
-        menu = QMenu(self)
-        menu.addAction("↺  Restart",  self._ds_restart)
-        menu.addAction("📄  Describe", lambda: self._describe("daemonset", name, ns))
-        menu.addSeparator()
-        menu.addAction("🗑  Delete", self._ds_delete)
-        menu.exec_(self.ds_list.viewport().mapToGlobal(pos))
-
-    # ── HorizontalPodAutoscalers ─────────────────────────────
-    @staticmethod
-    def _hpa_metric_value(d: dict) -> str:
-        """Pull whichever value field a v2 HPA metric target/current dict
-        actually carries — Resource/Pods/Object/External metrics all
-        share this shape but populate different keys of it."""
-        if not d:
-            return "-"
-        if "averageUtilization" in d:
-            return f"{d['averageUtilization']}%"
-        if "averageValue" in d:
-            return str(d["averageValue"])
-        if "value" in d:
-            return str(d["value"])
-        return "-"
-
-    @classmethod
-    def _hpa_metric_key_name(cls, m: dict, side: str):
-        """(type_key, metric_name) for one metric entry — 'side' is
-        'target' (from spec.metrics) or 'current' (from status.currentMetrics).
-        Matching spec vs current entries by (type, name) is how a target %
-        gets paired with its current % below."""
-        mtype = m.get("type", "")
-        key = mtype.lower()
-        sub = m.get(key, {}) or {}
-        name = (sub.get("metric") or {}).get("name") or sub.get("name") or mtype
-        return (key, name), cls._hpa_metric_value(sub.get(side))
-
-    def _load_hpas(self):
-        self._run_cmd(f"kubectl get hpa {self._ns_flag()} -o json 2>&1", self._populate_hpas)
-
-    def _populate_hpas(self, out: str):
-        self.hpa_list.clear()
-        all_ns = (self._current_ns == "(all namespaces)")
-        try:
-            items = json.loads(out).get("items", [])
-        except Exception:
-            items = []
-
-        total = 0
-        healthy_count = 0
-        for it in items:
-            spec   = it.get("spec") or {}
-            status = it.get("status") or {}
-            ref    = spec.get("scaleTargetRef") or {}
-
-            metrics_spec    = spec.get("metrics") or []
-            current_metrics = status.get("currentMetrics") or []
-
-            # autoscaling/v1 HPAs (older clusters) don't have spec.metrics
-            # at all — just a single implicit CPU-utilization target — so
-            # synthesize the same one-entry shape the v2 path below expects.
-            if not metrics_spec and spec.get("targetCPUUtilizationPercentage") is not None:
-                metrics_spec = [{"type": "Resource", "resource": {
-                    "name": "cpu", "target": {"averageUtilization": spec["targetCPUUtilizationPercentage"]}}}]
-                cur_cpu = status.get("currentCPUUtilizationPercentage")
-                if cur_cpu is not None:
-                    current_metrics = [{"type": "Resource", "resource": {
-                        "name": "cpu", "current": {"averageUtilization": cur_cpu}}}]
-
-            current_by_key = {}
-            for m in current_metrics:
-                key, val = self._hpa_metric_key_name(m, "current")
-                current_by_key[key] = val
-
-            metrics = []
-            has_unknown = False
-            for m in metrics_spec:
-                key, target_val = self._hpa_metric_key_name(m, "target")
-                current_val = current_by_key.get(key, "-")
-                if current_val == "-":
-                    has_unknown = True
-                metrics.append({"label": key[1], "current": current_val, "target": target_val})
-
-            conditions = status.get("conditions") or []
-            scaling_blocked = any(
-                c.get("status") == "False" and c.get("type") in ("AbleToScale", "ScalingActive")
-                for c in conditions
-            )
-            healthy = not has_unknown and not scaling_blocked
-
-            meta = {
-                "namespace":        (it.get("metadata") or {}).get("namespace", ""),
-                "name":             (it.get("metadata") or {}).get("name", ""),
-                "reference":        f"{ref.get('kind', '')}/{ref.get('name', '')}",
-                "min_replicas":     spec.get("minReplicas", "-"),
-                "max_replicas":     spec.get("maxReplicas", "-"),
-                "current_replicas": status.get("currentReplicas", "-"),
-                "desired_replicas": status.get("desiredReplicas", "-"),
-                "metrics":          metrics,
-                "age":              self._humanize_age((it.get("metadata") or {}).get("creationTimestamp", "")),
-                "healthy":          healthy,
-            }
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, meta)
-            item.setSizeHint(QSize(0, HPACardWidget.CARD_HEIGHT))
-            self.hpa_list.addItem(item)
-            self.hpa_list.setItemWidget(item, HPACardWidget(meta, all_ns))
-            total += 1
-            if healthy:
-                healthy_count += 1
-
-        if total == 0:
-            color_key = "TEXT_MUTED"
-        elif healthy_count == total:
-            color_key = "SUCCESS"
-        elif healthy_count == 0:
-            color_key = "DANGER"
-        else:
-            color_key = "WARNING"
-        self._set_count_badge(self.hpa_count_lbl, f"{total} autoscaler{'s' if total != 1 else ''} · {healthy_count} healthy", color_key)
-        self._filter_hpas(self.hpa_filter.text())
-
-    def _filter_hpas(self, text: str):
-        q = text.lower()
-        for i in range(self.hpa_list.count()):
-            item = self.hpa_list.item(i)
-            meta = item.data(Qt.UserRole) or {}
-            searchable = f"{meta.get('name', '')} {meta.get('reference', '')}".lower()
-            item.setHidden(q not in searchable)
-
-    def _on_hpa_selection_changed(self, current, previous):
-        if previous is not None:
-            w = self.hpa_list.itemWidget(previous)
-            if w:
-                w.set_selected(False)
-        if current is not None:
-            w = self.hpa_list.itemWidget(current)
-            if w:
-                w.set_selected(True)
-
-    def _on_hpa_double_click(self, item):
-        meta = item.data(Qt.UserRole) or {}
-        self._describe("hpa", meta.get("name"), meta.get("namespace") or "default")
-
-    def _selected_hpa(self) -> tuple:  # (Optional[str], str)
-        item = self.hpa_list.currentItem()
-        if not item:
-            QMessageBox.warning(self, "No selection", "Select an autoscaler first.")
-            return None, ""
-        meta = item.data(Qt.UserRole) or {}
-        return meta.get("name"), meta.get("namespace") or "default"
-
-    def _hpa_describe(self):
-        name, ns = self._selected_hpa()
         if name:
-            self._describe("hpa", name, ns)
+          parts.append(
+            f"Selected deployment: {name}"
+          )
 
-    def _hpa_delete(self):
-        name, ns = self._selected_hpa()
-        if not name:
-            return
-        if QMessageBox.question(self, "Delete HPA",
-                                f'Delete autoscaler "{name}"?\nThe target workload keeps running at its '
-                                f'current replica count, but nothing will scale it automatically anymore.',
-                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            self._run_cmd(f"kubectl delete hpa {name} -n {ns} 2>&1",
-                          lambda o: (self._log(o), self._load_hpas()))
+        if namespace:
+          parts.append(
+            f"Selected deployment namespace: {namespace}"
+          )
+    except Exception:
+      pass
 
-    def _hpa_ctx_menu(self, pos):
-        item = self.hpa_list.itemAt(pos)
-        if not item:
-            return
-        self.hpa_list.setCurrentItem(item)
+    # Selected pod, if any.
+    try:
+      item = self.pod_list.currentItem()
+
+      if item is not None:
         meta = item.data(Qt.UserRole) or {}
+
         name = meta.get("name")
-        ns   = meta.get("namespace") or "default"
-        menu = QMenu(self)
-        menu.addAction("📄  Describe", lambda: self._describe("hpa", name, ns))
-        menu.addSeparator()
-        menu.addAction("🗑  Delete", self._hpa_delete)
-        menu.exec_(self.hpa_list.viewport().mapToGlobal(pos))
+        namespace = meta.get("namespace")
 
-    # ── Services ──────────────────────────────────────────────
-    def _load_services(self):
-        self._run_cmd(f"kubectl get services {self._ns_flag()} 2>&1", self._populate_services)
+        if name:
+          parts.append(
+            f"Selected pod: {name}"
+          )
 
-    def _populate_services(self, out: str):
-        self.svc_list.clear()
-        all_ns = (self._current_ns == "(all namespaces)")
-        total = 0
-        for line in out.strip().splitlines()[1:]:
-            parts = line.split()
-            # `kubectl get services --all-namespaces` prepends NAMESPACE —
-            # same shifted-columns reasoning as _populate_pods/_populate_deployments.
-            if all_ns:
-                if len(parts) < 7:
-                    continue
-                ns, name, stype, cluster, ext, ports, age = parts[:7]
-            else:
-                if len(parts) < 6:
-                    continue
-                ns = self._current_ns or "default"
-                name, stype, cluster, ext, ports, age = parts[:6]
-            meta = {
-                "namespace": ns, "name": name, "type": stype,
-                "cluster_ip": cluster, "external_ip": ext,
-                "ports": ports, "age": age,
-            }
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, meta)
-            item.setSizeHint(QSize(0, ServiceCardWidget.CARD_HEIGHT))
-            self.svc_list.addItem(item)
-            self.svc_list.setItemWidget(item, ServiceCardWidget(meta, all_ns))
-            total += 1
-        color_key = "TEXT_MUTED" if total == 0 else "INFO"
-        self._set_count_badge(self.svc_count_lbl,
-                               f"{total} service{'s' if total != 1 else ''}", color_key)
-        # Same reasoning as _populate_pods: rebuild wipes the visual filter
-        # state even though the filter box still has text — reapply it.
-        self._filter_services(self.svc_filter.text())
+        if namespace:
+          parts.append(
+            f"Selected pod namespace: {namespace}"
+          )
+    except Exception:
+      pass
 
-    def _filter_services(self, text: str):
-        q = text.lower()
-        for i in range(self.svc_list.count()):
-            item = self.svc_list.item(i)
-            meta = item.data(Qt.UserRole) or {}
-            item.setHidden(q not in meta.get("name", "").lower())
+    return "\n".join(parts)
 
-    def _selected_svc(self) -> tuple:  # (Optional[str], str)
-        item = self.svc_list.currentItem()
-        if not item:
-            QMessageBox.warning(self, "No selection", "Select a service first.")
-            return None, ""
-        meta = item.data(Qt.UserRole) or {}
-        return meta.get("name"), meta.get("namespace") or "default"
+  def _on_ai_ops_operation_finished(self):
+    """Refresh the visible Kubernetes resource list after an AI operation."""
 
-    def _on_svc_double_click(self, item):
-        meta = item.data(Qt.UserRole) or {}
-        self._describe("service", meta.get("name"), meta.get("namespace") or "default")
+    try:
+      self._refresh_current_tab()
+    except Exception:
+      pass
 
-    def _on_svc_selection_changed(self, current, previous):
-        """Same reasoning as _on_pod_selection_changed above."""
-        if previous is not None:
-            w = self.svc_list.itemWidget(previous)
-            if w:
-                w.set_selected(False)
-        if current is not None:
-            w = self.svc_list.itemWidget(current)
-            if w:
-                w.set_selected(True)
+  # ── Jobs & CronJobs ───────────────────────────────────────
+  def _build_jobs_tab(self):
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
 
-    def _svc_describe(self):
-        svc, ns = self._selected_svc()
-        if svc:
-            self._describe("service", svc, ns)
+    splitter = QSplitter(Qt.Horizontal)
+    splitter.setHandleWidth(1)
 
-    def _svc_delete(self):
-        svc, ns = self._selected_svc()
-        if not svc:
-            return
-        if QMessageBox.question(self, "Delete Service", f'Delete service "{svc}"?',
-                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            self._run_cmd(f"kubectl delete service -n {ns} {svc} 2>&1",
-                          lambda o: (self._log(o), self._load_services()))
+    left = QWidget()
+    ll = QVBoxLayout(left)
+    ll.setContentsMargins(0, 0, 0, 0)
+    ll.setSpacing(0)
 
-    def _svc_ctx_menu(self, pos):
-        item = self.svc_list.itemAt(pos)
-        if not item:
-            return
-        self.svc_list.setCurrentItem(item)
-        meta = item.data(Qt.UserRole) or {}
-        svc  = meta.get("name")
-        ns   = meta.get("namespace") or "default"
-        menu = QMenu(self)
-        menu.addAction("📄  Describe", lambda: self._describe("service", svc, ns))
-        menu.addSeparator()
-        menu.addAction("🗑  Delete", self._svc_delete)
-        menu.exec_(self.svc_list.viewport().mapToGlobal(pos))
+    self.wl_type_bar = QWidget()
+    self.wl_type_bar.setFixedHeight(58)
+    self.wl_type_bar.setStyleSheet(
+      f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
+    )
+    tb_lay = QHBoxLayout(self.wl_type_bar)
+    tb_lay.setContentsMargins(12, 10, 12, 10)
+    tb_lay.setSpacing(10)
 
-    # ── Ingress ───────────────────────────────────────────────
-    def _load_ingress(self):
-        self._run_cmd(f"kubectl get ingress {self._ns_flag()} 2>&1", self._populate_ingress)
+    self.wl_type_toggle = QWidget()
+    self.wl_type_toggle.setObjectName("wl_type_toggle")
+    self.wl_type_toggle.setFixedHeight(36)
+    toggle_lay = QHBoxLayout(self.wl_type_toggle)
+    toggle_lay.setContentsMargins(3, 3, 3, 3)
+    toggle_lay.setSpacing(2)
+    self.wl_type_jobs_btn = icon_button(" Jobs")
+    self.wl_type_cron_btn = QPushButton("⏰ CronJobs")
+    for btn in (self.wl_type_jobs_btn, self.wl_type_cron_btn):
+      btn.setCheckable(True)
+      btn.setCursor(Qt.PointingHandCursor)
+      btn.setFixedHeight(30)
+      toggle_lay.addWidget(btn)
+    self.wl_type_jobs_btn.setChecked(True)
+    self.wl_type_jobs_btn.clicked.connect(lambda: self._set_workload_type("Jobs"))
+    self.wl_type_cron_btn.clicked.connect(lambda: self._set_workload_type("CronJobs"))
+    self._workload_type = "Jobs"
+    self._style_toggle(self.wl_type_toggle, (self.wl_type_jobs_btn, self.wl_type_cron_btn))
+    tb_lay.addWidget(self.wl_type_toggle)
 
-    def _populate_ingress(self, out: str):
-        self.ing_list.clear()
-        all_ns = (self._current_ns == "(all namespaces)")
-        total = 0
-        for line in out.strip().splitlines()[1:]:
-            parts = line.split()
-            if not parts:
-                continue
-            if all_ns:
-                if len(parts) < 2:
-                    continue
-                ns, name = parts[0], parts[1]
-                rest = parts[2:]
-            else:
-                ns = self._current_ns or "default"
-                name = parts[0]
-                rest = parts[1:]
-            cls     = rest[0] if len(rest) > 0 else "-"
-            hosts   = rest[1] if len(rest) > 1 else "-"
-            address = rest[2] if len(rest) > 2 else "-"
-            ports   = rest[3] if len(rest) > 3 else "-"
-            age     = rest[4] if len(rest) > 4 else "-"
-            meta = {
-                "namespace": ns, "name": name, "class": cls, "hosts": hosts,
-                "address": address, "ports": ports, "age": age,
-            }
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, meta)
-            item.setSizeHint(QSize(0, IngressCardWidget.CARD_HEIGHT))
-            self.ing_list.addItem(item)
-            self.ing_list.setItemWidget(item, IngressCardWidget(meta, all_ns))
-            total += 1
-        color_key = "TEXT_MUTED" if total == 0 else "INFO"
-        self._set_count_badge(self.ing_count_lbl,
-                               f"{total} rule{'s' if total != 1 else ''}", color_key)
-        self._filter_ingress(self.ing_filter.text())
+    self.wl_filter = QLineEdit()
+    self.wl_filter.setPlaceholderText(" Filter…")
+    self.wl_filter.textChanged.connect(self._filter_workloads)
+    tb_lay.addWidget(self.wl_filter, 1)
 
-    def _filter_ingress(self, text: str):
-        q = text.lower()
-        for i in range(self.ing_list.count()):
-            item = self.ing_list.item(i)
-            meta = item.data(Qt.UserRole) or {}
-            item.setHidden(q not in meta.get("name", "").lower())
+    self.wl_count_lbl = QLabel("")
+    tb_lay.addWidget(self.wl_count_lbl)
+    ll.addWidget(self.wl_type_bar)
 
-    def _selected_ing(self) -> tuple:  # (Optional[str], str)
-        item = self.ing_list.currentItem()
-        if not item:
-            QMessageBox.warning(self, "No selection", "Select an ingress first.")
-            return None, ""
-        meta = item.data(Qt.UserRole) or {}
-        return meta.get("name"), meta.get("namespace") or "default"
+    wl_actions = QHBoxLayout()
+    wl_actions.setContentsMargins(10, 6, 10, 6)
+    wl_actions.setSpacing(8)
 
-    def _on_ing_double_click(self, item):
-        meta = item.data(Qt.UserRole) or {}
-        self._describe("ingress", meta.get("name"), meta.get("namespace") or "default")
+    self.wl_trigger_btn = self._toolbar_btn("▶ Trigger Now", object_name="primary",
+                         tooltip="Manually run this CronJob now")
+    self.wl_trigger_btn.clicked.connect(self._workload_trigger_now)
+    wl_actions.addWidget(self.wl_trigger_btn)
 
-    def _on_ing_selection_changed(self, current, previous):
-        """Same reasoning as _on_pod_selection_changed above."""
-        if previous is not None:
-            w = self.ing_list.itemWidget(previous)
-            if w:
-                w.set_selected(False)
-        if current is not None:
-            w = self.ing_list.itemWidget(current)
-            if w:
-                w.set_selected(True)
+    self.wl_suspend_btn = self._toolbar_btn("⏸ Suspend",
+                         tooltip="Toggle Suspend/Resume for this CronJob")
+    self.wl_suspend_btn.clicked.connect(self._workload_toggle_suspend)
+    wl_actions.addWidget(self.wl_suspend_btn)
 
-    def _ing_describe(self):
-        ing, ns = self._selected_ing()
-        if ing:
-            self._describe("ingress", ing, ns)
+    wl_actions.addStretch()
 
-    def _ing_delete(self):
-        ing, ns = self._selected_ing()
-        if not ing:
-            return
-        if QMessageBox.question(self, "Delete Ingress", f'Delete ingress "{ing}"?',
-                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            self._run_cmd(f"kubectl delete ingress -n {ns} {ing} 2>&1",
-                          lambda o: (self._log(o), self._load_ingress()))
+    self.wl_desc_btn = self._toolbar_btn(" Describe")
+    self.wl_desc_btn.clicked.connect(self._workload_describe)
+    wl_actions.addWidget(self.wl_desc_btn)
 
-    def _ing_ctx_menu(self, pos):
-        item = self.ing_list.itemAt(pos)
-        if not item:
-            return
-        self.ing_list.setCurrentItem(item)
-        meta = item.data(Qt.UserRole) or {}
-        ing  = meta.get("name")
-        ns   = meta.get("namespace") or "default"
-        menu = QMenu(self)
-        menu.addAction("📄  Describe", lambda: self._describe("ingress", ing, ns))
-        menu.addSeparator()
-        menu.addAction("🗑  Delete", self._ing_delete)
-        menu.exec_(self.ing_list.viewport().mapToGlobal(pos))
+    self.wl_del_btn = self._toolbar_btn(" Delete", object_name="danger")
+    self.wl_del_btn.clicked.connect(self._workload_delete)
+    wl_actions.addWidget(self.wl_del_btn)
 
-    # ── Config & Secrets ──────────────────────────────────────
-    def _load_config_resources(self, _=None):
-        rtype = "configmaps" if self._cfg_type == "ConfigMaps" else "secrets"
-        cmd = (
-            f"kubectl get {rtype} {self._ns_flag()} "
-            f"-o jsonpath='{{range .items[*]}}{{.metadata.name}}\n{{end}}' 2>&1"
-        )
-        self._run_cmd(cmd, self._populate_cfg_list)
+    wl_actions_widget = QWidget()
+    wl_actions_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
+    wl_actions_widget.setLayout(wl_actions)
+    ll.addWidget(wl_actions_widget)
+    self.wl_toolbar = wl_actions_widget
 
-    def _populate_cfg_list(self, out: str):
-        self.cfg_list.clear()
-        self.cfg_detail.clear()
-        self.cfg_raw.clear()
-        card_type = "configmap" if self._cfg_type == "ConfigMaps" else "secret"
-        for name in out.strip().splitlines():
-            name = name.strip()
-            if not name:
-                continue
-            meta = {"name": name, "type": card_type}
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, meta)
-            item.setSizeHint(QSize(0, ConfigCardWidget.CARD_HEIGHT))
-            self.cfg_list.addItem(item)
-            self.cfg_list.setItemWidget(item, ConfigCardWidget(meta))
-        # Same reasoning as _populate_pods: reapply whatever's in the
-        # filter box, since the rebuild above doesn't know about it.
-        self._filter_configs(self.cfg_filter.text())
+    self.wl_list = QListWidget()
+    self.wl_list.setSpacing(6)
+    self.wl_list.setSelectionMode(QAbstractItemView.SingleSelection)
+    self.wl_list.setContextMenuPolicy(Qt.CustomContextMenu)
+    self.wl_list.customContextMenuRequested.connect(self._workload_ctx_menu)
+    self.wl_list.itemDoubleClicked.connect(self._on_workload_double_click)
+    self.wl_list.currentItemChanged.connect(self._on_workload_selection_changed)
+    self.wl_list.setStyleSheet(
+      "QListWidget { background: transparent; border: none; padding: 8px; }"
+      "QListWidget::item { border: none; padding: 0; margin: 0; }"
+    )
+    ll.addWidget(self.wl_list)
+    splitter.addWidget(left)
 
-    def _filter_configs(self, text: str):
-        q = text.lower()
-        for i in range(self.cfg_list.count()):
-            item = self.cfg_list.item(i)
-            meta = item.data(Qt.UserRole) or {}
-            item.setHidden(q not in meta.get("name", "").lower())
+    right = QWidget()
+    rl = QVBoxLayout(right)
+    rl.setContentsMargins(0, 0, 0, 0)
+    rl.setSpacing(0)
 
-    def _on_cfg_selection_changed(self, current, previous):
-        """Same card-selection forwarding as pods/deployments — the card
-        widget owns its own selected-state paint, so the list has to tell
-        it explicitly (see k8s_cards.py's _CardBase docstring)."""
-        if previous is not None:
-            w = self.cfg_list.itemWidget(previous)
-            if w:
-                w.set_selected(False)
-        if current is None:
-            return
-        w = self.cfg_list.itemWidget(current)
-        if w:
-            w.set_selected(True)
-        meta  = current.data(Qt.UserRole) or {}
-        name  = meta.get("name", "")
-        rtype = meta.get("type", "configmap")
-        ns    = self._current_ns if self._current_ns != "(all namespaces)" else "default"
-        self._run_cmd(f"kubectl get {rtype} {name} -n {ns} -o json 2>&1",
-                      lambda o: self._show_cfg_detail(o, rtype))
+    self.wl_history_hdr = QLabel(" Run History")
+    self.wl_history_hdr.setFixedHeight(34)
+    self.wl_history_hdr.setStyleSheet(
+      f"background: {T['BG_PANEL']}; color: {T['TEXT_DIM']}; font-size: 13px; "
+      f"font-weight: 700; border-bottom: 1px solid {T['BORDER']}; padding-left: 14px;"
+    )
+    rl.addWidget(self.wl_history_hdr)
 
-    def _pretty_cfg_value(self, val) -> str:
-        """Re-indent a ConfigMap/Secret value for display.
+    self.wl_history_hint = QLabel(" Select a CronJob to see its recent Job runs.")
+    self.wl_history_hint.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px; padding: 12px;")
+    self.wl_history_hint.setWordWrap(True)
+    rl.addWidget(self.wl_history_hint)
 
-        Values are often themselves a JSON document embedded as a string
-        (e.g. a 'config.json' key). kubectl's default '-o yaml' renders any
-        string containing real newlines as a double-quoted flow scalar —
-        literal '\\n' escapes, long lines wrapped with a trailing
-        backslash — which is unreadable for exactly this case. We already
-        have the value un-escaped (real newlines) from '-o json', so if it
-        parses as JSON we re-emit it with consistent 2-space indentation;
-        otherwise it's shown as-is with its real line breaks intact.
-        """
-        text = str(val)
-        stripped = text.strip()
-        if stripped[:1] in "{[":
-            try:
-                parsed = json.loads(stripped)
-                return json.dumps(parsed, indent=2)
-            except Exception:
-                pass
-        return text
+    self.wl_history_list = QListWidget()
+    self.wl_history_list.setSpacing(6)
+    self.wl_history_list.setSelectionMode(QAbstractItemView.SingleSelection)
+    self.wl_history_list.itemDoubleClicked.connect(self._on_wl_history_double_click)
+    self.wl_history_list.setStyleSheet(
+      "QListWidget { background: transparent; border: none; padding: 8px; }"
+      "QListWidget::item { border: none; padding: 0; margin: 0; }"
+    )
+    rl.addWidget(self.wl_history_list)
 
-    def _show_cfg_detail(self, out: str, rtype: str):
-        self.cfg_detail.clear()
-        self.cfg_raw.clear()
+    splitter.addWidget(right)
+    splitter.setSizes([440, 480])
+    lay.addWidget(splitter)
+    add_icon_tab(self.sub_tabs, w, "️ Jobs & CronJobs")
+    self._update_workload_action_visibility()
+
+  def _style_toggle(self, widget, buttons):
+    """Generic segmented-toggle styling shared by every ConfigMaps/
+    Secrets-style two-way switch on this tab (Config's own toggle
+    keeps its dedicated _style_cfg_toggle since it existed first —
+    this is for the newer Storage/Jobs toggles so their CSS doesn't
+    have to be copy-pasted per tab). Re-called from apply_theme()."""
+    widget.setStyleSheet(
+      f"QWidget#{widget.objectName()} {{ background: {T['BG_ITEM']}; "
+      f"border: 1px solid {T['BORDER']}; border-radius: 18px; }}"
+    )
+    btn_css = f"""
+      QPushButton {{
+        background: transparent; color: {T['TEXT_DIM']};
+        border: none; border-radius: 15px; padding: 0 16px;
+        font-size: 12px; font-weight: 700;
+      }}
+      QPushButton:hover:!checked {{ background: {T['BG_HOVER']}; color: {T['TEXT_PRIMARY']}; }}
+      QPushButton:checked {{ background: {T['ACCENT']}; color: white; }}
+    """
+    for b in buttons:
+      b.setStyleSheet(btn_css)
+
+  def _update_workload_action_visibility(self):
+    """Trigger Now / Suspend only make sense for CronJobs — Jobs are
+    one-shot and have no schedule to suspend."""
+    is_cron = (self._workload_type == "CronJobs")
+    self.wl_trigger_btn.setVisible(is_cron)
+    self.wl_suspend_btn.setVisible(is_cron)
+    self.wl_history_hdr.setVisible(is_cron)
+    self.wl_history_hint.setVisible(is_cron)
+    self.wl_history_list.setVisible(is_cron)
+    if not is_cron:
+      self.wl_history_list.clear()
+
+  def _set_workload_type(self, name: str):
+    self._workload_type = name
+    self.wl_type_jobs_btn.setChecked(name == "Jobs")
+    self.wl_type_cron_btn.setChecked(name == "CronJobs")
+    self._update_workload_action_visibility()
+    self._load_workloads()
+
+  def _load_workloads(self, _=None):
+    if self._workload_type == "CronJobs":
+      self._load_cronjobs()
+    else:
+      self._load_jobs()
+
+  @staticmethod
+  def _job_status(status: dict, spec: dict) -> str:
+    conditions = status.get("conditions") or []
+    for c in conditions:
+      if c.get("type") == "Complete" and c.get("status") == "True":
+        return "Complete"
+      if c.get("type") == "Failed" and c.get("status") == "True":
+        return "Failed"
+    if status.get("active"):
+      return "Running"
+    if status.get("succeeded"):
+      return "Complete"
+    if status.get("failed"):
+      return "Failed"
+    return "Pending"
+
+  @staticmethod
+  def _job_duration(status: dict) -> str:
+    start = status.get("startTime")
+    end  = status.get("completionTime")
+    if not start:
+      return "-"
+    try:
+      t0 = datetime.strptime(start, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+      return "-"
+    t1 = datetime.now(timezone.utc)
+    if end:
+      try:
+        t1 = datetime.strptime(end, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+      except Exception:
+        pass
+    secs = max(0, int((t1 - t0).total_seconds()))
+    if secs < 60:
+      return f"{secs}s"
+    mins = secs // 60
+    if mins < 60:
+      return f"{mins}m{secs % 60}s"
+    hours = mins // 60
+    return f"{hours}h{mins % 60}m"
+
+  def _load_jobs(self):
+    self._run_cmd(f"kubectl get jobs {self._ns_flag()} -o json 2>&1", self._populate_jobs)
+
+  def _job_meta_from_item(self, it: dict) -> dict:
+    meta_o = it.get("metadata") or {}
+    spec  = it.get("spec") or {}
+    status = it.get("status") or {}
+    completions = spec.get("completions", 1)
+    succeeded  = status.get("succeeded", 0)
+    owner = ""
+    for ref in meta_o.get("ownerReferences") or []:
+      if ref.get("kind") == "CronJob":
+        owner = ref.get("name", "")
+        break
+    return {
+      "namespace":  meta_o.get("namespace", ""),
+      "name":    meta_o.get("name", ""),
+      "status":   self._job_status(status, spec),
+      "completions": f"{succeeded}/{completions}",
+      "duration":  self._job_duration(status),
+      "owner":    owner,
+      "age":     self._humanize_age(meta_o.get("creationTimestamp", "")),
+    }
+
+  def _populate_jobs(self, out: str):
+    self.wl_list.clear()
+    all_ns = (self._current_ns == "(all namespaces)")
+    try:
+      items = json.loads(out).get("items", [])
+    except Exception:
+      items = []
+    for it in items:
+      meta = self._job_meta_from_item(it)
+      item = QListWidgetItem()
+      item.setData(Qt.UserRole, {**meta, "kind": "job"})
+      item.setSizeHint(QSize(0, JobCardWidget.CARD_HEIGHT))
+      self.wl_list.addItem(item)
+      self.wl_list.setItemWidget(item, JobCardWidget(meta, all_ns))
+    total = len(items)
+    color_key = "TEXT_MUTED" if total == 0 else "INFO"
+    self._set_count_badge(self.wl_count_lbl, f"{total} job{'s' if total != 1 else ''}", color_key)
+    self._filter_workloads(self.wl_filter.text())
+
+  def _load_cronjobs(self):
+    self._run_cmd(f"kubectl get cronjobs {self._ns_flag()} -o json 2>&1", self._populate_cronjobs)
+
+  def _populate_cronjobs(self, out: str):
+    self.wl_list.clear()
+    all_ns = (self._current_ns == "(all namespaces)")
+    try:
+      items = json.loads(out).get("items", [])
+    except Exception:
+      items = []
+    for it in items:
+      meta_o = it.get("metadata") or {}
+      spec  = it.get("spec") or {}
+      status = it.get("status") or {}
+      meta = {
+        "namespace":   meta_o.get("namespace", ""),
+        "name":     meta_o.get("name", ""),
+        "schedule":   spec.get("schedule", "-"),
+        "suspend":    bool(spec.get("suspend", False)),
+        "active":    len(status.get("active") or []),
+        "last_schedule": self._humanize_age(status.get("lastScheduleTime", "")) if status.get("lastScheduleTime") else "never",
+        "age":      self._humanize_age(meta_o.get("creationTimestamp", "")),
+      }
+      item = QListWidgetItem()
+      item.setData(Qt.UserRole, {**meta, "kind": "cronjob"})
+      item.setSizeHint(QSize(0, CronJobCardWidget.CARD_HEIGHT))
+      self.wl_list.addItem(item)
+      self.wl_list.setItemWidget(item, CronJobCardWidget(meta, all_ns))
+    total = len(items)
+    color_key = "TEXT_MUTED" if total == 0 else "INFO"
+    self._set_count_badge(self.wl_count_lbl, f"{total} cronjob{'s' if total != 1 else ''}", color_key)
+    self._filter_workloads(self.wl_filter.text())
+
+  def _filter_workloads(self, text: str):
+    q = text.lower()
+    for i in range(self.wl_list.count()):
+      item = self.wl_list.item(i)
+      meta = item.data(Qt.UserRole) or {}
+      item.setHidden(q not in meta.get("name", "").lower())
+
+  def _selected_workload(self) -> tuple: # (Optional[dict])
+    item = self.wl_list.currentItem()
+    if not item:
+      QMessageBox.warning(self, "No selection", "Select a job or cronjob first.")
+      return None
+    return item.data(Qt.UserRole) or {}
+
+  def _on_workload_double_click(self, item):
+    meta = item.data(Qt.UserRole) or {}
+    self._describe(meta.get("kind", "job"), meta.get("name"), meta.get("namespace") or "default")
+
+  def _on_workload_selection_changed(self, current, previous):
+    if previous is not None:
+      w = self.wl_list.itemWidget(previous)
+      if w:
+        w.set_selected(False)
+    if current is None:
+      self.wl_history_list.clear()
+      return
+    w = self.wl_list.itemWidget(current)
+    if w:
+      w.set_selected(True)
+    meta = current.data(Qt.UserRole) or {}
+    if meta.get("kind") == "cronjob":
+      self._load_job_history(meta.get("namespace") or "default", meta.get("name"))
+    else:
+      self.wl_history_list.clear()
+
+  def _load_job_history(self, ns: str, cronjob_name: str):
+    self._history_cronjob = cronjob_name
+    self._run_cmd(f"kubectl get jobs -n {ns} -o json 2>&1",
+           lambda o: self._populate_job_history(o, cronjob_name))
+
+  def _populate_job_history(self, out: str, cronjob_name: str):
+    # The selection may have moved on to a different CronJob (or off
+    # CronJobs entirely) while this command was in flight — drop a
+    # stale result rather than showing the wrong run history.
+    if getattr(self, "_history_cronjob", None) != cronjob_name:
+      return
+    self.wl_history_list.clear()
+    try:
+      items = json.loads(out).get("items", [])
+    except Exception:
+      items = []
+    runs = []
+    for it in items:
+      owners = (it.get("metadata") or {}).get("ownerReferences") or []
+      if any(r.get("kind") == "CronJob" and r.get("name") == cronjob_name for r in owners):
+        runs.append(it)
+    # Most recent run first.
+    runs.sort(key=lambda it: (it.get("metadata") or {}).get("creationTimestamp", ""), reverse=True)
+    for it in runs:
+      meta = self._job_meta_from_item(it)
+      item = QListWidgetItem()
+      item.setData(Qt.UserRole, {**meta, "kind": "job"})
+      item.setSizeHint(QSize(0, JobCardWidget.CARD_HEIGHT))
+      self.wl_history_list.addItem(item)
+      self.wl_history_list.setItemWidget(item, JobCardWidget(meta, False))
+    if not runs:
+      self.wl_history_list.addItem(QListWidgetItem(" No runs yet."))
+
+  def _on_wl_history_double_click(self, item):
+    meta = item.data(Qt.UserRole)
+    if not meta:
+      return
+    self._describe("job", meta.get("name"), meta.get("namespace") or "default")
+
+  def _workload_describe(self):
+    meta = self._selected_workload()
+    if meta:
+      self._describe(meta.get("kind", "job"), meta.get("name"), meta.get("namespace") or "default")
+
+  def _workload_delete(self):
+    meta = self._selected_workload()
+    if not meta:
+      return
+    kind = meta.get("kind", "job")
+    name = meta.get("name")
+    ns  = meta.get("namespace") or "default"
+    label = "CronJob" if kind == "cronjob" else "Job"
+    if QMessageBox.question(self, f"Delete {label}", f'Delete {label.lower()} "{name}"?',
+                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+      self._run_cmd(f"kubectl delete {kind} {name} -n {ns} 2>&1",
+             lambda o: (self._log(o), self._load_workloads()))
+
+  def _workload_trigger_now(self):
+    meta = self._selected_workload()
+    if not meta:
+      return
+    if meta.get("kind") != "cronjob":
+      QMessageBox.information(self, "Trigger Now", "Select a CronJob to trigger.")
+      return
+    name = meta.get("name")
+    ns  = meta.get("namespace") or "default"
+    job_name = f"{name}-manual-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+    def on_done(out):
+      self._log(out)
+      self._load_job_history(ns, name)
+      self._load_cronjobs()
+
+    self._run_cmd(
+      f"kubectl create job {job_name} --from=cronjob/{name} -n {ns} 2>&1", on_done)
+
+  def _workload_toggle_suspend(self):
+    meta = self._selected_workload()
+    if not meta:
+      return
+    if meta.get("kind") != "cronjob":
+      QMessageBox.information(self, "Suspend / Resume", "Select a CronJob first.")
+      return
+    name = meta.get("name")
+    ns  = meta.get("namespace") or "default"
+    new_suspend = not meta.get("suspend")
+    patch = '{"spec":{"suspend":%s}}' % ("true" if new_suspend else "false")
+    self._run_cmd(
+      f"kubectl patch cronjob {name} -n {ns} -p '{patch}' --type=merge 2>&1",
+      lambda o: (self._log(o), self._load_cronjobs()))
+
+  def _workload_ctx_menu(self, pos):
+    item = self.wl_list.itemAt(pos)
+    if not item:
+      return
+    self.wl_list.setCurrentItem(item)
+    meta = item.data(Qt.UserRole) or {}
+    kind = meta.get("kind", "job")
+    menu = QMenu(self)
+    menu.addAction(" Describe", self._workload_describe)
+    if kind == "cronjob":
+      menu.addAction("▶ Trigger Now", self._workload_trigger_now)
+      suspend_label = "▶ Resume" if meta.get("suspend") else "⏸ Suspend"
+      menu.addAction(suspend_label, self._workload_toggle_suspend)
+    menu.addSeparator()
+    menu.addAction(" Delete", self._workload_delete)
+    menu.exec_(self.wl_list.viewport().mapToGlobal(pos))
+
+  # ── Storage: PersistentVolumeClaims / PersistentVolumes ────
+  def _build_storage_tab(self):
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+
+    self.pvx_type_bar = QWidget()
+    self.pvx_type_bar.setFixedHeight(58)
+    self.pvx_type_bar.setStyleSheet(
+      f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
+    )
+    tb_lay = QHBoxLayout(self.pvx_type_bar)
+    tb_lay.setContentsMargins(12, 10, 12, 10)
+    tb_lay.setSpacing(10)
+
+    self.pvx_type_toggle = QWidget()
+    self.pvx_type_toggle.setObjectName("pvx_type_toggle")
+    self.pvx_type_toggle.setFixedHeight(36)
+    toggle_lay = QHBoxLayout(self.pvx_type_toggle)
+    toggle_lay.setContentsMargins(3, 3, 3, 3)
+    toggle_lay.setSpacing(2)
+    self.pvx_type_pvc_btn = icon_button(" Claims (PVC)")
+    self.pvx_type_pv_btn = icon_button(" Volumes (PV)")
+    for btn in (self.pvx_type_pvc_btn, self.pvx_type_pv_btn):
+      btn.setCheckable(True)
+      btn.setCursor(Qt.PointingHandCursor)
+      btn.setFixedHeight(30)
+      toggle_lay.addWidget(btn)
+    self.pvx_type_pvc_btn.setChecked(True)
+    self.pvx_type_pvc_btn.clicked.connect(lambda: self._set_storage_type("PVC"))
+    self.pvx_type_pv_btn.clicked.connect(lambda: self._set_storage_type("PV"))
+    self._storage_type = "PVC"
+    self._style_toggle(self.pvx_type_toggle, (self.pvx_type_pvc_btn, self.pvx_type_pv_btn))
+    tb_lay.addWidget(self.pvx_type_toggle)
+
+    self.pvx_filter = QLineEdit()
+    self.pvx_filter.setPlaceholderText(" Filter…")
+    self.pvx_filter.textChanged.connect(self._filter_storage)
+    tb_lay.addWidget(self.pvx_filter, 1)
+
+    self.pvx_count_lbl = QLabel("")
+    tb_lay.addWidget(self.pvx_count_lbl)
+    lay.addWidget(self.pvx_type_bar)
+
+    pvx_actions = QHBoxLayout()
+    pvx_actions.setContentsMargins(10, 6, 10, 6)
+    pvx_actions.setSpacing(8)
+    pvx_actions.addStretch()
+
+    self.pvx_desc_btn = self._toolbar_btn(" Describe")
+    self.pvx_desc_btn.clicked.connect(self._storage_describe)
+    pvx_actions.addWidget(self.pvx_desc_btn)
+
+    self.pvx_del_btn = self._toolbar_btn(" Delete", object_name="danger")
+    self.pvx_del_btn.clicked.connect(self._storage_delete)
+    pvx_actions.addWidget(self.pvx_del_btn)
+
+    pvx_actions_widget = QWidget()
+    pvx_actions_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
+    pvx_actions_widget.setLayout(pvx_actions)
+    lay.addWidget(pvx_actions_widget)
+    self.pvx_toolbar = pvx_actions_widget
+
+    self.pvx_list = QListWidget()
+    self.pvx_list.setSpacing(6)
+    self.pvx_list.setSelectionMode(QAbstractItemView.SingleSelection)
+    self.pvx_list.setContextMenuPolicy(Qt.CustomContextMenu)
+    self.pvx_list.customContextMenuRequested.connect(self._storage_ctx_menu)
+    self.pvx_list.itemDoubleClicked.connect(self._on_storage_double_click)
+    self.pvx_list.currentItemChanged.connect(self._on_storage_selection_changed)
+    self.pvx_list.setStyleSheet(
+      "QListWidget { background: transparent; border: none; padding: 8px; }"
+      "QListWidget::item { border: none; padding: 0; margin: 0; }"
+    )
+    lay.addWidget(self.pvx_list)
+    add_icon_tab(self.sub_tabs, w, " Storage")
+
+  def _set_storage_type(self, name: str):
+    self._storage_type = name
+    self.pvx_type_pvc_btn.setChecked(name == "PVC")
+    self.pvx_type_pv_btn.setChecked(name == "PV")
+    self._load_storage()
+
+  def _load_storage(self, _=None):
+    if self._storage_type == "PV":
+      self._load_pvs()
+    else:
+      self._load_pvcs()
+
+  def _load_pvcs(self):
+    self._run_cmd(f"kubectl get pvc {self._ns_flag()} -o json 2>&1", self._populate_pvcs)
+
+  def _populate_pvcs(self, out: str):
+    self.pvx_list.clear()
+    all_ns = (self._current_ns == "(all namespaces)")
+    try:
+      items = json.loads(out).get("items", [])
+    except Exception:
+      items = []
+    for it in items:
+      meta_o = it.get("metadata") or {}
+      spec  = it.get("spec") or {}
+      status = it.get("status") or {}
+      capacity = (status.get("capacity") or {}).get("storage", "-")
+      meta = {
+        "namespace":   meta_o.get("namespace", ""),
+        "name":     meta_o.get("name", ""),
+        "status":    status.get("phase", "Unknown"),
+        "volume":    spec.get("volumeName", "-") or "-",
+        "capacity":   capacity,
+        "access_modes": ", ".join(spec.get("accessModes") or []) or "-",
+        "storage_class": spec.get("storageClassName", "-") or "-",
+        "age":      self._humanize_age(meta_o.get("creationTimestamp", "")),
+      }
+      item = QListWidgetItem()
+      item.setData(Qt.UserRole, {**meta, "kind": "pvc"})
+      item.setSizeHint(QSize(0, PVCCardWidget.CARD_HEIGHT))
+      self.pvx_list.addItem(item)
+      self.pvx_list.setItemWidget(item, PVCCardWidget(meta, all_ns))
+    total = len(items)
+    color_key = "TEXT_MUTED" if total == 0 else "INFO"
+    self._set_count_badge(self.pvx_count_lbl, f"{total} claim{'s' if total != 1 else ''}", color_key)
+    self._filter_storage(self.pvx_filter.text())
+
+  def _load_pvs(self):
+    # PersistentVolumes are cluster-scoped — no namespace flag applies.
+    self._run_cmd("kubectl get pv -o json 2>&1", self._populate_pvs)
+
+  def _populate_pvs(self, out: str):
+    self.pvx_list.clear()
+    try:
+      items = json.loads(out).get("items", [])
+    except Exception:
+      items = []
+    for it in items:
+      meta_o = it.get("metadata") or {}
+      spec  = it.get("spec") or {}
+      status = it.get("status") or {}
+      claim_ref = spec.get("claimRef") or {}
+      claim = (f"{claim_ref.get('namespace', '')}/{claim_ref.get('name', '')}"
+           if claim_ref.get("name") else "-")
+      meta = {
+        "name":      meta_o.get("name", ""),
+        "capacity":    (spec.get("capacity") or {}).get("storage", "-"),
+        "access_modes":  ", ".join(spec.get("accessModes") or []) or "-",
+        "reclaim_policy": spec.get("persistentVolumeReclaimPolicy", "-") or "-",
+        "status":     status.get("phase", "Unknown"),
+        "claim":     claim,
+        "storage_class": spec.get("storageClassName", "-") or "-",
+        "age":      self._humanize_age(meta_o.get("creationTimestamp", "")),
+      }
+      item = QListWidgetItem()
+      item.setData(Qt.UserRole, {**meta, "kind": "pv"})
+      item.setSizeHint(QSize(0, PVCardWidget.CARD_HEIGHT))
+      self.pvx_list.addItem(item)
+      self.pvx_list.setItemWidget(item, PVCardWidget(meta))
+    total = len(items)
+    color_key = "TEXT_MUTED" if total == 0 else "INFO"
+    self._set_count_badge(self.pvx_count_lbl, f"{total} volume{'s' if total != 1 else ''}", color_key)
+    self._filter_storage(self.pvx_filter.text())
+
+  def _filter_storage(self, text: str):
+    q = text.lower()
+    for i in range(self.pvx_list.count()):
+      item = self.pvx_list.item(i)
+      meta = item.data(Qt.UserRole) or {}
+      item.setHidden(q not in meta.get("name", "").lower())
+
+  def _selected_storage(self):
+    item = self.pvx_list.currentItem()
+    if not item:
+      QMessageBox.warning(self, "No selection", "Select a claim or volume first.")
+      return None
+    return item.data(Qt.UserRole) or {}
+
+  def _on_storage_double_click(self, item):
+    meta = item.data(Qt.UserRole) or {}
+    kind = "pvc" if meta.get("kind") == "pvc" else "pv"
+    self._describe(kind, meta.get("name"), meta.get("namespace") or "default")
+
+  def _on_storage_selection_changed(self, current, previous):
+    if previous is not None:
+      w = self.pvx_list.itemWidget(previous)
+      if w:
+        w.set_selected(False)
+    if current is not None:
+      w = self.pvx_list.itemWidget(current)
+      if w:
+        w.set_selected(True)
+
+  def _storage_describe(self):
+    meta = self._selected_storage()
+    if meta:
+      kind = "pvc" if meta.get("kind") == "pvc" else "pv"
+      self._describe(kind, meta.get("name"), meta.get("namespace") or "default")
+
+  def _storage_delete(self):
+    meta = self._selected_storage()
+    if not meta:
+      return
+    is_pvc = meta.get("kind") == "pvc"
+    name = meta.get("name")
+    ns  = meta.get("namespace") or "default"
+    label = "PersistentVolumeClaim" if is_pvc else "PersistentVolume"
+    if QMessageBox.question(self, f"Delete {label}", f'Delete {label} "{name}"?',
+                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+      if is_pvc:
+        cmd = f"kubectl delete pvc {name} -n {ns} 2>&1"
+      else:
+        cmd = f"kubectl delete pv {name} 2>&1"
+      self._run_cmd(cmd, lambda o: (self._log(o), self._load_storage()))
+
+  def _storage_ctx_menu(self, pos):
+    item = self.pvx_list.itemAt(pos)
+    if not item:
+      return
+    self.pvx_list.setCurrentItem(item)
+    meta = item.data(Qt.UserRole) or {}
+    kind = "pvc" if meta.get("kind") == "pvc" else "pv"
+    name = meta.get("name")
+    ns  = meta.get("namespace") or "default"
+    menu = QMenu(self)
+    menu.addAction(" Describe", lambda: self._describe(kind, name, ns))
+    menu.addSeparator()
+    menu.addAction(" Delete", self._storage_delete)
+    menu.exec_(self.pvx_list.viewport().mapToGlobal(pos))
+
+  def _build_config_tab(self):
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+
+    splitter = QSplitter(Qt.Horizontal)
+    splitter.setHandleWidth(1)
+
+    # Left: type toggle + list
+    left = QWidget()
+    ll = QVBoxLayout(left)
+    ll.setContentsMargins(0, 0, 0, 0)
+    ll.setSpacing(0)
+
+    # Taller toolbar with real breathing room — the old 42px bar packed
+    # a combo box and filter field edge-to-edge with almost no margin,
+    # which is most of what read as "congested".
+    self.cfg_type_bar = QWidget()
+    self.cfg_type_bar.setFixedHeight(58)
+    self.cfg_type_bar.setStyleSheet(
+      f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
+    )
+    tb_lay = QHBoxLayout(self.cfg_type_bar)
+    tb_lay.setContentsMargins(12, 10, 12, 10)
+    tb_lay.setSpacing(10)
+
+    # ConfigMaps/Secrets is a binary choice, not a long list — a
+    # segmented two-button toggle reads faster than opening a dropdown
+    # for one of two options, and gives the "big, catchy" control the
+    # namespace picker also got, instead of a thin QComboBox.
+    self.cfg_type_toggle = QWidget()
+    self.cfg_type_toggle.setObjectName("cfg_type_toggle")
+    self.cfg_type_toggle.setFixedHeight(36)
+    toggle_lay = QHBoxLayout(self.cfg_type_toggle)
+    toggle_lay.setContentsMargins(3, 3, 3, 3)
+    toggle_lay.setSpacing(2)
+    self.cfg_type_cm_btn = icon_button(" ConfigMaps")
+    self.cfg_type_secret_btn = icon_button(" Secrets")
+    for btn in (self.cfg_type_cm_btn, self.cfg_type_secret_btn):
+      btn.setCheckable(True)
+      btn.setCursor(Qt.PointingHandCursor)
+      btn.setFixedHeight(30)
+      toggle_lay.addWidget(btn)
+    self.cfg_type_cm_btn.setChecked(True)
+    self.cfg_type_cm_btn.clicked.connect(lambda: self._set_cfg_type("ConfigMaps"))
+    self.cfg_type_secret_btn.clicked.connect(lambda: self._set_cfg_type("Secrets"))
+    self._cfg_type = "ConfigMaps"
+    self._style_cfg_toggle()
+    tb_lay.addWidget(self.cfg_type_toggle)
+
+    self.cfg_filter = QLineEdit()
+    self.cfg_filter.setPlaceholderText(" Filter…")
+    self.cfg_filter.textChanged.connect(self._filter_configs)
+    tb_lay.addWidget(self.cfg_filter, 1)
+    ll.addWidget(self.cfg_type_bar)
+
+    # Cards instead of bare text rows — icon, name, and a ConfigMap/
+    # Secret pill per entry, spaced out like the Pods/Deployments
+    # lists (k8s_cards.py) instead of one dense column of names.
+    self.cfg_list = QListWidget()
+    self.cfg_list.setSpacing(6)
+    self.cfg_list.setSelectionMode(QAbstractItemView.SingleSelection)
+    self.cfg_list.currentItemChanged.connect(self._on_cfg_selection_changed)
+    self.cfg_list.setStyleSheet(
+      "QListWidget { background: transparent; border: none; padding: 10px; }"
+      "QListWidget::item { border: none; padding: 0; margin: 0; }"
+    )
+    ll.addWidget(self.cfg_list)
+    splitter.addWidget(left)
+
+    # Right: detail + raw yaml
+    right = QWidget()
+    rl = QVBoxLayout(right)
+    rl.setContentsMargins(0, 0, 0, 0)
+    rl.setSpacing(0)
+
+    self.cfg_detail_hdr = QLabel(" Data")
+    self.cfg_detail_hdr.setFixedHeight(34)
+    self.cfg_detail_hdr.setStyleSheet(
+      f"background: {T['BG_PANEL']}; color: {T['TEXT_DIM']}; font-size: 13px; "
+      f"font-weight: 700; border-bottom: 1px solid {T['BORDER']}; padding-left: 14px;"
+    )
+    rl.addWidget(self.cfg_detail_hdr)
+
+    self.cfg_detail = QTreeWidget()
+    self._style_tree(self.cfg_detail)
+    self.cfg_detail.setRootIsDecorated(False)
+    self.cfg_detail.setAlternatingRowColors(True)
+    self.cfg_detail.setColumnCount(2)
+    self.cfg_detail.setHeaderLabels(["Key", "Value"])
+    self.cfg_detail.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+    self.cfg_detail.header().setSectionResizeMode(1, QHeaderView.Stretch)
+    rl.addWidget(self.cfg_detail)
+
+    self.cfg_raw_lbl = QLabel(" Structured View")
+    self.cfg_raw_lbl.setFixedHeight(34)
+    self.cfg_raw_lbl.setStyleSheet(
+      f"background: {T['BG_PANEL']}; color: {T['TEXT_DIM']}; font-size: 13px; "
+      f"font-weight: 700; border-top: 1px solid {T['BORDER']}; "
+      f"border-bottom: 1px solid {T['BORDER']}; padding-left: 14px;"
+    )
+    rl.addWidget(self.cfg_raw_lbl)
+
+    self.cfg_raw = QTextEdit()
+    self.cfg_raw.setReadOnly(True)
+    self.cfg_raw.setFont(monospace_font(11))
+    self.cfg_raw.setMinimumHeight(220)
+    self.cfg_raw.setStyleSheet(f"padding: 10px; border: none; background: {T['BG_DARK']};")
+    rl.addWidget(self.cfg_raw)
+
+    splitter.addWidget(right)
+    splitter.setSizes([320, 620])
+    lay.addWidget(splitter)
+    add_icon_tab(self.sub_tabs, w, " Config & Secrets")
+
+  def _style_cfg_toggle(self):
+    """Pill-shaped container + two checkable buttons that look like one
+    segmented control (selected side lit with the accent colour).
+    Re-called from apply_theme() since colours are literal hex here."""
+    self.cfg_type_toggle.setStyleSheet(
+      f"QWidget#cfg_type_toggle {{ background: {T['BG_ITEM']}; "
+      f"border: 1px solid {T['BORDER']}; border-radius: 18px; }}"
+    )
+    btn_css = f"""
+      QPushButton {{
+        background: transparent; color: {T['TEXT_DIM']};
+        border: none; border-radius: 15px; padding: 0 16px;
+        font-size: 12px; font-weight: 700;
+      }}
+      QPushButton:hover:!checked {{ background: {T['BG_HOVER']}; color: {T['TEXT_PRIMARY']}; }}
+      QPushButton:checked {{ background: {T['ACCENT']}; color: white; }}
+    """
+    self.cfg_type_cm_btn.setStyleSheet(btn_css)
+    self.cfg_type_secret_btn.setStyleSheet(btn_css)
+
+  def _set_cfg_type(self, name: str):
+    """Click handler for the ConfigMaps/Secrets segmented toggle —
+    keeps the two buttons mutually exclusive (QPushButton's own
+    setCheckable doesn't do this on its own outside a QButtonGroup)
+    and reloads the list for the newly-selected type."""
+    self._cfg_type = name
+    self.cfg_type_cm_btn.setChecked(name == "ConfigMaps")
+    self.cfg_type_secret_btn.setChecked(name == "Secrets")
+    self._load_config_resources()
+
+  def _build_events_tab(self):
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+
+    tb = QHBoxLayout()
+    tb.setContentsMargins(10, 6, 10, 6)
+    tb.setSpacing(8)
+    self.event_filter = QLineEdit()
+    self.event_filter.setPlaceholderText(" Filter events (reason / object / message)…")
+    self.event_filter.setMaximumWidth(280)
+    self.event_filter.textChanged.connect(self._filter_events)
+    tb.addWidget(self.event_filter)
+
+    self.event_count_lbl = QLabel("")
+    tb.addWidget(self.event_count_lbl)
+    tb.addStretch()
+
+    self.event_warn_btn = self._toolbar_btn(" Warnings only")
+    self.event_warn_btn.setCheckable(True)
+    self.event_warn_btn.toggled.connect(self._toggle_events_warnings_only)
+    tb.addWidget(self.event_warn_btn)
+
+    tb_widget = QWidget()
+    tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
+    tb_widget.setLayout(tb)
+    lay.addWidget(tb_widget)
+    self.events_toolbar = tb_widget
+
+    # Newest first, warnings visually distinct — see EventCardWidget
+    # (k8s_cards.py) for the accent-color logic.
+    self.event_list = QListWidget()
+    self.event_list.setSpacing(4)
+    self.event_list.setSelectionMode(QAbstractItemView.SingleSelection)
+    self.event_list.setContextMenuPolicy(Qt.CustomContextMenu)
+    self.event_list.customContextMenuRequested.connect(self._event_ctx_menu)
+    self.event_list.itemDoubleClicked.connect(self._on_event_double_click)
+    self.event_list.currentItemChanged.connect(self._on_event_selection_changed)
+    self.event_list.setStyleSheet(
+      "QListWidget { background: transparent; border: none; padding: 8px; }"
+      "QListWidget::item { border: none; padding: 0; margin: 0; }"
+    )
+    lay.addWidget(self.event_list)
+    add_icon_tab(self.sub_tabs, w, " Events")
+
+  def _build_terminal_tab(self):
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(8, 8, 8, 8)
+    lay.setSpacing(8)
+
+    self.k8s_terminal = QTextEdit()
+    self.k8s_terminal.setReadOnly(True)
+    self.k8s_terminal.setFont(monospace_font(11))
+    self.k8s_terminal.setStyleSheet(
+      f"background: #0d0d1a; color: {T['SUCCESS']}; border: none; padding: 8px;"
+    )
+    self.k8s_terminal.setPlaceholderText("kubectl output appears here…")
+    lay.addWidget(self.k8s_terminal)
+
+    inp_row = QHBoxLayout()
+    self.k8s_inp = QLineEdit()
+    self.k8s_inp.setPlaceholderText("kubectl …")
+    self.k8s_inp.returnPressed.connect(self._run_kubectl_terminal)
+    inp_row.addWidget(self.k8s_inp)
+
+    clr = self._toolbar_btn("Clear")
+    clr.clicked.connect(self.k8s_terminal.clear)
+    inp_row.addWidget(clr)
+
+    run = self._toolbar_btn("Run", object_name="primary")
+    run.clicked.connect(self._run_kubectl_terminal)
+    inp_row.addWidget(run)
+    lay.addLayout(inp_row)
+    self.sub_tabs.addTab(w, "⌨ Terminal")
+
+  def _build_tunnels_tab(self):
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+
+    # Toolbar: CSV path + reload + select-all/clear
+    tb = QHBoxLayout()
+    tb.setContentsMargins(10, 6, 10, 6)
+    tb.setSpacing(8)
+
+    self.tunnel_path_lbl = QLabel(f" {self._tunnel_csv_path} (on VM)")
+    self.tunnel_path_lbl.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 13px;")
+    tb.addWidget(self.tunnel_path_lbl)
+    tb.addStretch()
+
+    change_file_btn = self._toolbar_btn(
+      " Change File",
+      tooltip=(
+        "Point at a different tunnel-services CSV on the connected VM\n"
+        "(e.g. a personal or per-project file instead of the shared default).\n"
+        "Remembered for next time."
+      ),
+    )
+    change_file_btn.clicked.connect(self._change_tunnel_csv_path)
+    tb.addWidget(change_file_btn)
+
+    reload_btn = self._toolbar_btn("↺ Reload CSV")
+    reload_btn.clicked.connect(self._load_tunnel_csv)
+    tb.addWidget(reload_btn)
+
+    manage_btn = self._toolbar_btn(
+      "️ Manage Services",
+      tooltip="Add, edit, or remove tunnel services stored on the connected VM",
+    )
+    manage_btn.clicked.connect(self._open_manage_tunnel_services)
+    tb.addWidget(manage_btn)
+
+    refresh_status_btn = self._toolbar_btn(
+      " Refresh Status",
+      tooltip=(
+        "Check which services' ports are currently listening on the VM\n"
+        "( exposed / not exposed), without reloading the CSV."
+      ),
+    )
+    refresh_status_btn.clicked.connect(self._refresh_tunnel_status)
+    tb.addWidget(refresh_status_btn)
+
+    selall_btn = self._toolbar_btn(" Select All")
+    selall_btn.clicked.connect(lambda: self._set_all_tunnel_checks(True))
+    tb.addWidget(selall_btn)
+
+    clear_btn = self._toolbar_btn(" Clear")
+    clear_btn.clicked.connect(lambda: self._set_all_tunnel_checks(False))
+    tb.addWidget(clear_btn)
+
+    tb_widget = QWidget()
+    tb_widget.setStyleSheet(f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};")
+    tb_widget.setLayout(tb)
+    lay.addWidget(tb_widget)
+    self.tunnel_toolbar = tb_widget
+    
+    search_row = QHBoxLayout()
+    search_row.setContentsMargins(10, 6, 10, 6)
+    search_row.setSpacing(8)
+
+    self.tunnel_search = QLineEdit()
+    self.tunnel_search.setPlaceholderText(" Filter services...")
+    self.tunnel_search.setClearButtonEnabled(True)
+    self.tunnel_search.setMaximumHeight(34)
+    self.tunnel_search.textChanged.connect(self._filter_tunnel_services)
+    search_row.addWidget(self.tunnel_search, 1)
+
+    # Status toggle — All / Active () / Inactive (). Mutually
+    # exclusive via QButtonGroup, combined with the text search above
+    # in _filter_tunnel_services() rather than replacing it.
+    self.tunnel_filter_all_btn = self._toolbar_btn(
+      "All", tooltip="Show every service, regardless of status")
+    self.tunnel_filter_active_btn = self._toolbar_btn(
+      " Active", tooltip="Show only services currently exposed on the VM")
+    self.tunnel_filter_inactive_btn = self._toolbar_btn(
+      " Inactive", tooltip="Show only services not currently exposed on the VM")
+
+    self._tunnel_filter_keys = {}
+    self.tunnel_filter_group = QButtonGroup(self)
+    self.tunnel_filter_group.setExclusive(True)
+    for btn, key in (
+      (self.tunnel_filter_all_btn, "all"),
+      (self.tunnel_filter_active_btn, "active"),
+      (self.tunnel_filter_inactive_btn, "inactive"),
+    ):
+      btn.setCheckable(True)
+      self.tunnel_filter_group.addButton(btn)
+      self._tunnel_filter_keys[btn] = key
+      search_row.addWidget(btn)
+    self.tunnel_filter_all_btn.setChecked(True)
+    self.tunnel_filter_group.buttonClicked.connect(self._on_tunnel_status_filter_clicked)
+
+    lay.addLayout(search_row)
+    # Service checklist
+    self.tunnel_list = QListWidget()
+    self.tunnel_list.setAlternatingRowColors(True)
+    self.tunnel_list.itemChanged.connect(self._update_tunnel_cmd_preview)
+    self.tunnel_list.setStyleSheet("""
+    QListWidget {
+      font-size: 13px;
+    }
+    QListWidget::item {
+      height: 38px;
+    }
+    QListWidget::indicator {
+      width: 22px;
+      height: 22px;
+    }
+    """)
+    lay.addWidget(self.tunnel_list, 1)
+
+    # Command preview (read-only, for transparency/debugging)
+    preview_row = QHBoxLayout()
+    preview_row.setContentsMargins(10, 8, 10, 4)
+    preview_row.addWidget(QLabel("Command:"))
+    self.tunnel_cmd_preview = QLineEdit()
+    self.tunnel_cmd_preview.setReadOnly(True)
+    self.tunnel_cmd_preview.setFont(monospace_font(10))
+    self.tunnel_cmd_preview.setPlaceholderText("Select service(s) below to preview the SSH tunnel command…")
+    preview_row.addWidget(self.tunnel_cmd_preview, 1)
+    lay.addLayout(preview_row)
+
+    # Controls: status + start/stop
+    ctrl_row = QHBoxLayout()
+    ctrl_row.setContentsMargins(10, 4, 10, 10)
+    ctrl_row.setSpacing(8)
+
+    self.tunnel_status_lbl = QLabel("● Not tunnelling")
+    self.tunnel_status_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px;")
+    ctrl_row.addWidget(self.tunnel_status_lbl)
+    ctrl_row.addStretch()
+
+    self.tunnel_start_btn = self._toolbar_btn(" Tunnel", object_name="primary")
+    self.tunnel_start_btn.clicked.connect(self._start_tunnel)
+    ctrl_row.addWidget(self.tunnel_start_btn)
+
+    self.tunnel_stop_btn = self._toolbar_btn("⏹ Stop", object_name="danger")
+    self.tunnel_stop_btn.setEnabled(False)
+    self.tunnel_stop_btn.clicked.connect(self._stop_tunnel)
+    ctrl_row.addWidget(self.tunnel_stop_btn)
+
+    self.port_kill = self._toolbar_btn(" Kill Port", object_name="danger")
+    self.port_kill.clicked.connect(self._kill_selected_ports)
+    ctrl_row.addWidget(self.port_kill)
+
+    self.tunnel_restart_btn = self._toolbar_btn(
+      "↻ Restart Tunneling",
+      tooltip=(
+        "Runs 'kubectl port-forward' directly on the connected VM for each\n"
+        "selected service, e.g.:\n"
+        "nohup kubectl -n <namespace> port-forward svc/<name> <port>:<port> &\n\n"
+        "This is separate from the local SSH tunnel above — use both together:\n"
+        "this exposes the service on the VM's own localhost, and the SSH\n"
+        "tunnel forwards that port to your machine."
+      ),
+    )
+    self.tunnel_restart_btn.clicked.connect(self._restart_kubectl_tunnels)
+    ctrl_row.addWidget(self.tunnel_restart_btn)
+
+    lay.addLayout(ctrl_row)
+
+    # Process log (ssh stdout/stderr, merged)
+    self.tunnel_log = QTextEdit()
+    self.tunnel_log.setReadOnly(True)
+    self.tunnel_log.setFont(monospace_font(10))
+    self.tunnel_log.setFixedHeight(130)
+    self.tunnel_log.setPlaceholderText("Tunnel process output appears here…")
+    self.tunnel_log.setStyleSheet(
+      f"background: #0d0d1a; color: {T['TEXT_DIM']}; border: none; padding: 8px;"
+    )
+    lay.addWidget(self.tunnel_log)
+
+    add_icon_tab(self.sub_tabs, w, " Tunnels")
+    # self._load_tunnel_csv()
+
+    # Apply whatever tab-visibility choices were saved in Settings
+    # (defaults to "everything visible" the first time the app runs).
+    self._apply_saved_hidden_tabs()
+
+  # ── Tab visibility (Settings → Kubernetes Tabs) ────────────
+  def visible_tab_titles(self) -> list:
+    """The exact tab-bar strings currently in sub_tabs, in order —
+    used by SettingsDialog to build its show/hide checklist and as
+    the stable keys stored in settings.json."""
+    return [self.sub_tabs.tabText(i) for i in range(self.sub_tabs.count())]
+
+  def apply_hidden_tabs(self, hidden_titles):
+    """Hide/show sub-tabs by title. Safe to call at any time (e.g.
+    right after the user saves new choices in Settings) — QTabWidget
+    keeps a hidden tab's contents alive, it just isn't selectable
+    from the tab bar."""
+    hidden = set(hidden_titles or [])
+    for i in range(self.sub_tabs.count()):
+      self.sub_tabs.setTabVisible(i, self.sub_tabs.tabText(i) not in hidden)
+
+  def _apply_saved_hidden_tabs(self):
+    self.apply_hidden_tabs(load_settings().get("k8s_hidden_tabs", []))
+
+  # ── Theme refresh ─────────────────────────────────────────
+  def apply_theme(self):
+    self.ctrl_bar.setStyleSheet(
+      f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
+    )
+    self.health_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px;")
+    self.ns_dot.setStyleSheet(f"color: {T['ACCENT']}; font-size: 11px; background: transparent;")
+    self._style_ns_group()
+    if hasattr(self, "pod_action_cluster"):
+      self.pod_action_cluster.setStyleSheet(
+        f"QFrame#action_cluster {{ background: {T['BG_ITEM']}; border-radius: 8px; }}"
+      )
+    self.k8s_terminal.setStyleSheet(
+      f"background: #0d0d1a; color: {T['SUCCESS']}; border: none; padding: 8px;"
+    )
+    toolbar_style = f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
+    for bar in (getattr(self, "pods_toolbar", None), getattr(self, "deploy_toolbar", None),
+          getattr(self, "sts_toolbar", None), getattr(self, "ds_toolbar", None),
+          getattr(self, "hpa_toolbar", None),
+          getattr(self, "svc_toolbar", None), getattr(self, "ing_toolbar", None),
+          getattr(self, "events_toolbar", None), getattr(self, "tunnel_toolbar", None),
+          getattr(self, "wl_toolbar", None), getattr(self, "wl_type_bar", None),
+          getattr(self, "pvx_toolbar", None), getattr(self, "pvx_type_bar", None)):
+      if bar is not None:
+        bar.setStyleSheet(toolbar_style)
+    if getattr(self, "wl_type_toggle", None) is not None:
+      self._style_toggle(self.wl_type_toggle, (self.wl_type_jobs_btn, self.wl_type_cron_btn))
+    if getattr(self, "pvx_type_toggle", None) is not None:
+      self._style_toggle(self.pvx_type_toggle, (self.pvx_type_pvc_btn, self.pvx_type_pv_btn))
+    if getattr(self, "wl_history_hdr", None) is not None:
+      self.wl_history_hdr.setStyleSheet(
+        f"background: {T['BG_PANEL']}; color: {T['TEXT_DIM']}; font-size: 13px; "
+        f"font-weight: 700; border-bottom: 1px solid {T['BORDER']}; padding-left: 14px;"
+      )
+    if getattr(self, "wl_history_hint", None) is not None:
+      self.wl_history_hint.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px; padding: 12px;")
+    if getattr(self, "tunnel_log", None) is not None:
+      self.tunnel_log.setStyleSheet(
+        f"background: #0d0d1a; color: {T['TEXT_DIM']}; border: none; padding: 8px;"
+      )
+    if getattr(self, "tunnel_path_lbl", None) is not None:
+      self.tunnel_path_lbl.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 13px;")
+    if getattr(self, "tunnel_status_lbl", None) is not None:
+      running = self._tunnel_process is not None and self._tunnel_process.state() != QProcess.NotRunning
+      color = T['SUCCESS'] if running else T['TEXT_MUTED']
+      self.tunnel_status_lbl.setStyleSheet(f"color: {color}; font-size: 12px;")
+    if getattr(self, "cfg_detail_hdr", None) is not None:
+      self.cfg_detail_hdr.setStyleSheet(
+        f"background: {T['BG_PANEL']}; color: {T['TEXT_DIM']}; font-size: 13px; "
+        f"font-weight: 700; border-bottom: 1px solid {T['BORDER']}; padding-left: 14px;"
+      )
+    if getattr(self, "cfg_type_bar", None) is not None:
+      self.cfg_type_bar.setStyleSheet(
+        f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
+      )
+    if getattr(self, "cfg_type_toggle", None) is not None:
+      self._style_cfg_toggle()
+    if getattr(self, "cfg_raw", None) is not None:
+      self.cfg_raw.setStyleSheet(f"padding: 10px; border: none; background: {T['BG_DARK']};")
+    if getattr(self, "cfg_raw_lbl", None) is not None:
+      self.cfg_raw_lbl.setStyleSheet(
+        f"background: {T['BG_PANEL']}; color: {T['TEXT_DIM']}; font-size: 13px; "
+        f"font-weight: 700; border-top: 1px solid {T['BORDER']}; "
+        f"border-bottom: 1px solid {T['BORDER']}; padding-left: 14px;"
+      )
+    if self.ssh and self._current_context:
+      self._check_cluster_health()
+      # Pod/deployment cards (k8s_cards.py) bake T's colors in at
+      # construction time rather than re-reading them live, so a
+      # theme switch needs a rebuild of whichever list is on screen
+      # for its cards to pick up the new palette.
+      self._refresh_current_tab()
+
+  def _style_tree(self, tree):
+    font = monospace_font(13)
+    tree.setFont(font)
+
+    tree.setStyleSheet("""
+    QTreeWidget {
+      font-size: 13px;
+    }
+
+    QTreeWidget::item {
+      height: 38px;
+    }
+    """)
+
+    hdr = tree.header()
+    header_font = QFont("Segoe UI", 12)
+    header_font.setBold(True)
+    hdr.setFont(header_font)
+    hdr.setMinimumHeight(42)
+
+  def _filter_tunnel_services(self, _text=None):
+    """
+    Filter tunnel services by service name, namespace or port, AND by
+    the Active/Inactive status toggle. Both conditions must pass for a
+    row to be shown. Preserves the checkbox state.
+
+    `_text` is accepted (and ignored) so this can be connected directly
+    to QLineEdit.textChanged as well as called with no arguments from
+    the status-toggle handler and after a status refresh.
+    """
+    text = self.tunnel_search.text().strip().lower()
+
+    for i in range(self.tunnel_list.count()):
+      item = self.tunnel_list.item(i)
+
+      svc = item.data(Qt.UserRole)
+      if svc is None:
+        continue
+
+      searchable = (
+        f"{svc['name']} "
+        f"{svc['namespace']} "
+        f"{svc['port']}"
+      ).lower()
+      text_match = text in searchable
+
+      exposed = item.data(self.TUNNEL_STATUS_ROLE)
+      if self._tunnel_status_filter == "active":
+        status_match = exposed is True
+      elif self._tunnel_status_filter == "inactive":
+        status_match = exposed is False
+      else:
+        status_match = True
+
+      item.setHidden(not (text_match and status_match))
+
+  def _on_tunnel_status_filter_clicked(self, btn):
+    self._tunnel_status_filter = self._tunnel_filter_keys.get(btn, "all")
+    self._filter_tunnel_services()
+
+  # ── Namespace helpers ─────────────────────────────────────
+  def _load_namespaces(self):
+    self._run_cmd(
+      "kubectl get namespaces -o jsonpath='{.items[*].metadata.name}'",
+      self._populate_namespaces,
+    )
+
+  def _populate_namespaces(self, out: str):
+    names = out.strip().strip("'").split()
+    self._namespaces = names
+    current = self.ns_combo.currentText()
+    # A just-created namespace (see _create_namespace) takes priority
+    # over whatever was selected before, so the picker lands on the
+    # namespace that was just created instead of silently staying put.
+    pending = self._namespaces_pending_select
+    self._namespaces_pending_select = None
+    self.ns_combo.blockSignals(True)
+    self.ns_combo.clear()
+    self.ns_combo.addItem("(all namespaces)")
+    self.ns_combo.addItems(names)
+    if pending and pending in names:
+      self.ns_combo.setCurrentText(pending)
+    elif current in names:
+      self.ns_combo.setCurrentText(current)
+    elif "default" in names:
+      self.ns_combo.setCurrentText("default")
+    self.ns_combo.blockSignals(False)
+    self._current_ns = self.ns_combo.currentText()
+    if self._cluster_available:
+      self._refresh_current_tab()
+
+  def _on_ns_change(self, ns: str):
+    self._current_ns = ns
+    self._refresh_current_tab()
+
+  def _ns_flag(self) -> str:
+    ns = self._current_ns
+    if ns == "(all namespaces)" or not ns:
+      return "--all-namespaces"
+    return f"-n {ns}"
+
+  def _create_namespace(self):
+    if not self.ssh:
+      return
+    name, ok = QInputDialog.getText(self, "Create Namespace", "Namespace name:")
+    name = (name or "").strip()
+    if not ok or not name:
+      return
+    if not re.match(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", name):
+      QMessageBox.warning(
+        self, "Invalid name",
+        "Namespace names must be lowercase alphanumeric or '-', "
+        "and must start/end with an alphanumeric character."
+      )
+      return
+
+    def on_done(out):
+      self._log(out)
+      self._namespaces_pending_select = name
+      self._load_namespaces()
+
+    self._run_cmd(f"kubectl create namespace {name} 2>&1", on_done)
+
+  # ── Cluster health ────────────────────────────────────────
+  def _check_cluster_health(self):
+    """Probe the selected context before allowing any resource command."""
+    if not self.ssh or not self._current_context:
+      self._cluster_available = False
+      return
+    if self._cluster_probe_in_progress:
+      return
+
+    self._cluster_probe_in_progress = True
+    self._run_cmd(
+      "kubectl cluster-info --request-timeout=3s 2>&1 | head -3",
+      self._update_health,
+    )
+
+  def _update_health(self, out: str):
+    self._cluster_probe_in_progress = False
+    text = (out or "").lower()
+    healthy = (
+      "running" in text
+      or "control plane" in text
+      or "kubernetes control plane" in text
+    ) and not any(
+      bad in text
+      for bad in (
+        "unable to connect",
+        "connection refused",
+        "connection timed out",
+        "i/o timeout",
+        "no such host",
+        "context deadline exceeded",
+        "the server doesn't have a resource type",
+      )
+    )
+
+    self._cluster_available = healthy
+
+    if healthy:
+      self.health_lbl.setText("● Cluster OK")
+      self.health_lbl.setStyleSheet(f"color: {T['SUCCESS']}; font-size: 12px;")
+      self._load_namespaces()
+    else:
+      self._auto_refresh_timer.stop()
+      self.auto_btn.setChecked(False)
+      self.auto_btn.setText("⏱ Auto (30 s)")
+      self.health_lbl.setText("● Cluster unavailable")
+      self.health_lbl.setStyleSheet(f"color: {T['DANGER']}; font-size: 12px;")
+      self._clear_all(keep_context=True)
+
+  def _toggle_auto_refresh(self, on: bool):
+    if on:
+      self._auto_refresh_timer.start(30000)
+      self.auto_btn.setText("⏱ Auto ON")
+    else:
+      self._auto_refresh_timer.stop()
+      self.auto_btn.setText("⏱ Auto (30 s)")
+
+  def _auto_refresh(self):
+    if not self.ssh or not self._cluster_available or not self._current_context:
+      self._auto_refresh_timer.stop()
+      self.auto_btn.setChecked(False)
+      self.auto_btn.setText("⏱ Auto (30 s)")
+      return
+    self._refresh_current_tab()
+
+  def _clear_all(self, keep_context=False):
+    self.pod_list.clear()
+    self.deploy_list.clear()
+    self.pod_count_lbl.setText("")
+    self.pod_count_lbl.setStyleSheet("")
+    self.deploy_count_lbl.setText("")
+    self.deploy_count_lbl.setStyleSheet("")
+    self.sts_list.clear()
+    self.sts_count_lbl.setText("")
+    self.sts_count_lbl.setStyleSheet("")
+    self.ds_list.clear()
+    self.ds_count_lbl.setText("")
+    self.ds_count_lbl.setStyleSheet("")
+    self.hpa_list.clear()
+    self.hpa_count_lbl.setText("")
+    self.hpa_count_lbl.setStyleSheet("")
+    self.svc_list.clear()
+    self.svc_count_lbl.setText("")
+    self.svc_count_lbl.setStyleSheet("")
+    self.ing_list.clear()
+    self.ing_count_lbl.setText("")
+    self.ing_count_lbl.setStyleSheet("")
+    self.wl_list.clear()
+    self.wl_history_list.clear()
+    self.wl_count_lbl.setText("")
+    self.wl_count_lbl.setStyleSheet("")
+    self.pvx_list.clear()
+    self.pvx_count_lbl.setText("")
+    self.pvx_count_lbl.setStyleSheet("")
+    self.cfg_list.clear()
+    self.cfg_detail.clear()
+    self.cfg_raw.clear()
+    self.event_list.clear()
+    self.event_count_lbl.setText("")
+    self.event_count_lbl.setStyleSheet("")
+    self._events_raw = ""
+    if getattr(self, "event_warn_btn", None) is not None:
+      self.event_warn_btn.setChecked(False)
+    self.ns_combo.clear()
+    if not keep_context:
+      self.context_combo.clear()
+      self._contexts = []
+      self._current_context = ""
+    self.health_lbl.setText("● Cluster")
+    self.health_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px;")
+
+  def _refresh_current_tab(self, _=None):
+    # Never issue resource-level kubectl commands until the selected
+    # context has passed the cluster-health probe. This also prevents
+    # tab changes and auto-refresh from generating unwanted commands on
+    # machines that have no reachable Kubernetes cluster.
+    if not self.ssh or not self._cluster_available or not self._current_context:
+      return
+
+    idx = self.sub_tabs.currentIndex()
+    if  idx == 0: self._load_pods()
+    elif idx == 1: self._load_deployments()
+    elif idx == 2: self._load_statefulsets()
+    elif idx == 3: self._load_daemonsets()
+    elif idx == 4: self._load_hpas()
+    elif idx == 5: self._load_services()
+    elif idx == 6: self._load_ingress()
+    elif idx == 7: self._load_workloads()
+    elif idx == 8: self._load_storage()
+    elif idx == 9: self._load_config_resources()
+    elif idx == 10: self._load_events()
+    elif idx == 11: self._refresh_tunnel_status()
+
+  # ── Pods ──────────────────────────────────────────────────
+  # `kubectl get pods -o wide` renders the RESTARTS column as a plain
+  # number ("0") normally, but as "N (Ndhm ago)" — a single logical
+  # value containing a space — for any pod whose last restart was
+  # recent enough for kubectl to bother annotating it. line.split()
+  # blows that annotation into two extra whitespace-separated tokens
+  # ("(22d", "ago)"), which silently shifts every fixed-position column
+  # after it (AGE/IP/NODE) by two — the misalignment seen when a
+  # recently-restarted pod's IP/Node show up empty or wrong while an
+  # untouched pod in the same table lines up fine. _split_pod_line
+  # detects that two-token annotation before the fixed-offset slicing
+  # below runs, pulls it out into its own "Last Restart" value (rather
+  # than just discarding it — it's genuinely useful info), and returns
+  # the remaining tokens so the real columns land back in place.
+  _PAREN_OPEN_RE = re.compile(r"^\(\S*$")
+  _PAREN_CLOSE_RE = re.compile(r"^\S*\)$")
+
+  @staticmethod
+  def _split_pod_line(line: str):
+    """Returns (cleaned_parts, last_restart). last_restart is e.g.
+    "22d ago", or "" if this pod has never restarted (or kubectl's
+    RESTARTS column didn't include the annotation)."""
+    parts = line.split()
+    cleaned = []
+    last_restart = ""
+    i = 0
+    while i < len(parts):
+      if (KubernetesTab._PAREN_OPEN_RE.match(parts[i]) and i + 1 < len(parts)
+          and KubernetesTab._PAREN_CLOSE_RE.match(parts[i + 1])):
+        # "(22d" + "ago)" -> "22d ago"
+        last_restart = f"{parts[i][1:]} {parts[i + 1][:-1]}"
+        i += 2
+        continue
+      cleaned.append(parts[i])
+      i += 1
+    return cleaned, last_restart
+
+  def _load_pods(self):
+    self._run_cmd(f"kubectl get pods {self._ns_flag()} -o wide 2>&1", self._populate_pods)
+
+  def _populate_pods(self, out: str):
+    self.pod_list.clear()
+    all_ns = (self._current_ns == "(all namespaces)")
+    total  = 0
+    running = 0
+    # The namespace chip on each card is only shown in "(all namespaces)"
+    # view (i.e. rows can differ) — when one namespace is selected it's
+    # implied by ns_combo already, so the chip would just repeat itself.
+    for line in out.strip().splitlines()[1:]:
+      parts, last_restart = self._split_pod_line(line)
+      if all_ns:
+        # `kubectl get pods --all-namespaces -o wide` prepends NAMESPACE.
+        if len(parts) < 6:
+          continue
+        ns, name, ready, status, restarts, age = parts[:6]
+        ip  = parts[6] if len(parts) > 6 else "-"
+        node = parts[7] if len(parts) > 7 else "-"
+      else:
+        if len(parts) < 5:
+          continue
+        ns = self._current_ns or "default"
+        name, ready, status, restarts, age = parts[:5]
+        ip  = parts[5] if len(parts) > 5 else "-"
+        node = parts[6] if len(parts) > 6 else "-"
+      meta = {
+        "namespace": ns, "name": name, "ready": ready, "status": status,
+        "restarts": restarts, "last_restart": last_restart or "-",
+        "age": age, "ip": ip, "node": node,
+      }
+      item = QListWidgetItem()
+      item.setData(Qt.UserRole, meta)
+      item.setSizeHint(QSize(0, PodCardWidget.CARD_HEIGHT))
+      self.pod_list.addItem(item)
+      card = PodCardWidget(meta, all_ns)
+      card.ai_requested.connect(self._on_pod_card_ai_requested)
+      self.pod_list.setItemWidget(item, card)
+      if meta.get("name") == self._pod_ai_pod:
+        # A refresh landed while this pod's diagnosis was still in
+        # flight — the old card (and its " …" busy state) just got
+        # thrown away, so re-point the busy state at its replacement.
+        self._pod_ai_card = card
+        card.set_ai_busy(True)
+      total += 1
+      if "running" in status.lower():
+        running += 1
+    if total == 0:
+      color_key = "TEXT_MUTED"
+    elif running == total:
+      color_key = "SUCCESS"
+    elif running == 0:
+      color_key = "DANGER"
+    else:
+      color_key = "WARNING"
+    self._set_count_badge(self.pod_count_lbl, f"{running}/{total} running", color_key)
+    # Refreshing rebuilds every row from scratch, which would otherwise
+    # silently show everything again even though the filter box still
+    # has text in it — reapply whatever's currently typed there.
+    self._filter_pods(self.pod_filter.text())
+
+  def _filter_pods(self, text: str):
+    q = text.lower()
+    for i in range(self.pod_list.count()):
+      item = self.pod_list.item(i)
+      meta = item.data(Qt.UserRole) or {}
+      item.setHidden(q not in meta.get("name", "").lower())
+
+  def _selected_pod(self) -> tuple: # (Optional[str], str)
+    item = self.pod_list.currentItem()
+    if not item:
+      QMessageBox.warning(self, "No selection", "Select a pod first.")
+      return None, ""
+    meta = item.data(Qt.UserRole) or {}
+    return meta.get("name"), meta.get("namespace") or "default"
+
+  def _on_pod_double_click(self, item):
+    """Double-clicking a pod card is a shortcut for Describe — reads
+    name/namespace off the card that was actually double-clicked rather
+    than relying on _selected_pod()'s currentItem(), since a
+    double-click's second press is what sets the current item and
+    there's no reason to depend on that timing."""
+    meta = item.data(Qt.UserRole) or {}
+    self._describe("pod", meta.get("name"), meta.get("namespace") or "default")
+
+  def _on_pod_selection_changed(self, current, previous):
+    """Cards paint their own selected state (they fully cover the
+    QListWidgetItem's rect, so the list's native selection styling
+    never shows through) — forward selection changes into them."""
+    if previous is not None:
+      w = self.pod_list.itemWidget(previous)
+      if w:
+        w.set_selected(False)
+    if current is not None:
+      w = self.pod_list.itemWidget(current)
+      if w:
+        w.set_selected(True)
+
+  def _pod_logs(self):
+    pod, ns = self._selected_pod()
+    if pod:
+      self._logs_pod(pod, ns)
+
+
+  def _logs_pod(self, pod: str, ns: str):
+    """Look up the pod containers before opening LogViewerDialog.
+
+    Single-container pods open directly. Multi-container pods require an
+    explicit container selection so logs are never taken from the wrong
+    sidecar/container by accident.
+    """
+    self._run_cmd(
+      f"kubectl get pod -n {ns} {pod} "
+      f"-o jsonpath='{{.spec.containers[*].name}}' 2>&1",
+      lambda out, pod=pod, ns=ns:
+        self._on_logs_containers_fetched(out, pod, ns),
+    )
+
+
+  def _on_logs_containers_fetched(self, out: str, pod: str, ns: str):
+    # Same trailing-quote defensiveness as the Exec container lookup.
+    containers = out.strip().strip("'").split()
+
+    if len(containers) <= 1:
+      LogViewerDialog(
+        self,
+        self.ssh,
+        ns,
+        pod,
+        containers[0] if containers else None
+      ).exec_()
+      return
+
+    dlg = ContainerPickerDialog(
+      self,
+      pod,
+      containers,
+      action="Logs"
+    )
+
+    if dlg.exec_() == QDialog.Accepted:
+      LogViewerDialog(
+        self,
+        self.ssh,
+        ns,
+        pod,
+        dlg.selected_container()
+      ).exec_()
+
+  # ── Inline " AI" button on troubled pod cards ─────────────
+  # Same diagnosis flow as LogViewerDialog's "Analyze with AI" button
+  # (fetch logs -> ai_assist.AIExplainWorker -> AIExplainDialog), just
+  # entered straight from the card instead of requiring the user to open
+  # the full log viewer first. Single-flight: only one card's request
+  # runs at a time (see the self._pod_ai_* state in __init__).
+  def _on_pod_card_ai_requested(self, meta: dict):
+    if self._pod_ai_pod is not None:
+      return # a diagnosis is already running — button is disabled meanwhile, but be defensive
+
+    if not self.ssh:
+      QMessageBox.warning(self, "Not connected", "Connect to the instance first.")
+      return
+
+    provider = ai_assist.get_provider()
+    api_key = ai_assist.get_api_key(provider)
+    if not api_key:
+      label = ai_assist.PROVIDERS.get(provider, {}).get("label", provider)
+      QMessageBox.information(
+        self, "No API key set",
+        f"Add a {label} API key in Settings → AI to use this feature."
+      )
+      return
+
+    pod  = meta.get("name")
+    ns   = meta.get("namespace") or "default"
+    status = meta.get("status", "") or ""
+
+    self._pod_ai_pod = pod
+    self._pod_ai_card = self.sender() if isinstance(self.sender(), PodCardWidget) else None
+    if self._pod_ai_card is not None:
+      self._pod_ai_card.set_ai_busy(True)
+
+    self._pod_ai_dialog = AIExplainDialog(self, f"AI diagnosis — {pod}")
+    self._pod_ai_dialog.body.setPlainText("Fetching logs…")
+    self._pod_ai_dialog.show()
+
+    # A pod that's actively crash-looping usually has nothing useful in
+    # its *current* container's logs (it just restarted) — the actual
+    # error is in the previous container's log instead. A pod with
+    # restarts>0 but currently Running already fell back to this same
+    # heuristic on the card itself (see k8s_cards._pod_in_trouble), so
+    # mirror it here rather than re-deriving it from restarts alone.
+    use_previous = "crash" in status.lower()
+    prev = "--previous" if use_previous else ""
+    inner = f"kubectl {self._context_flag()} logs --tail=200 -n {ns} {prev} {pod} 2>&1".replace("kubectl logs", "kubectl logs")
+    cmd = f"bash -lc {shlex.quote(inner)}"
+
+    worker = CommandWorker(self.ssh, cmd)
+    worker.done.connect(lambda out, pod=pod, ns=ns: self._on_pod_ai_logs_fetched(pod, ns, out))
+    worker.error.connect(lambda err: self._on_pod_ai_logs_error(err))
+    self._pod_ai_log_worker = worker
+    track_worker(self._workers, worker)
+    worker.start()
+
+  def _on_pod_ai_logs_fetched(self, pod: str, ns: str, log_text: str):
+    self._pod_ai_log_worker = None
+    log_text = (log_text or "").strip()
+    if not log_text:
+      self._on_pod_ai_logs_error("No log output for this pod.")
+      return
+
+    if self._pod_ai_dialog is not None:
+      self._pod_ai_dialog.set_source_context(
+        f"Pod: {pod}\nNamespace: {ns}\n\nLogs/evidence:\n{log_text}"
+      )
+      self._pod_ai_dialog.set_loading()
+
+    provider = ai_assist.get_provider()
+    worker = ai_assist.AIExplainWorker(
+      provider, ai_assist.get_api_key(provider), ai_assist.get_model(provider),
+      pod, ns, None, log_text,
+    )
+    worker.done.connect(self._on_pod_ai_done)
+    worker.error.connect(self._on_pod_ai_error)
+    worker.finished.connect(self._on_pod_ai_finished)
+    self._pod_ai_worker = worker
+    worker.start()
+
+  def _on_pod_ai_logs_error(self, message: str):
+    self._pod_ai_log_worker = None
+    if self._pod_ai_dialog is not None:
+      self._pod_ai_dialog.set_error(f"Couldn't fetch logs: {message}")
+    self._on_pod_ai_finished()
+
+  def _on_pod_ai_done(self, text: str):
+    if self._pod_ai_dialog is not None:
+      self._pod_ai_dialog.set_markdown(text)
+
+  def _on_pod_ai_error(self, message: str):
+    if self._pod_ai_dialog is not None:
+      self._pod_ai_dialog.set_error(message)
+
+  def _on_pod_ai_finished(self):
+    self._pod_ai_worker = None
+    self._pod_ai_pod  = None
+    if self._pod_ai_card is not None:
+      self._pod_ai_card.set_ai_busy(False)
+    self._pod_ai_card = None
+
+  def _pod_exec(self):
+    pod, ns = self._selected_pod()
+    if pod:
+      self._exec_pod(pod, ns)
+
+  def _exec_pod(self, pod: str, ns: str):
+    """Look up the pod's container names before opening ExecDialog —
+    see ContainerPickerDialog's docstring for why. Single-container
+    pods (the common case) skip straight to ExecDialog with no extra
+    click."""
+    self._run_cmd(
+      f"kubectl get pod -n {ns} {pod} "
+      f"-o jsonpath='{{.spec.containers[*].name}}' 2>&1",
+      lambda out, pod=pod, ns=ns: self._on_exec_containers_fetched(out, pod, ns),
+    )
+
+  def _on_exec_containers_fetched(self, out: str, pod: str, ns: str):
+    # Same trailing-quote defensiveness as _populate_namespaces.
+    containers = out.strip().strip("'").split()
+    if len(containers) <= 1:
+      ExecDialog(self, self.ssh, ns, pod, containers[0] if containers else None,
+            context=self._current_context).exec_()
+      return
+    dlg = ContainerPickerDialog(self, pod, containers)
+    if dlg.exec_() == QDialog.Accepted:
+      ExecDialog(self, self.ssh, ns, pod, dlg.selected_container(),
+            context=self._current_context).exec_()
+
+  def _pod_delete(self):
+    pod, ns = self._selected_pod()
+    if not pod:
+      return
+    if QMessageBox.question(self, "Delete Pod", f'Delete pod "{pod}"?',
+                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+      self._run_cmd(f"kubectl delete pod -n {ns} {pod} 2>&1",
+             lambda o: (self._log(o), self._load_pods()))
+
+  def _pod_restart(self):
+    pod, ns = self._selected_pod()
+    if pod:
+      self._run_cmd(f"kubectl delete pod -n {ns} {pod} 2>&1",
+             lambda o: (self._log(o), self._load_pods()))
+
+  def _pod_ctx_menu(self, pos):
+    item = self.pod_list.itemAt(pos)
+    if not item:
+      return
+    self.pod_list.setCurrentItem(item)
+    meta = item.data(Qt.UserRole) or {}
+    pod = meta.get("name")
+    ns  = meta.get("namespace") or "default"
+    menu = QMenu(self)
+    menu.addAction(" View Logs", lambda: self._logs_pod(pod, ns))
+    menu.addAction(" Exec Shell", lambda: self._exec_pod(pod, ns))
+    menu.addAction(" Describe",  lambda: self._describe("pod", pod, ns))
+    menu.addSeparator()
+    menu.addAction(" Delete", self._pod_delete)
+    menu.exec_(self.pod_list.viewport().mapToGlobal(pos))
+
+  # ── Deployments ───────────────────────────────────────────
+  def _load_deployments(self):
+    self._run_cmd(f"kubectl get deployments {self._ns_flag()} -o wide 2>&1",
+           self._populate_deployments)
+
+  def _populate_deployments(self, out: str):
+    self.deploy_list.clear()
+    all_ns = (self._current_ns == "(all namespaces)")
+    total = 0
+    ready_count = 0
+    for line in out.strip().splitlines()[1:]:
+      parts = line.split()
+      if all_ns:
+        # `kubectl get deployments --all-namespaces -o wide` prepends
+        # NAMESPACE — without accounting for it, every column below
+        # silently shifts left by one (Name shows the namespace,
+        # Ready shows the name, and so on).
+        if len(parts) < 6:
+          continue
+        ns, name, ready, upd, avail, age = parts[:6]
+        imgs = " | ".join(parts[6:]) if len(parts) > 6 else "-"
+      else:
+        if len(parts) < 5:
+          continue
+        ns = self._current_ns or "default"
+        name, ready, upd, avail, age = parts[:5]
+        imgs = " | ".join(parts[5:]) if len(parts) > 5 else "-"
+      meta = {
+        "namespace": ns, "name": name, "ready": ready,
+        "up_to_date": upd, "available": avail, "age": age, "images": imgs,
+      }
+      item = QListWidgetItem()
+      item.setData(Qt.UserRole, meta)
+      item.setSizeHint(QSize(0, DeploymentCardWidget.CARD_HEIGHT))
+      self.deploy_list.addItem(item)
+      self.deploy_list.setItemWidget(item, DeploymentCardWidget(meta, all_ns))
+      total += 1
+      try:
+        cur, desired = ready.split("/")
+        if cur == desired:
+          ready_count += 1
+      except Exception:
+        pass
+    if total == 0:
+      color_key = "TEXT_MUTED"
+    elif ready_count == total:
+      color_key = "SUCCESS"
+    elif ready_count == 0:
+      color_key = "DANGER"
+    else:
+      color_key = "WARNING"
+    self._set_count_badge(self.deploy_count_lbl, f"{total} deployment{'s' if total != 1 else ''} · {ready_count} ready", color_key)
+    # Same reasoning as _populate_pods: rebuild wipes the visual filter
+    # state even though the filter box still has text — reapply it.
+    self._filter_deployments(self.deploy_filter.text())
+
+  def _on_deploy_click(self, item):
+    meta = item.data(Qt.UserRole) or {}
+    try:
+      _, desired = meta.get("ready", "").split("/")
+      self.scale_spin.setValue(int(desired))
+    except Exception:
+      pass
+
+  def _on_deploy_double_click(self, item):
+    """Double-clicking a deployment card is a shortcut for Describe —
+    reads name/namespace off the card that was actually double-clicked,
+    same reasoning as _on_pod_double_click above."""
+    meta = item.data(Qt.UserRole) or {}
+    self._describe("deployment", meta.get("name"), meta.get("namespace") or "default")
+
+  def _on_deploy_selection_changed(self, current, previous):
+    """Same reasoning as _on_pod_selection_changed above."""
+    if previous is not None:
+      w = self.deploy_list.itemWidget(previous)
+      if w:
+        w.set_selected(False)
+    if current is not None:
+      w = self.deploy_list.itemWidget(current)
+      if w:
+        w.set_selected(True)
+
+  def _filter_deployments(self, text: str):
+    q = text.lower()
+    for i in range(self.deploy_list.count()):
+      item = self.deploy_list.item(i)
+      meta = item.data(Qt.UserRole) or {}
+      item.setHidden(q not in meta.get("name", "").lower())
+
+  def _selected_deploy(self) -> tuple: # (Optional[str], str)
+    item = self.deploy_list.currentItem()
+    if not item:
+      QMessageBox.warning(self, "No selection", "Select a deployment first.")
+      return None, ""
+    meta = item.data(Qt.UserRole) or {}
+    return meta.get("name"), meta.get("namespace") or "default"
+
+  def _deploy_scale(self):
+    dep, ns = self._selected_deploy()
+    if not dep:
+      return
+    replicas = self.scale_spin.value()
+    if QMessageBox.question(self, "Scale", f'Scale "{dep}" to {replicas} replica(s)?',
+                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+      self._run_cmd(f"kubectl scale deployment {dep} -n {ns} --replicas={replicas} 2>&1",
+             lambda o: (self._log(o), self._load_deployments()))
+
+  def _deploy_scale_step(self, delta: int):
+    """Quick +1/-1 scale, applied immediately (no confirmation dialog —
+    this is the fast stepper next to the Replicas spinbox, distinct
+    from the "⇅ Scale" button which jumps straight to whatever number
+    is typed into the spinbox). Keeps the spinbox in sync so both
+    controls always agree on the current target."""
+    dep, ns = self._selected_deploy()
+    if not dep:
+      return
+    replicas = max(self.scale_spin.minimum(),
+            min(self.scale_spin.maximum(), self.scale_spin.value() + delta))
+    self.scale_spin.setValue(replicas)
+    self._run_cmd(f"kubectl scale deployment {dep} -n {ns} --replicas={replicas} 2>&1",
+           lambda o: (self._log(o), self._load_deployments()))
+
+  def _deploy_restart(self):
+    dep, ns = self._selected_deploy()
+    if dep:
+      self._run_cmd(f"kubectl rollout restart deployment/{dep} -n {ns} 2>&1",
+             lambda o: (self._log(o), self._load_deployments()))
+
+  def _deploy_describe(self):
+    dep, ns = self._selected_deploy()
+    if dep:
+      self._describe("deployment", dep, ns)
+
+  def _deploy_delete(self):
+    dep, ns = self._selected_deploy()
+    if not dep:
+      return
+    if QMessageBox.question(self, "Delete Deployment",
+                f'Delete deployment "{dep}"?\nThis will remove all its pods.',
+                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+      self._run_cmd(f"kubectl delete deployment {dep} -n {ns} 2>&1",
+             lambda o: (self._log(o), self._load_deployments()))
+
+  # ── StatefulSets ──────────────────────────────────────────
+  def _load_statefulsets(self):
+    self._run_cmd(f"kubectl get statefulsets {self._ns_flag()} -o wide 2>&1",
+           self._populate_statefulsets)
+
+  def _populate_statefulsets(self, out: str):
+    self.sts_list.clear()
+    all_ns = (self._current_ns == "(all namespaces)")
+    total = 0
+    ready_count = 0
+    for line in out.strip().splitlines()[1:]:
+      parts = line.split()
+      # `kubectl get statefulsets -o wide` columns: NAME READY AGE
+      # CONTAINERS IMAGES (NAMESPACE prepended in --all-namespaces).
+      if all_ns:
+        if len(parts) < 4:
+          continue
+        ns, name, ready, age = parts[:4]
+        imgs = " | ".join(parts[4:]) if len(parts) > 4 else "-"
+      else:
+        if len(parts) < 3:
+          continue
+        ns = self._current_ns or "default"
+        name, ready, age = parts[:3]
+        imgs = " | ".join(parts[3:]) if len(parts) > 3 else "-"
+      meta = {
+        "namespace": ns, "name": name, "ready": ready,
+        "age": age, "images": imgs,
+      }
+      item = QListWidgetItem()
+      item.setData(Qt.UserRole, meta)
+      item.setSizeHint(QSize(0, StatefulSetCardWidget.CARD_HEIGHT))
+      self.sts_list.addItem(item)
+      self.sts_list.setItemWidget(item, StatefulSetCardWidget(meta, all_ns))
+      total += 1
+      try:
+        cur, desired = ready.split("/")
+        if cur == desired:
+          ready_count += 1
+      except Exception:
+        pass
+    if total == 0:
+      color_key = "TEXT_MUTED"
+    elif ready_count == total:
+      color_key = "SUCCESS"
+    elif ready_count == 0:
+      color_key = "DANGER"
+    else:
+      color_key = "WARNING"
+    self._set_count_badge(self.sts_count_lbl, f"{total} statefulset{'s' if total != 1 else ''} · {ready_count} ready", color_key)
+    self._filter_statefulsets(self.sts_filter.text())
+
+  def _on_sts_click(self, item):
+    meta = item.data(Qt.UserRole) or {}
+    try:
+      _, desired = meta.get("ready", "").split("/")
+      self.sts_scale_spin.setValue(int(desired))
+    except Exception:
+      pass
+
+  def _on_sts_double_click(self, item):
+    meta = item.data(Qt.UserRole) or {}
+    self._describe("statefulset", meta.get("name"), meta.get("namespace") or "default")
+
+  def _on_sts_selection_changed(self, current, previous):
+    if previous is not None:
+      w = self.sts_list.itemWidget(previous)
+      if w:
+        w.set_selected(False)
+    if current is not None:
+      w = self.sts_list.itemWidget(current)
+      if w:
+        w.set_selected(True)
+
+  def _filter_statefulsets(self, text: str):
+    q = text.lower()
+    for i in range(self.sts_list.count()):
+      item = self.sts_list.item(i)
+      meta = item.data(Qt.UserRole) or {}
+      item.setHidden(q not in meta.get("name", "").lower())
+
+  def _selected_sts(self) -> tuple: # (Optional[str], str)
+    item = self.sts_list.currentItem()
+    if not item:
+      QMessageBox.warning(self, "No selection", "Select a statefulset first.")
+      return None, ""
+    meta = item.data(Qt.UserRole) or {}
+    return meta.get("name"), meta.get("namespace") or "default"
+
+  def _sts_scale(self):
+    sts, ns = self._selected_sts()
+    if not sts:
+      return
+    replicas = self.sts_scale_spin.value()
+    if QMessageBox.question(self, "Scale", f'Scale "{sts}" to {replicas} replica(s)?',
+                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+      self._run_cmd(f"kubectl scale statefulset {sts} -n {ns} --replicas={replicas} 2>&1",
+             lambda o: (self._log(o), self._load_statefulsets()))
+
+  def _sts_restart(self):
+    sts, ns = self._selected_sts()
+    if sts:
+      self._run_cmd(f"kubectl rollout restart statefulset/{sts} -n {ns} 2>&1",
+             lambda o: (self._log(o), self._load_statefulsets()))
+
+  def _sts_describe(self):
+    sts, ns = self._selected_sts()
+    if sts:
+      self._describe("statefulset", sts, ns)
+
+  def _sts_delete(self):
+    sts, ns = self._selected_sts()
+    if not sts:
+      return
+    if QMessageBox.question(self, "Delete StatefulSet",
+                f'Delete statefulset "{sts}"?\nThis will remove all its pods.',
+                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+      self._run_cmd(f"kubectl delete statefulset {sts} -n {ns} 2>&1",
+             lambda o: (self._log(o), self._load_statefulsets()))
+
+  def _sts_ctx_menu(self, pos):
+    item = self.sts_list.itemAt(pos)
+    if not item:
+      return
+    self.sts_list.setCurrentItem(item)
+    meta = item.data(Qt.UserRole) or {}
+    name = meta.get("name")
+    ns  = meta.get("namespace") or "default"
+    menu = QMenu(self)
+    menu.addAction("↺ Restart", self._sts_restart)
+    menu.addAction(" Describe", lambda: self._describe("statefulset", name, ns))
+    menu.addSeparator()
+    menu.addAction(" Delete", self._sts_delete)
+    menu.exec_(self.sts_list.viewport().mapToGlobal(pos))
+
+  # ── DaemonSets ────────────────────────────────────────────
+  def _load_daemonsets(self):
+    self._run_cmd(f"kubectl get daemonsets {self._ns_flag()} -o wide 2>&1",
+           self._populate_daemonsets)
+
+  def _populate_daemonsets(self, out: str):
+    self.ds_list.clear()
+    all_ns = (self._current_ns == "(all namespaces)")
+    total = 0
+    ready_count = 0
+    for line in out.strip().splitlines()[1:]:
+      parts = line.split()
+      # `kubectl get daemonsets -o wide` columns: NAME DESIRED CURRENT
+      # READY UP-TO-DATE AVAILABLE NODE-SELECTOR AGE CONTAINERS IMAGES
+      # SELECTOR (NAMESPACE prepended in --all-namespaces). NODE-SELECTOR
+      # renders as a single space-free token ("<none>" or a real
+      # selector expression), so straight positional split() still
+      # lines the fixed columns up correctly.
+      if all_ns:
+        if len(parts) < 9:
+          continue
+        ns, name, desired, current, ready, upd, avail, node_sel, age = parts[:9]
+        imgs = " | ".join(parts[9:]) if len(parts) > 9 else "-"
+      else:
+        if len(parts) < 8:
+          continue
+        ns = self._current_ns or "default"
+        name, desired, current, ready, upd, avail, node_sel, age = parts[:8]
+        imgs = " | ".join(parts[8:]) if len(parts) > 8 else "-"
+      meta = {
+        "namespace": ns, "name": name, "desired": desired, "current": current,
+        "ready": ready, "up_to_date": upd, "available": avail,
+        "node_selector": node_sel, "age": age, "images": imgs,
+      }
+      item = QListWidgetItem()
+      item.setData(Qt.UserRole, meta)
+      item.setSizeHint(QSize(0, DaemonSetCardWidget.CARD_HEIGHT))
+      self.ds_list.addItem(item)
+      self.ds_list.setItemWidget(item, DaemonSetCardWidget(meta, all_ns))
+      total += 1
+      if desired == ready or desired == "0":
+        ready_count += 1
+    if total == 0:
+      color_key = "TEXT_MUTED"
+    elif ready_count == total:
+      color_key = "SUCCESS"
+    elif ready_count == 0:
+      color_key = "DANGER"
+    else:
+      color_key = "WARNING"
+    self._set_count_badge(self.ds_count_lbl, f"{total} daemonset{'s' if total != 1 else ''} · {ready_count} ready", color_key)
+    self._filter_daemonsets(self.ds_filter.text())
+
+  def _on_ds_double_click(self, item):
+    meta = item.data(Qt.UserRole) or {}
+    self._describe("daemonset", meta.get("name"), meta.get("namespace") or "default")
+
+  def _on_ds_selection_changed(self, current, previous):
+    if previous is not None:
+      w = self.ds_list.itemWidget(previous)
+      if w:
+        w.set_selected(False)
+    if current is not None:
+      w = self.ds_list.itemWidget(current)
+      if w:
+        w.set_selected(True)
+
+  def _filter_daemonsets(self, text: str):
+    q = text.lower()
+    for i in range(self.ds_list.count()):
+      item = self.ds_list.item(i)
+      meta = item.data(Qt.UserRole) or {}
+      item.setHidden(q not in meta.get("name", "").lower())
+
+  def _selected_ds(self) -> tuple: # (Optional[str], str)
+    item = self.ds_list.currentItem()
+    if not item:
+      QMessageBox.warning(self, "No selection", "Select a daemonset first.")
+      return None, ""
+    meta = item.data(Qt.UserRole) or {}
+    return meta.get("name"), meta.get("namespace") or "default"
+
+  def _ds_restart(self):
+    ds, ns = self._selected_ds()
+    if ds:
+      self._run_cmd(f"kubectl rollout restart daemonset/{ds} -n {ns} 2>&1",
+             lambda o: (self._log(o), self._load_daemonsets()))
+
+  def _ds_describe(self):
+    ds, ns = self._selected_ds()
+    if ds:
+      self._describe("daemonset", ds, ns)
+
+  def _ds_delete(self):
+    ds, ns = self._selected_ds()
+    if not ds:
+      return
+    if QMessageBox.question(self, "Delete DaemonSet",
+                f'Delete daemonset "{ds}"?\nThis will remove it from every node.',
+                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+      self._run_cmd(f"kubectl delete daemonset {ds} -n {ns} 2>&1",
+             lambda o: (self._log(o), self._load_daemonsets()))
+
+  def _ds_ctx_menu(self, pos):
+    item = self.ds_list.itemAt(pos)
+    if not item:
+      return
+    self.ds_list.setCurrentItem(item)
+    meta = item.data(Qt.UserRole) or {}
+    name = meta.get("name")
+    ns  = meta.get("namespace") or "default"
+    menu = QMenu(self)
+    menu.addAction("↺ Restart", self._ds_restart)
+    menu.addAction(" Describe", lambda: self._describe("daemonset", name, ns))
+    menu.addSeparator()
+    menu.addAction(" Delete", self._ds_delete)
+    menu.exec_(self.ds_list.viewport().mapToGlobal(pos))
+
+  # ── HorizontalPodAutoscalers ─────────────────────────────
+  @staticmethod
+  def _hpa_metric_value(d: dict) -> str:
+    """Pull whichever value field a v2 HPA metric target/current dict
+    actually carries — Resource/Pods/Object/External metrics all
+    share this shape but populate different keys of it."""
+    if not d:
+      return "-"
+    if "averageUtilization" in d:
+      return f"{d['averageUtilization']}%"
+    if "averageValue" in d:
+      return str(d["averageValue"])
+    if "value" in d:
+      return str(d["value"])
+    return "-"
+
+  @classmethod
+  def _hpa_metric_key_name(cls, m: dict, side: str):
+    """(type_key, metric_name) for one metric entry — 'side' is
+    'target' (from spec.metrics) or 'current' (from status.currentMetrics).
+    Matching spec vs current entries by (type, name) is how a target %
+    gets paired with its current % below."""
+    mtype = m.get("type", "")
+    key = mtype.lower()
+    sub = m.get(key, {}) or {}
+    name = (sub.get("metric") or {}).get("name") or sub.get("name") or mtype
+    return (key, name), cls._hpa_metric_value(sub.get(side))
+
+  def _load_hpas(self):
+    self._run_cmd(f"kubectl get hpa {self._ns_flag()} -o json 2>&1", self._populate_hpas)
+
+  def _populate_hpas(self, out: str):
+    self.hpa_list.clear()
+    all_ns = (self._current_ns == "(all namespaces)")
+    try:
+      items = json.loads(out).get("items", [])
+    except Exception:
+      items = []
+
+    total = 0
+    healthy_count = 0
+    for it in items:
+      spec  = it.get("spec") or {}
+      status = it.get("status") or {}
+      ref  = spec.get("scaleTargetRef") or {}
+
+      metrics_spec  = spec.get("metrics") or []
+      current_metrics = status.get("currentMetrics") or []
+
+      # autoscaling/v1 HPAs (older clusters) don't have spec.metrics
+      # at all — just a single implicit CPU-utilization target — so
+      # synthesize the same one-entry shape the v2 path below expects.
+      if not metrics_spec and spec.get("targetCPUUtilizationPercentage") is not None:
+        metrics_spec = [{"type": "Resource", "resource": {
+          "name": "cpu", "target": {"averageUtilization": spec["targetCPUUtilizationPercentage"]}}}]
+        cur_cpu = status.get("currentCPUUtilizationPercentage")
+        if cur_cpu is not None:
+          current_metrics = [{"type": "Resource", "resource": {
+            "name": "cpu", "current": {"averageUtilization": cur_cpu}}}]
+
+      current_by_key = {}
+      for m in current_metrics:
+        key, val = self._hpa_metric_key_name(m, "current")
+        current_by_key[key] = val
+
+      metrics = []
+      has_unknown = False
+      for m in metrics_spec:
+        key, target_val = self._hpa_metric_key_name(m, "target")
+        current_val = current_by_key.get(key, "-")
+        if current_val == "-":
+          has_unknown = True
+        metrics.append({"label": key[1], "current": current_val, "target": target_val})
+
+      conditions = status.get("conditions") or []
+      scaling_blocked = any(
+        c.get("status") == "False" and c.get("type") in ("AbleToScale", "ScalingActive")
+        for c in conditions
+      )
+      healthy = not has_unknown and not scaling_blocked
+
+      meta = {
+        "namespace":    (it.get("metadata") or {}).get("namespace", ""),
+        "name":       (it.get("metadata") or {}).get("name", ""),
+        "reference":    f"{ref.get('kind', '')}/{ref.get('name', '')}",
+        "min_replicas":   spec.get("minReplicas", "-"),
+        "max_replicas":   spec.get("maxReplicas", "-"),
+        "current_replicas": status.get("currentReplicas", "-"),
+        "desired_replicas": status.get("desiredReplicas", "-"),
+        "metrics":     metrics,
+        "age":       self._humanize_age((it.get("metadata") or {}).get("creationTimestamp", "")),
+        "healthy":     healthy,
+      }
+      item = QListWidgetItem()
+      item.setData(Qt.UserRole, meta)
+      item.setSizeHint(QSize(0, HPACardWidget.CARD_HEIGHT))
+      self.hpa_list.addItem(item)
+      self.hpa_list.setItemWidget(item, HPACardWidget(meta, all_ns))
+      total += 1
+      if healthy:
+        healthy_count += 1
+
+    if total == 0:
+      color_key = "TEXT_MUTED"
+    elif healthy_count == total:
+      color_key = "SUCCESS"
+    elif healthy_count == 0:
+      color_key = "DANGER"
+    else:
+      color_key = "WARNING"
+    self._set_count_badge(self.hpa_count_lbl, f"{total} autoscaler{'s' if total != 1 else ''} · {healthy_count} healthy", color_key)
+    self._filter_hpas(self.hpa_filter.text())
+
+  def _filter_hpas(self, text: str):
+    q = text.lower()
+    for i in range(self.hpa_list.count()):
+      item = self.hpa_list.item(i)
+      meta = item.data(Qt.UserRole) or {}
+      searchable = f"{meta.get('name', '')} {meta.get('reference', '')}".lower()
+      item.setHidden(q not in searchable)
+
+  def _on_hpa_selection_changed(self, current, previous):
+    if previous is not None:
+      w = self.hpa_list.itemWidget(previous)
+      if w:
+        w.set_selected(False)
+    if current is not None:
+      w = self.hpa_list.itemWidget(current)
+      if w:
+        w.set_selected(True)
+
+  def _on_hpa_double_click(self, item):
+    meta = item.data(Qt.UserRole) or {}
+    self._describe("hpa", meta.get("name"), meta.get("namespace") or "default")
+
+  def _selected_hpa(self) -> tuple: # (Optional[str], str)
+    item = self.hpa_list.currentItem()
+    if not item:
+      QMessageBox.warning(self, "No selection", "Select an autoscaler first.")
+      return None, ""
+    meta = item.data(Qt.UserRole) or {}
+    return meta.get("name"), meta.get("namespace") or "default"
+
+  def _hpa_describe(self):
+    name, ns = self._selected_hpa()
+    if name:
+      self._describe("hpa", name, ns)
+
+  def _hpa_delete(self):
+    name, ns = self._selected_hpa()
+    if not name:
+      return
+    if QMessageBox.question(self, "Delete HPA",
+                f'Delete autoscaler "{name}"?\nThe target workload keeps running at its '
+                f'current replica count, but nothing will scale it automatically anymore.',
+                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+      self._run_cmd(f"kubectl delete hpa {name} -n {ns} 2>&1",
+             lambda o: (self._log(o), self._load_hpas()))
+
+  def _hpa_ctx_menu(self, pos):
+    item = self.hpa_list.itemAt(pos)
+    if not item:
+      return
+    self.hpa_list.setCurrentItem(item)
+    meta = item.data(Qt.UserRole) or {}
+    name = meta.get("name")
+    ns  = meta.get("namespace") or "default"
+    menu = QMenu(self)
+    menu.addAction(" Describe", lambda: self._describe("hpa", name, ns))
+    menu.addSeparator()
+    menu.addAction(" Delete", self._hpa_delete)
+    menu.exec_(self.hpa_list.viewport().mapToGlobal(pos))
+
+  # ── Services ──────────────────────────────────────────────
+  def _load_services(self):
+    self._run_cmd(f"kubectl get services {self._ns_flag()} 2>&1", self._populate_services)
+
+  def _populate_services(self, out: str):
+    self.svc_list.clear()
+    all_ns = (self._current_ns == "(all namespaces)")
+    total = 0
+    for line in out.strip().splitlines()[1:]:
+      parts = line.split()
+      # `kubectl get services --all-namespaces` prepends NAMESPACE —
+      # same shifted-columns reasoning as _populate_pods/_populate_deployments.
+      if all_ns:
+        if len(parts) < 7:
+          continue
+        ns, name, stype, cluster, ext, ports, age = parts[:7]
+      else:
+        if len(parts) < 6:
+          continue
+        ns = self._current_ns or "default"
+        name, stype, cluster, ext, ports, age = parts[:6]
+      meta = {
+        "namespace": ns, "name": name, "type": stype,
+        "cluster_ip": cluster, "external_ip": ext,
+        "ports": ports, "age": age,
+      }
+      item = QListWidgetItem()
+      item.setData(Qt.UserRole, meta)
+      item.setSizeHint(QSize(0, ServiceCardWidget.CARD_HEIGHT))
+      self.svc_list.addItem(item)
+      self.svc_list.setItemWidget(item, ServiceCardWidget(meta, all_ns))
+      total += 1
+    color_key = "TEXT_MUTED" if total == 0 else "INFO"
+    self._set_count_badge(self.svc_count_lbl,
+                f"{total} service{'s' if total != 1 else ''}", color_key)
+    # Same reasoning as _populate_pods: rebuild wipes the visual filter
+    # state even though the filter box still has text — reapply it.
+    self._filter_services(self.svc_filter.text())
+
+  def _filter_services(self, text: str):
+    q = text.lower()
+    for i in range(self.svc_list.count()):
+      item = self.svc_list.item(i)
+      meta = item.data(Qt.UserRole) or {}
+      item.setHidden(q not in meta.get("name", "").lower())
+
+  def _selected_svc(self) -> tuple: # (Optional[str], str)
+    item = self.svc_list.currentItem()
+    if not item:
+      QMessageBox.warning(self, "No selection", "Select a service first.")
+      return None, ""
+    meta = item.data(Qt.UserRole) or {}
+    return meta.get("name"), meta.get("namespace") or "default"
+
+  def _on_svc_double_click(self, item):
+    meta = item.data(Qt.UserRole) or {}
+    self._describe("service", meta.get("name"), meta.get("namespace") or "default")
+
+  def _on_svc_selection_changed(self, current, previous):
+    """Same reasoning as _on_pod_selection_changed above."""
+    if previous is not None:
+      w = self.svc_list.itemWidget(previous)
+      if w:
+        w.set_selected(False)
+    if current is not None:
+      w = self.svc_list.itemWidget(current)
+      if w:
+        w.set_selected(True)
+
+  def _svc_describe(self):
+    svc, ns = self._selected_svc()
+    if svc:
+      self._describe("service", svc, ns)
+
+  def _svc_delete(self):
+    svc, ns = self._selected_svc()
+    if not svc:
+      return
+    if QMessageBox.question(self, "Delete Service", f'Delete service "{svc}"?',
+                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+      self._run_cmd(f"kubectl delete service -n {ns} {svc} 2>&1",
+             lambda o: (self._log(o), self._load_services()))
+
+  def _svc_ctx_menu(self, pos):
+    item = self.svc_list.itemAt(pos)
+    if not item:
+      return
+    self.svc_list.setCurrentItem(item)
+    meta = item.data(Qt.UserRole) or {}
+    svc = meta.get("name")
+    ns  = meta.get("namespace") or "default"
+    menu = QMenu(self)
+    menu.addAction(" Describe", lambda: self._describe("service", svc, ns))
+    menu.addSeparator()
+    menu.addAction(" Delete", self._svc_delete)
+    menu.exec_(self.svc_list.viewport().mapToGlobal(pos))
+
+  # ── Ingress ───────────────────────────────────────────────
+  def _load_ingress(self):
+    self._run_cmd(f"kubectl get ingress {self._ns_flag()} 2>&1", self._populate_ingress)
+
+  def _populate_ingress(self, out: str):
+    self.ing_list.clear()
+    all_ns = (self._current_ns == "(all namespaces)")
+    total = 0
+    for line in out.strip().splitlines()[1:]:
+      parts = line.split()
+      if not parts:
+        continue
+      if all_ns:
+        if len(parts) < 2:
+          continue
+        ns, name = parts[0], parts[1]
+        rest = parts[2:]
+      else:
+        ns = self._current_ns or "default"
+        name = parts[0]
+        rest = parts[1:]
+      cls   = rest[0] if len(rest) > 0 else "-"
+      hosts  = rest[1] if len(rest) > 1 else "-"
+      address = rest[2] if len(rest) > 2 else "-"
+      ports  = rest[3] if len(rest) > 3 else "-"
+      age   = rest[4] if len(rest) > 4 else "-"
+      meta = {
+        "namespace": ns, "name": name, "class": cls, "hosts": hosts,
+        "address": address, "ports": ports, "age": age,
+      }
+      item = QListWidgetItem()
+      item.setData(Qt.UserRole, meta)
+      item.setSizeHint(QSize(0, IngressCardWidget.CARD_HEIGHT))
+      self.ing_list.addItem(item)
+      self.ing_list.setItemWidget(item, IngressCardWidget(meta, all_ns))
+      total += 1
+    color_key = "TEXT_MUTED" if total == 0 else "INFO"
+    self._set_count_badge(self.ing_count_lbl,
+                f"{total} rule{'s' if total != 1 else ''}", color_key)
+    self._filter_ingress(self.ing_filter.text())
+
+  def _filter_ingress(self, text: str):
+    q = text.lower()
+    for i in range(self.ing_list.count()):
+      item = self.ing_list.item(i)
+      meta = item.data(Qt.UserRole) or {}
+      item.setHidden(q not in meta.get("name", "").lower())
+
+  def _selected_ing(self) -> tuple: # (Optional[str], str)
+    item = self.ing_list.currentItem()
+    if not item:
+      QMessageBox.warning(self, "No selection", "Select an ingress first.")
+      return None, ""
+    meta = item.data(Qt.UserRole) or {}
+    return meta.get("name"), meta.get("namespace") or "default"
+
+  def _on_ing_double_click(self, item):
+    meta = item.data(Qt.UserRole) or {}
+    self._describe("ingress", meta.get("name"), meta.get("namespace") or "default")
+
+  def _on_ing_selection_changed(self, current, previous):
+    """Same reasoning as _on_pod_selection_changed above."""
+    if previous is not None:
+      w = self.ing_list.itemWidget(previous)
+      if w:
+        w.set_selected(False)
+    if current is not None:
+      w = self.ing_list.itemWidget(current)
+      if w:
+        w.set_selected(True)
+
+  def _ing_describe(self):
+    ing, ns = self._selected_ing()
+    if ing:
+      self._describe("ingress", ing, ns)
+
+  def _ing_delete(self):
+    ing, ns = self._selected_ing()
+    if not ing:
+      return
+    if QMessageBox.question(self, "Delete Ingress", f'Delete ingress "{ing}"?',
+                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+      self._run_cmd(f"kubectl delete ingress -n {ns} {ing} 2>&1",
+             lambda o: (self._log(o), self._load_ingress()))
+
+  def _ing_ctx_menu(self, pos):
+    item = self.ing_list.itemAt(pos)
+    if not item:
+      return
+    self.ing_list.setCurrentItem(item)
+    meta = item.data(Qt.UserRole) or {}
+    ing = meta.get("name")
+    ns  = meta.get("namespace") or "default"
+    menu = QMenu(self)
+    menu.addAction(" Describe", lambda: self._describe("ingress", ing, ns))
+    menu.addSeparator()
+    menu.addAction(" Delete", self._ing_delete)
+    menu.exec_(self.ing_list.viewport().mapToGlobal(pos))
+
+  # ── Config & Secrets ──────────────────────────────────────
+  def _load_config_resources(self, _=None):
+    rtype = "configmaps" if self._cfg_type == "ConfigMaps" else "secrets"
+    cmd = (
+      f"kubectl get {rtype} {self._ns_flag()} "
+      f"-o jsonpath='{{range .items[*]}}{{.metadata.name}}\n{{end}}' 2>&1"
+    )
+    self._run_cmd(cmd, self._populate_cfg_list)
+
+  def _populate_cfg_list(self, out: str):
+    self.cfg_list.clear()
+    self.cfg_detail.clear()
+    self.cfg_raw.clear()
+    card_type = "configmap" if self._cfg_type == "ConfigMaps" else "secret"
+    for name in out.strip().splitlines():
+      name = name.strip()
+      if not name:
+        continue
+      meta = {"name": name, "type": card_type}
+      item = QListWidgetItem()
+      item.setData(Qt.UserRole, meta)
+      item.setSizeHint(QSize(0, ConfigCardWidget.CARD_HEIGHT))
+      self.cfg_list.addItem(item)
+      self.cfg_list.setItemWidget(item, ConfigCardWidget(meta))
+    # Same reasoning as _populate_pods: reapply whatever's in the
+    # filter box, since the rebuild above doesn't know about it.
+    self._filter_configs(self.cfg_filter.text())
+
+  def _filter_configs(self, text: str):
+    q = text.lower()
+    for i in range(self.cfg_list.count()):
+      item = self.cfg_list.item(i)
+      meta = item.data(Qt.UserRole) or {}
+      item.setHidden(q not in meta.get("name", "").lower())
+
+  def _on_cfg_selection_changed(self, current, previous):
+    """Same card-selection forwarding as pods/deployments — the card
+    widget owns its own selected-state paint, so the list has to tell
+    it explicitly (see k8s_cards.py's _CardBase docstring)."""
+    if previous is not None:
+      w = self.cfg_list.itemWidget(previous)
+      if w:
+        w.set_selected(False)
+    if current is None:
+      return
+    w = self.cfg_list.itemWidget(current)
+    if w:
+      w.set_selected(True)
+    meta = current.data(Qt.UserRole) or {}
+    name = meta.get("name", "")
+    rtype = meta.get("type", "configmap")
+    ns  = self._current_ns if self._current_ns != "(all namespaces)" else "default"
+    self._run_cmd(f"kubectl get {rtype} {name} -n {ns} -o json 2>&1",
+           lambda o: self._show_cfg_detail(o, rtype))
+
+  def _pretty_cfg_value(self, val) -> str:
+    """Re-indent a ConfigMap/Secret value for display.
+
+    Values are often themselves a JSON document embedded as a string
+    (e.g. a 'config.json' key). kubectl's default '-o yaml' renders any
+    string containing real newlines as a double-quoted flow scalar —
+    literal '\\n' escapes, long lines wrapped with a trailing
+    backslash — which is unreadable for exactly this case. We already
+    have the value un-escaped (real newlines) from '-o json', so if it
+    parses as JSON we re-emit it with consistent 2-space indentation;
+    otherwise it's shown as-is with its real line breaks intact.
+    """
+    text = str(val)
+    stripped = text.strip()
+    if stripped[:1] in "{[":
+      try:
+        parsed = json.loads(stripped)
+        return json.dumps(parsed, indent=2)
+      except Exception:
+        pass
+    return text
+
+  def _show_cfg_detail(self, out: str, rtype: str):
+    self.cfg_detail.clear()
+    self.cfg_raw.clear()
+    try:
+      obj = json.loads(out)
+    except Exception:
+      QTreeWidgetItem(self.cfg_detail, ["(parse error)", out[:200]])
+      self.cfg_raw.setPlainText(out)
+      return
+
+    data = obj.get("data") or obj.get("stringData") or {}
+    decoded = {}
+    for key, val in data.items():
+      if rtype == "secret":
+        import base64
         try:
-            obj = json.loads(out)
+          val = base64.b64decode(val).decode(errors="replace")
         except Exception:
-            QTreeWidgetItem(self.cfg_detail, ["(parse error)", out[:200]])
-            self.cfg_raw.setPlainText(out)
-            return
+          val = "(binary)"
+      decoded[key] = val
 
-        data = obj.get("data") or obj.get("stringData") or {}
-        decoded = {}
-        for key, val in data.items():
-            if rtype == "secret":
-                import base64
-                try:
-                    val = base64.b64decode(val).decode(errors="replace")
-                except Exception:
-                    val = "(binary)"
-            decoded[key] = val
+    # ── Tree: one row per key, single-line preview (real newlines
+    # would otherwise render oddly/collapse inside a tree cell) ──
+    for key, val in decoded.items():
+      preview = str(val).replace("\n", " ⏎ ").strip()
+      if len(preview) > 200:
+        preview = preview[:200] + " …"
+      vi = QTreeWidgetItem([key, preview])
+      vi.setFont(0, monospace_font(11))
+      vi.setFont(1, monospace_font(10))
+      self.cfg_detail.addTopLevelItem(vi)
 
-        # ── Tree: one row per key, single-line preview (real newlines
-        # would otherwise render oddly/collapse inside a tree cell) ──
-        for key, val in decoded.items():
-            preview = str(val).replace("\n", " ⏎ ").strip()
-            if len(preview) > 200:
-                preview = preview[:200] + " …"
-            vi = QTreeWidgetItem([key, preview])
-            vi.setFont(0, monospace_font(11))
-            vi.setFont(1, monospace_font(10))
-            self.cfg_detail.addTopLevelItem(vi)
+    # ── Structured view: metadata + each key's full content, pretty
+    # printed instead of kubectl's escaped/wrapped YAML flow scalar.
+    meta = obj.get("metadata", {}) or {}
+    lines = [
+      f"apiVersion: {obj.get('apiVersion', 'v1')}",
+      f"kind: {obj.get('kind', rtype.capitalize())}",
+      f"name: {meta.get('name', '')}",
+      f"namespace: {meta.get('namespace', '')}",
+      "",
+    ]
+    for key, val in decoded.items():
+      lines.append(f"{key}:")
+      pretty = self._pretty_cfg_value(val)
+      for pline in (pretty.splitlines() or [""]):
+        lines.append(f" {pline}")
+      lines.append("")
+    self.cfg_raw.setPlainText("\n".join(lines).rstrip() + "\n")
 
-        # ── Structured view: metadata + each key's full content, pretty
-        # printed instead of kubectl's escaped/wrapped YAML flow scalar.
-        meta = obj.get("metadata", {}) or {}
-        lines = [
-            f"apiVersion: {obj.get('apiVersion', 'v1')}",
-            f"kind: {obj.get('kind', rtype.capitalize())}",
-            f"name: {meta.get('name', '')}",
-            f"namespace: {meta.get('namespace', '')}",
-            "",
-        ]
-        for key, val in decoded.items():
-            lines.append(f"{key}:")
-            pretty = self._pretty_cfg_value(val)
-            for pline in (pretty.splitlines() or [""]):
-                lines.append(f"  {pline}")
-            lines.append("")
-        self.cfg_raw.setPlainText("\n".join(lines).rstrip() + "\n")
+  # ── Events ────────────────────────────────────────────────
+  @staticmethod
+  def _humanize_age(iso_ts: str) -> str:
+    """Compact kubectl-style age ('45s' / '12m' / '3h' / '5d' / '2y')
+    from a Kubernetes ISO-8601 UTC timestamp. Events come from '-o json'
+    rather than a pre-formatted AGE column (unlike every other tab
+    here), so this has to be computed client-side."""
+    if not iso_ts:
+      return "-"
+    try:
+      ts = datetime.strptime(iso_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+      return "-"
+    secs = max(0, int((datetime.now(timezone.utc) - ts).total_seconds()))
+    if secs < 60:
+      return f"{secs}s"
+    mins = secs // 60
+    if mins < 60:
+      return f"{mins}m"
+    hours = mins // 60
+    if hours < 24:
+      return f"{hours}h"
+    days = hours // 24
+    if days < 365:
+      return f"{days}d"
+    return f"{days // 365}y"
 
-    # ── Events ────────────────────────────────────────────────
-    @staticmethod
-    def _humanize_age(iso_ts: str) -> str:
-        """Compact kubectl-style age ('45s' / '12m' / '3h' / '5d' / '2y')
-        from a Kubernetes ISO-8601 UTC timestamp. Events come from '-o json'
-        rather than a pre-formatted AGE column (unlike every other tab
-        here), so this has to be computed client-side."""
-        if not iso_ts:
-            return "-"
-        try:
-            ts = datetime.strptime(iso_ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        except Exception:
-            return "-"
-        secs = max(0, int((datetime.now(timezone.utc) - ts).total_seconds()))
-        if secs < 60:
-            return f"{secs}s"
-        mins = secs // 60
-        if mins < 60:
-            return f"{mins}m"
-        hours = mins // 60
-        if hours < 24:
-            return f"{hours}h"
-        days = hours // 24
-        if days < 365:
-            return f"{days}d"
-        return f"{days // 365}y"
+  def _load_events(self):
+    self._run_cmd(f"kubectl get events {self._ns_flag()} -o json 2>&1", self._on_events_loaded)
 
-    def _load_events(self):
-        self._run_cmd(f"kubectl get events {self._ns_flag()} -o json 2>&1", self._on_events_loaded)
+  def _on_events_loaded(self, out: str):
+    # Cached so the "Warnings only" toggle can re-filter instantly
+    # without an extra SSH round-trip.
+    self._events_raw = out
+    self._populate_events(out)
 
-    def _on_events_loaded(self, out: str):
-        # Cached so the "Warnings only" toggle can re-filter instantly
-        # without an extra SSH round-trip.
-        self._events_raw = out
-        self._populate_events(out)
+  def _populate_events(self, out: str):
+    self.event_list.clear()
+    all_ns = (self._current_ns == "(all namespaces)")
+    try:
+      items = json.loads(out).get("items", [])
+    except Exception:
+      items = []
 
-    def _populate_events(self, out: str):
-        self.event_list.clear()
-        all_ns = (self._current_ns == "(all namespaces)")
-        try:
-            items = json.loads(out).get("items", [])
-        except Exception:
-            items = []
+    def sort_key(it):
+      return (it.get("lastTimestamp") or it.get("eventTime")
+          or (it.get("metadata") or {}).get("creationTimestamp") or "")
 
-        def sort_key(it):
-            return (it.get("lastTimestamp") or it.get("eventTime")
-                    or (it.get("metadata") or {}).get("creationTimestamp") or "")
+    items.sort(key=sort_key, reverse=True)
 
-        items.sort(key=sort_key, reverse=True)
+    warnings_only = getattr(self, "_events_warnings_only", False)
+    total = 0
+    warning_count = 0
+    for it in items:
+      etype = it.get("type") or "Normal"
+      if warnings_only and etype != "Warning":
+        continue
+      involved = it.get("involvedObject") or {}
+      ts = sort_key(it)
+      meta = {
+        "namespace":  (it.get("metadata") or {}).get("namespace", ""),
+        "type":    etype,
+        "reason":   it.get("reason", "") or "-",
+        "message":   it.get("message", "") or "",
+        "count":    it.get("count") or 1,
+        "object_kind": involved.get("kind", ""),
+        "object_name": involved.get("name", ""),
+        "age":     self._humanize_age(ts),
+      }
+      item = QListWidgetItem()
+      item.setData(Qt.UserRole, meta)
+      item.setSizeHint(QSize(0, EventCardWidget.CARD_HEIGHT))
+      self.event_list.addItem(item)
+      self.event_list.setItemWidget(item, EventCardWidget(meta, all_ns))
+      total += 1
+      if etype == "Warning":
+        warning_count += 1
 
-        warnings_only = getattr(self, "_events_warnings_only", False)
-        total = 0
-        warning_count = 0
-        for it in items:
-            etype = it.get("type") or "Normal"
-            if warnings_only and etype != "Warning":
-                continue
-            involved = it.get("involvedObject") or {}
-            ts = sort_key(it)
-            meta = {
-                "namespace":   (it.get("metadata") or {}).get("namespace", ""),
-                "type":        etype,
-                "reason":      it.get("reason", "") or "-",
-                "message":     it.get("message", "") or "",
-                "count":       it.get("count") or 1,
-                "object_kind": involved.get("kind", ""),
-                "object_name": involved.get("name", ""),
-                "age":         self._humanize_age(ts),
-            }
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, meta)
-            item.setSizeHint(QSize(0, EventCardWidget.CARD_HEIGHT))
-            self.event_list.addItem(item)
-            self.event_list.setItemWidget(item, EventCardWidget(meta, all_ns))
-            total += 1
-            if etype == "Warning":
-                warning_count += 1
+    if total == 0:
+      color_key = "TEXT_MUTED"
+    elif warning_count == 0:
+      color_key = "SUCCESS"
+    else:
+      color_key = "DANGER"
+    self._set_count_badge(
+      self.event_count_lbl,
+      f"{total} event{'s' if total != 1 else ''} · {warning_count} warning{'s' if warning_count != 1 else ''}",
+      color_key,
+    )
+    self._filter_events(self.event_filter.text())
 
-        if total == 0:
-            color_key = "TEXT_MUTED"
-        elif warning_count == 0:
-            color_key = "SUCCESS"
-        else:
-            color_key = "DANGER"
-        self._set_count_badge(
-            self.event_count_lbl,
-            f"{total} event{'s' if total != 1 else ''} · {warning_count} warning{'s' if warning_count != 1 else ''}",
-            color_key,
+  def _toggle_events_warnings_only(self, on: bool):
+    self._events_warnings_only = on
+    if getattr(self, "_events_raw", None):
+      self._populate_events(self._events_raw)
+    else:
+      self._load_events()
+
+  def _filter_events(self, text: str):
+    q = text.lower()
+    for i in range(self.event_list.count()):
+      item = self.event_list.item(i)
+      meta = item.data(Qt.UserRole) or {}
+      searchable = (
+        f"{meta.get('reason', '')} {meta.get('object_kind', '')} "
+        f"{meta.get('object_name', '')} {meta.get('message', '')}"
+      ).lower()
+      item.setHidden(q not in searchable)
+
+  def _on_event_selection_changed(self, current, previous):
+    if previous is not None:
+      w = self.event_list.itemWidget(previous)
+      if w:
+        w.set_selected(False)
+    if current is not None:
+      w = self.event_list.itemWidget(current)
+      if w:
+        w.set_selected(True)
+
+  def _event_involved_object(self, meta: dict):
+    """Returns (kubectl_kind, name, namespace) for the object an event
+    is about, or (None, None, None) if the event didn't carry one."""
+    kind = (meta.get("object_kind") or "").lower()
+    name = meta.get("object_name")
+    if not kind or not name:
+      return None, None, None
+    ns = meta.get("namespace") or (
+      self._current_ns if self._current_ns != "(all namespaces)" else "default"
+    )
+    return kind, name, ns
+
+  def _on_event_double_click(self, item):
+    meta = item.data(Qt.UserRole) or {}
+    kind, name, ns = self._event_involved_object(meta)
+    if kind:
+      self._describe(kind, name, ns)
+
+  def _event_ctx_menu(self, pos):
+    item = self.event_list.itemAt(pos)
+    if not item:
+      return
+    self.event_list.setCurrentItem(item)
+    meta = item.data(Qt.UserRole) or {}
+    kind, name, ns = self._event_involved_object(meta)
+    menu = QMenu(self)
+    if kind:
+      menu.addAction(f" Describe {meta.get('object_kind')}/{name}",
+              lambda: self._describe(kind, name, ns))
+      menu.addSeparator()
+    menu.addAction(" Copy Message",
+            lambda: QApplication.clipboard().setText(meta.get("message", "")))
+    menu.exec_(self.event_list.viewport().mapToGlobal(pos))
+
+  # ── Describe helper ───────────────────────────────────────
+  def _describe(self, kind: str, name: str, ns: str):
+    self._describe_title = f"describe {kind}/{name}"
+    self._run_cmd(f"kubectl describe {kind} {name} -n {ns} 2>&1",
+           self._show_describe_dialog)
+
+  def _show_describe_dialog(self, out: str):
+    dlg = QDialog(self)
+    dlg.setWindowTitle(getattr(self, "_describe_title", "Describe"))
+    dlg.resize(900, 620)
+    apply_qss_to(dlg)
+    lay = _QVL(dlg)
+    te = QTextEdit()
+    te.setReadOnly(True)
+    te.setFont(monospace_font(11))
+    te.setPlainText(out)
+    lay.addWidget(te)
+    bb = QDialogButtonBox(QDialogButtonBox.Close)
+    bb.rejected.connect(dlg.reject)
+    lay.addWidget(bb)
+    dlg.exec_()
+
+  # ── Terminal output helpers ───────────────────────────────
+  @staticmethod
+  def _esc(text: str) -> str:
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+          .replace(">", "&gt;"))
+
+  def _append_html(self, html: str):
+    """Append raw HTML (e.g. the colored '$ cmd' line)."""
+    append_terminal_html(self.k8s_terminal, html)
+
+  def _append_pre(self, text: str):
+    """Append plain command output, preserving whitespace so columns don't zigzag."""
+    append_terminal_text(self.k8s_terminal, text)
+
+  # ── Terminal tab ──────────────────────────────────────────
+  def _run_kubectl(self):
+    cmd = self.kubectl_inp.text().strip()
+    if not cmd:
+      return
+    if not cmd.startswith("kubectl"):
+      cmd = "kubectl " + cmd
+    self.kubectl_inp.clear()
+    self._run_cmd(cmd + " 2>&1",
+           lambda o: (self._log(o), self.sub_tabs.setCurrentIndex(5)))
+
+  def _run_kubectl_terminal(self):
+    cmd = self.k8s_inp.text().strip()
+    if not cmd:
+      return
+    if not cmd.startswith("kubectl"):
+      cmd = "kubectl " + cmd
+    self._append_html(f"\n<span style='color:{T['ACCENT2']}'>$ {self._esc(cmd)}</span>")
+    self._run_cmd(cmd + " 2>&1", lambda o: self._append_pre(o))
+    self.k8s_inp.clear()
+
+  # ── Port tunnels ──────────────────────────────────────────
+  # ── Status-column glyphs ───────────────────────────────────
+  STATUS_UNKNOWN = ""
+  STATUS_UP   = ""
+  STATUS_DOWN  = ""
+
+  # Per-item data role storing the last-known exposed state (True/False),
+  # or None before the first status check completes. Read by
+  # _filter_tunnel_services() to apply the Active/Inactive toggle.
+  TUNNEL_STATUS_ROLE = Qt.UserRole + 1
+
+  def _format_tunnel_label(self, svc: dict, glyph: str) -> str:
+    max_name, max_ns = self._tunnel_col_widths
+    return (
+      f"{glyph} "
+      f"{svc['name']:<{max_name}}"
+      f"{'ns/' + svc['namespace']:<{max_ns}}"
+      f" : {svc['container_port']}"
+      f" → {svc['port']}"
+    )
+
+  def _open_manage_tunnel_services(self):
+    """Open the card-based dialog for adding/editing/removing tunnel
+    services on the connected VM's CSV. Reloads the checklist from the
+    VM afterwards so it reflects whatever was actually saved (rather
+    than just trusting the dialog's in-memory copy)."""
+    if not self.ssh:
+      QMessageBox.information(
+        self, "Not connected",
+        "Connect to a VM first to manage its tunnel services."
+      )
+      return
+    dlg = ManageTunnelServicesDialog(
+      self.ssh, self._tunnel_services, self._tunnel_csv_path,
+      namespaces=self._namespaces, parent=self,
+    )
+    dlg.services_saved.connect(lambda _: self._load_tunnel_csv())
+    dlg.exec_()
+
+  def _change_tunnel_csv_path(self):
+    """Let the user point the Tunnels tab at a different remote CSV
+    (e.g. their own file instead of the shared team default), and
+    remember the choice across restarts."""
+    path, ok = QInputDialog.getText(
+      self, "Change Tunnel Services File",
+      "Remote CSV path (on the connected VM):",
+      QLineEdit.Normal, self._tunnel_csv_path,
+    )
+    if not ok:
+      return
+    path = path.strip()
+    if not path or path == self._tunnel_csv_path:
+      return
+    self._tunnel_csv_path = path
+    self.tunnel_path_lbl.setText(f" {self._tunnel_csv_path} (on VM)")
+    save_settings(tunnel_csv_path=self._tunnel_csv_path)
+    if self.ssh:
+      self._load_tunnel_csv()
+
+  def _load_tunnel_csv(self):
+    """Load tunnel services from the currently connected VM."""
+
+    self.tunnel_list.blockSignals(True)
+    self.tunnel_list.clear()
+    self._tunnel_services = []
+
+    # No VM connected
+    if not self.ssh:
+      self.tunnel_cmd_preview.clear()
+      self.tunnel_list.blockSignals(False)
+      return
+
+    # Load services from the connected VM
+    self._tunnel_services = load_tunnel_services(
+      self.ssh,
+      self._tunnel_csv_path
+    )
+
+    if not self._tunnel_services:
+      item = QListWidgetItem("(No tunnel services found on the connected VM)")
+      item.setFlags(Qt.NoItemFlags)
+      item.setForeground(QColor(T["TEXT_MUTED"]))
+      self.tunnel_list.addItem(item)
+    else:
+      # Use the system's fixed-width font
+      font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+      font.setPointSize(10)
+
+      # Determine column widths (shared with _refresh_tunnel_status
+      # so updating the status glyph later doesn't reflow anything)
+      max_name = max(len(svc["name"]) for svc in self._tunnel_services) + 4
+      max_ns = max(len(f"ns/{svc['namespace']}") for svc in self._tunnel_services) + 4
+      self._tunnel_col_widths = (max_name, max_ns)
+
+      for svc in self._tunnel_services:
+        label = self._format_tunnel_label(svc, self.STATUS_UNKNOWN)
+
+        item = QListWidgetItem(label)
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Unchecked)
+        item.setData(Qt.UserRole, svc)
+        item.setData(self.TUNNEL_STATUS_ROLE, None)
+        item.setFont(font)
+        item.setForeground(QColor(T["TEXT_MUTED"]))
+        item.setToolTip("Checking whether this port is exposed on the VM…")
+
+        self.tunnel_list.addItem(item)
+
+    self.tunnel_list.blockSignals(False)
+    self._update_tunnel_cmd_preview()
+    self._filter_tunnel_services()
+    self._refresh_tunnel_status()
+
+  def _refresh_tunnel_status(self):
+    """Check, in a single SSH round-trip, which configured local ports
+    are currently listening on the VM — i.e. whether each service's
+    'kubectl port-forward' is actually up right now — and update the
+    checklist with a / status glyph per row."""
+    if not self.ssh or not self._tunnel_services:
+      return
+    cmd = "ss -ltn 2>/dev/null | awk 'NR>1{print $4}'"
+    self._run_cmd(cmd, self._on_tunnel_status_result)
+
+  def _on_tunnel_status_result(self, out: str):
+    listening_ports = set()
+    for line in out.splitlines():
+      line = line.strip()
+      if not line or ":" not in line:
+        continue
+      port_s = line.rsplit(":", 1)[-1]
+      if port_s.isdigit():
+        listening_ports.add(int(port_s))
+
+    for i in range(self.tunnel_list.count()):
+      item = self.tunnel_list.item(i)
+      svc = item.data(Qt.UserRole)
+      if not svc:
+        continue
+      exposed = svc["port"] in listening_ports
+      glyph  = self.STATUS_UP if exposed else self.STATUS_DOWN
+      item.setText(self._format_tunnel_label(svc, glyph))
+      item.setData(self.TUNNEL_STATUS_ROLE, exposed)
+      item.setForeground(QColor(T["SUCCESS"] if exposed else T["DANGER"]))
+      item.setToolTip(
+        "Port {} is {} on the VM.".format(
+          svc["port"], "listening (exposed)" if exposed else "NOT listening"
         )
-        self._filter_events(self.event_filter.text())
-
-    def _toggle_events_warnings_only(self, on: bool):
-        self._events_warnings_only = on
-        if getattr(self, "_events_raw", None):
-            self._populate_events(self._events_raw)
-        else:
-            self._load_events()
-
-    def _filter_events(self, text: str):
-        q = text.lower()
-        for i in range(self.event_list.count()):
-            item = self.event_list.item(i)
-            meta = item.data(Qt.UserRole) or {}
-            searchable = (
-                f"{meta.get('reason', '')} {meta.get('object_kind', '')} "
-                f"{meta.get('object_name', '')} {meta.get('message', '')}"
-            ).lower()
-            item.setHidden(q not in searchable)
-
-    def _on_event_selection_changed(self, current, previous):
-        if previous is not None:
-            w = self.event_list.itemWidget(previous)
-            if w:
-                w.set_selected(False)
-        if current is not None:
-            w = self.event_list.itemWidget(current)
-            if w:
-                w.set_selected(True)
-
-    def _event_involved_object(self, meta: dict):
-        """Returns (kubectl_kind, name, namespace) for the object an event
-        is about, or (None, None, None) if the event didn't carry one."""
-        kind = (meta.get("object_kind") or "").lower()
-        name = meta.get("object_name")
-        if not kind or not name:
-            return None, None, None
-        ns = meta.get("namespace") or (
-            self._current_ns if self._current_ns != "(all namespaces)" else "default"
-        )
-        return kind, name, ns
-
-    def _on_event_double_click(self, item):
-        meta = item.data(Qt.UserRole) or {}
-        kind, name, ns = self._event_involved_object(meta)
-        if kind:
-            self._describe(kind, name, ns)
-
-    def _event_ctx_menu(self, pos):
-        item = self.event_list.itemAt(pos)
-        if not item:
-            return
-        self.event_list.setCurrentItem(item)
-        meta = item.data(Qt.UserRole) or {}
-        kind, name, ns = self._event_involved_object(meta)
-        menu = QMenu(self)
-        if kind:
-            menu.addAction(f"📄  Describe {meta.get('object_kind')}/{name}",
-                           lambda: self._describe(kind, name, ns))
-            menu.addSeparator()
-        menu.addAction("📋  Copy Message",
-                       lambda: QApplication.clipboard().setText(meta.get("message", "")))
-        menu.exec_(self.event_list.viewport().mapToGlobal(pos))
-
-    # ── Describe helper ───────────────────────────────────────
-    def _describe(self, kind: str, name: str, ns: str):
-        self._describe_title = f"describe {kind}/{name}"
-        self._run_cmd(f"kubectl describe {kind} {name} -n {ns} 2>&1",
-                      self._show_describe_dialog)
-
-    def _show_describe_dialog(self, out: str):
-        dlg = QDialog(self)
-        dlg.setWindowTitle(getattr(self, "_describe_title", "Describe"))
-        dlg.resize(900, 620)
-        apply_qss_to(dlg)
-        lay = _QVL(dlg)
-        te  = QTextEdit()
-        te.setReadOnly(True)
-        te.setFont(monospace_font(11))
-        te.setPlainText(out)
-        lay.addWidget(te)
-        bb = QDialogButtonBox(QDialogButtonBox.Close)
-        bb.rejected.connect(dlg.reject)
-        lay.addWidget(bb)
-        dlg.exec_()
-
-    # ── Terminal output helpers ───────────────────────────────
-    @staticmethod
-    def _esc(text: str) -> str:
-        return (text.replace("&", "&amp;").replace("<", "&lt;")
-                    .replace(">", "&gt;"))
-
-    def _append_html(self, html: str):
-        """Append raw HTML (e.g. the colored '$ cmd' line)."""
-        append_terminal_html(self.k8s_terminal, html)
-
-    def _append_pre(self, text: str):
-        """Append plain command output, preserving whitespace so columns don't zigzag."""
-        append_terminal_text(self.k8s_terminal, text)
-
-    # ── Terminal tab ──────────────────────────────────────────
-    def _run_kubectl(self):
-        cmd = self.kubectl_inp.text().strip()
-        if not cmd:
-            return
-        if not cmd.startswith("kubectl"):
-            cmd = "kubectl " + cmd
-        self.kubectl_inp.clear()
-        self._run_cmd(cmd + " 2>&1",
-                      lambda o: (self._log(o), self.sub_tabs.setCurrentIndex(5)))
-
-    def _run_kubectl_terminal(self):
-        cmd = self.k8s_inp.text().strip()
-        if not cmd:
-            return
-        if not cmd.startswith("kubectl"):
-            cmd = "kubectl " + cmd
-        self._append_html(f"\n<span style='color:{T['ACCENT2']}'>$ {self._esc(cmd)}</span>")
-        self._run_cmd(cmd + " 2>&1", lambda o: self._append_pre(o))
-        self.k8s_inp.clear()
-
-    # ── Port tunnels ──────────────────────────────────────────
-    # ── Status-column glyphs ───────────────────────────────────
-    STATUS_UNKNOWN = "⚪"
-    STATUS_UP      = "🟢"
-    STATUS_DOWN    = "🔴"
-
-    # Per-item data role storing the last-known exposed state (True/False),
-    # or None before the first status check completes. Read by
-    # _filter_tunnel_services() to apply the Active/Inactive toggle.
-    TUNNEL_STATUS_ROLE = Qt.UserRole + 1
-
-    def _format_tunnel_label(self, svc: dict, glyph: str) -> str:
-        max_name, max_ns = self._tunnel_col_widths
-        return (
-            f"{glyph}  "
-            f"{svc['name']:<{max_name}}"
-            f"{'ns/' + svc['namespace']:<{max_ns}}"
-            f" : {svc['container_port']}"
-            f" → {svc['port']}"
-        )
-
-    def _open_manage_tunnel_services(self):
-        """Open the card-based dialog for adding/editing/removing tunnel
-        services on the connected VM's CSV. Reloads the checklist from the
-        VM afterwards so it reflects whatever was actually saved (rather
-        than just trusting the dialog's in-memory copy)."""
-        if not self.ssh:
-            QMessageBox.information(
-                self, "Not connected",
-                "Connect to a VM first to manage its tunnel services."
-            )
-            return
-        dlg = ManageTunnelServicesDialog(
-            self.ssh, self._tunnel_services, self._tunnel_csv_path,
-            namespaces=self._namespaces, parent=self,
-        )
-        dlg.services_saved.connect(lambda _: self._load_tunnel_csv())
-        dlg.exec_()
-
-    def _change_tunnel_csv_path(self):
-        """Let the user point the Tunnels tab at a different remote CSV
-        (e.g. their own file instead of the shared team default), and
-        remember the choice across restarts."""
-        path, ok = QInputDialog.getText(
-            self, "Change Tunnel Services File",
-            "Remote CSV path (on the connected VM):",
-            QLineEdit.Normal, self._tunnel_csv_path,
-        )
-        if not ok:
-            return
-        path = path.strip()
-        if not path or path == self._tunnel_csv_path:
-            return
-        self._tunnel_csv_path = path
-        self.tunnel_path_lbl.setText(f"📄  {self._tunnel_csv_path}  (on VM)")
-        save_settings(tunnel_csv_path=self._tunnel_csv_path)
-        if self.ssh:
-            self._load_tunnel_csv()
-
-    def _load_tunnel_csv(self):
-        """Load tunnel services from the currently connected VM."""
-
-        self.tunnel_list.blockSignals(True)
-        self.tunnel_list.clear()
-        self._tunnel_services = []
-
-        # No VM connected
-        if not self.ssh:
-            self.tunnel_cmd_preview.clear()
-            self.tunnel_list.blockSignals(False)
-            return
-
-        # Load services from the connected VM
-        self._tunnel_services = load_tunnel_services(
-            self.ssh,
-            self._tunnel_csv_path
-        )
-
-        if not self._tunnel_services:
-            item = QListWidgetItem("(No tunnel services found on the connected VM)")
-            item.setFlags(Qt.NoItemFlags)
-            item.setForeground(QColor(T["TEXT_MUTED"]))
-            self.tunnel_list.addItem(item)
-        else:
-            # Use the system's fixed-width font
-            font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
-            font.setPointSize(10)
-
-            # Determine column widths (shared with _refresh_tunnel_status
-            # so updating the status glyph later doesn't reflow anything)
-            max_name = max(len(svc["name"]) for svc in self._tunnel_services) + 4
-            max_ns = max(len(f"ns/{svc['namespace']}") for svc in self._tunnel_services) + 4
-            self._tunnel_col_widths = (max_name, max_ns)
-
-            for svc in self._tunnel_services:
-                label = self._format_tunnel_label(svc, self.STATUS_UNKNOWN)
-
-                item = QListWidgetItem(label)
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Unchecked)
-                item.setData(Qt.UserRole, svc)
-                item.setData(self.TUNNEL_STATUS_ROLE, None)
-                item.setFont(font)
-                item.setForeground(QColor(T["TEXT_MUTED"]))
-                item.setToolTip("Checking whether this port is exposed on the VM…")
-
-                self.tunnel_list.addItem(item)
-
-        self.tunnel_list.blockSignals(False)
-        self._update_tunnel_cmd_preview()
-        self._filter_tunnel_services()
-        self._refresh_tunnel_status()
-
-    def _refresh_tunnel_status(self):
-        """Check, in a single SSH round-trip, which configured local ports
-        are currently listening on the VM — i.e. whether each service's
-        'kubectl port-forward' is actually up right now — and update the
-        checklist with a 🟢/🔴 status glyph per row."""
-        if not self.ssh or not self._tunnel_services:
-            return
-        cmd = "ss -ltn 2>/dev/null | awk 'NR>1{print $4}'"
-        self._run_cmd(cmd, self._on_tunnel_status_result)
-
-    def _on_tunnel_status_result(self, out: str):
-        listening_ports = set()
-        for line in out.splitlines():
-            line = line.strip()
-            if not line or ":" not in line:
-                continue
-            port_s = line.rsplit(":", 1)[-1]
-            if port_s.isdigit():
-                listening_ports.add(int(port_s))
-
-        for i in range(self.tunnel_list.count()):
-            item = self.tunnel_list.item(i)
-            svc = item.data(Qt.UserRole)
-            if not svc:
-                continue
-            exposed = svc["port"] in listening_ports
-            glyph   = self.STATUS_UP if exposed else self.STATUS_DOWN
-            item.setText(self._format_tunnel_label(svc, glyph))
-            item.setData(self.TUNNEL_STATUS_ROLE, exposed)
-            item.setForeground(QColor(T["SUCCESS"] if exposed else T["DANGER"]))
-            item.setToolTip(
-                "Port {} is {} on the VM.".format(
-                    svc["port"], "listening (exposed)" if exposed else "NOT listening"
-                )
-            )
-
-        # Statuses just changed — re-apply the Active/Inactive toggle (and
-        # the text search) now that they're known, rather than waiting for
-        # the user to touch the search box again.
-        self._filter_tunnel_services()
-
-    def _set_all_tunnel_checks(self, checked: bool):
-        """Check/uncheck every currently VISIBLE row — i.e. respects
-        whatever the search box and Active/Inactive toggle are currently
-        hiding, rather than reaching through the filter to rows the user
-        can't see."""
-        state = Qt.Checked if checked else Qt.Unchecked
-        self.tunnel_list.blockSignals(True)
-        for i in range(self.tunnel_list.count()):
-            item = self.tunnel_list.item(i)
-            if item.isHidden():
-                continue
-            if item.flags() & Qt.ItemIsUserCheckable:
-                item.setCheckState(state)
-        self.tunnel_list.blockSignals(False)
-        self._update_tunnel_cmd_preview()
-
-    def _selected_tunnel_services(self) -> list:
-        selected = []
-        for i in range(self.tunnel_list.count()):
-            item = self.tunnel_list.item(i)
-            if (item.flags() & Qt.ItemIsUserCheckable) and item.checkState() == Qt.Checked:
-                selected.append(item.data(Qt.UserRole))
-        return selected
-
-    def _build_tunnel_cmd(self, services: list):
-        """Returns (cmd_list, None) on success or (None, error_message) on failure."""
-        if not services:
-            return None, "Select at least one service to tunnel."
-        if not self._conn_host or not self._conn_user:
-            return None, "Connect to an instance first."
-        if not self._conn_pem:
-            return None, "A private-key (.pem) connection is required for tunnelling."
-
-        seen_ports = {}
-        forwards = []
-        for svc in services:
-            port = svc["port"]
-            if port in seen_ports and seen_ports[port] != svc["name"]:
-                return None, (f"Port {port} is used by both '{seen_ports[port]}' and "
-                              f"'{svc['name']}' — can't forward the same local port twice.")
-            seen_ports[port] = svc["name"]
-            forwards += ["-L", f"{port}:127.0.0.1:{port}"]
-
-        cmd = ["ssh", "-nNT"] + forwards
-        if self._conn_port and int(self._conn_port) != 22:
-            cmd += ["-p", str(self._conn_port)]
-        cmd += ["-i", self._conn_pem, f"{self._conn_user}@{self._conn_host}"]
-        return cmd, None
-
-    def _update_tunnel_cmd_preview(self, *_):
-        services = self._selected_tunnel_services()
-        cmd, err = self._build_tunnel_cmd(services)
-        self.tunnel_cmd_preview.setText(" ".join(cmd) if cmd else (err or ""))
-
-    def _start_tunnel(self):
-        if self._tunnel_process is not None and self._tunnel_process.state() != QProcess.NotRunning:
-            QMessageBox.information(self, "Tunnel already running",
-                                    "Stop the current tunnel before starting a new one.")
-            return
-
-        services = self._selected_tunnel_services()
-        cmd, err = self._build_tunnel_cmd(services)
-        if not cmd:
-            QMessageBox.warning(self, "Can't start tunnel", err)
-            return
-
-        self.tunnel_log.clear()
-        append_terminal_html(self.tunnel_log, f"<span style='color:{T['ACCENT2']}'>$ {self._esc(' '.join(cmd))}</span>")
-
-        proc = QProcess(self)
-        proc.setProcessChannelMode(QProcess.MergedChannels)
-        proc.readyReadStandardOutput.connect(lambda: self._on_tunnel_output(proc))
-        proc.errorOccurred.connect(self._on_tunnel_error)
-        proc.finished.connect(self._on_tunnel_finished)
-        proc.start(cmd[0], cmd[1:])
-        self._tunnel_process = proc
-
-        self.tunnel_start_btn.setEnabled(False)
-        self.tunnel_stop_btn.setEnabled(True)
-        self.tunnel_status_lbl.setText(f"●  Tunnelling {len(services)} service(s)")
-        self.tunnel_status_lbl.setStyleSheet(f"color: {T['SUCCESS']}; font-size: 12px;")
-
-    def _stop_tunnel(self):
-        if self._tunnel_process is not None and self._tunnel_process.state() != QProcess.NotRunning:
-            self._tunnel_process.terminate()
-            if not self._tunnel_process.waitForFinished(2000):
-                self._tunnel_process.kill()
-                self._tunnel_process.waitForFinished(1000)
-        # _on_tunnel_finished (connected above) resets buttons/status when the
-        # process actually exits; if there was never a process, reset here.
-        if self._tunnel_process is None:
-            self.tunnel_start_btn.setEnabled(True)
-            self.tunnel_stop_btn.setEnabled(False)
-            self.tunnel_status_lbl.setText("●  Not tunnelling")
-            self.tunnel_status_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px;")
-
-    def _on_ports_killed(self, out):
-        if out.strip():
-            append_terminal_text(self.tunnel_log, out)
-
-        self._refresh_tunnel_status()
-
-    def _kill_selected_ports(self):
-        if not self.ssh:
-            QMessageBox.warning(self, "Not connected", "Connect to an instance first.")
-            return
-        services = self._selected_tunnel_services()
-        if not services:
-            QMessageBox.warning(
-                self,
-                "No services selected",
-                "Select one or more services first."
-            )
-            return
-        ports = [str(svc["port"]) for svc in services]
-        # Kill anything listening on the selected ports
-        cmd = " ; ".join(
-            [
-                f"pid=$(lsof -ti:{port} 2>/dev/null); "
-                f'[ -n "$pid" ] && kill -9 $pid || echo "Nothing running on {port}"'
-                for port in ports
-            ]
-        )
-        cmd = f"bash -lc {shlex.quote(cmd)}"
-        append_terminal_html(
-            self.tunnel_log,
-            f"<span style='color:{T['ACCENT2']}'>$ {self._esc(cmd)}</span>"
-        )
-        self._run_cmd(cmd, self._on_ports_killed)
-
-    def _on_tunnel_output(self, proc):
-        data = bytes(proc.readAllStandardOutput()).decode(errors="replace")
-        if data:
-            append_terminal_text(self.tunnel_log, data)
-
-    def _on_tunnel_error(self, error):
-        append_terminal_html(self.tunnel_log, f"<span style='color:{T['DANGER']}'>[process error: {error}]</span>")
-
-    def _on_tunnel_finished(self, exit_code, _exit_status):
-        color = T['SUCCESS'] if exit_code == 0 else T['DANGER']
-        append_terminal_html(self.tunnel_log, f"<span style='color:{color}'>[tunnel closed, exit code {exit_code}]</span>")
-        self.tunnel_start_btn.setEnabled(True)
-        self.tunnel_stop_btn.setEnabled(False)
-        self.tunnel_status_lbl.setText("●  Not tunnelling")
-        self.tunnel_status_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px;")
-        self._tunnel_process = None
-
-    # ── Remote kubectl port-forward restart ───────────────────
-    # Distinct from the SSH -L tunnel above: this runs 'kubectl port-forward'
-    # directly on the connected VM, in the exact format:
-    #   nohup kubectl -n <namespace> port-forward svc/<name> <port>:<port> &
-    # Supports restarting several services in one go.
-    def _build_kubectl_tunnel_restart_cmd(self, services: list) -> str:
-        """Kill whatever's already on the port, then relaunch — mirrors the
-        kill_kubectl_port.sh + nohup pattern used by the real restart script."""
-        cmds = []
-
-        for svc in services:
-            name = svc["name"]
-            port = svc["port"]
-            container_port = svc.get("container_port", port)
-            ns = svc["namespace"]
-
-            cmds.append(
-                f'pid=$(lsof -ti:{port} 2>/dev/null); [ -n "$pid" ] && kill -9 $pid'
-            )
-            cmds.append(
-                f"nohup kubectl {self._context_flag()} -n {ns} port-forward svc/{name} {port}:{container_port} > /dev/null 2>&1 &"
-            )
-
-        # ';' not '&&' — the kill script may exit nonzero if nothing was listening
-        inner = " ; ".join(cmds)
-        # exec_command() opens a non-login shell, which skips /etc/profile —
-        # exactly where kubectl's PATH entry usually lives (Homebrew, snap,
-        # etc.). "bash -lc" forces a login shell so those get sourced.
-        return f"bash -lc {shlex.quote(inner)}"
-
-    def _restart_kubectl_tunnels(self):
-        if not self.ssh:
-            QMessageBox.warning(self, "Not connected", "Connect to an instance first.")
-            return
-
-        services = self._selected_tunnel_services()
-        if not services:
-            QMessageBox.warning(self, "No services selected",
-                                "Check one or more services below to restart their tunnel.")
-            return
-
-        # Each service's restart is an independent SSH command (kill-port +
-        # nohup port-forward), so there's no dependency between them — but
-        # each one's CommandWorker opens its own channel(s) on the *same*
-        # SSH transport, and sshd caps how many of those can be open at
-        # once (MaxSessions, commonly 10). Firing every selected service at
-        # once used to blow past that ceiling as soon as more than a
-        # handful were selected, and every worker beyond the limit failed
-        # with ChannelException/"Unable to open channel." Instead, queue
-        # everything and keep only MAX_CONCURRENT_TUNNEL_RESTARTS workers
-        # in flight; each finished worker pulls the next one off the queue.
-        self._tunnel_restart_queue    = list(services)
-        self._tunnel_restart_pending  = len(services)
-        self._tunnel_restart_failed   = []
-        self._tunnel_restart_inflight = 0
-
-        self.tunnel_restart_btn.setEnabled(False)
-        self.progress.show()
-
-        for _ in range(min(self.MAX_CONCURRENT_TUNNEL_RESTARTS, len(self._tunnel_restart_queue))):
-            self._start_next_tunnel_restart()
-
-    def _start_next_tunnel_restart(self):
-        if not self._tunnel_restart_queue:
-            return
-        service = self._tunnel_restart_queue.pop(0)
-        self._tunnel_restart_inflight += 1
-
-        cmd = self._build_kubectl_tunnel_restart_cmd([service])  # single-service cmd
-        append_terminal_html(
-            self.tunnel_log,
-            f"<span style='color:{T['ACCENT2']}'>$ {self._esc(cmd)}</span>"
-        )
-        worker = CommandWorker(self.ssh, cmd)
-        worker.done.connect(lambda out, svc=service: self._on_tunnel_step_done(svc, out))
-        worker.error.connect(lambda err, svc=service: self._on_tunnel_step_error(svc, err))
-        track_worker(self._workers, worker)
-        worker.start()
-
-    def _on_tunnel_step_done(self, service, output):
-        append_terminal_html(
-            self.tunnel_log,
-            f"<span style='color:{T['SUCCESS']}'>✓ {self._esc(service['name'])}</span>"
-        )
-        self._on_tunnel_step_finished()
-
-    def _on_tunnel_step_error(self, service, err):
-        self._tunnel_restart_failed.append(service['name'])
-        append_terminal_html(
-            self.tunnel_log,
-            f"<span style='color:{T['DANGER']}'>✗ {self._esc(service['name'])}: {self._esc(str(err))}</span>"
-        )
-        self._on_tunnel_step_finished()
-
-    def _on_tunnel_step_finished(self):
-        # Workers finish in whatever order the remote shell happens to
-        # complete them, not the order they were started. Each completion
-        # frees up one of the MAX_CONCURRENT_TUNNEL_RESTARTS slots, so pull
-        # the next queued service (if any) in before checking whether the
-        # whole batch is done.
-        self._tunnel_restart_inflight -= 1
-        self._tunnel_restart_pending  -= 1
-        if self._tunnel_restart_queue:
-            self._start_next_tunnel_restart()
-        elif self._tunnel_restart_pending <= 0:
-            self._finish_kubectl_tunnel_restarts()
-
-    def _finish_kubectl_tunnel_restarts(self):
-        if self._tunnel_restart_failed:
-            self._on_kubectl_tunnel_restart_error(
-                f"{len(self._tunnel_restart_failed)} service(s) failed: {', '.join(self._tunnel_restart_failed)}"
-            )
-        else:
-            self._on_kubectl_tunnel_restart_done("all tunnels restarted")
-
-    def _on_kubectl_tunnel_restart_done(self, out: str):
-        self.progress.hide()
-        self.tunnel_restart_btn.setEnabled(True)
-        if out.strip():
-            append_terminal_text(self.tunnel_log, out)
-        # Give kubectl a moment to bind, then check what's actually listening.
-        QTimer.singleShot(1200, self._refresh_tunnel_status)
-
-    def _on_kubectl_tunnel_restart_error(self, err: str):
-        # Even if this fires (e.g. a slow-starting kubectl, or any other
-        # transient hiccup), the button must never stay stuck disabled, and
-        # we should still check whether the tunnel actually came up.
-        self.progress.hide()
-        self.tunnel_restart_btn.setEnabled(True)
-        append_terminal_html(
-            self.tunnel_log,
-            f"<span style='color:{T['DANGER']}'>[error] {self._esc(err)}</span>"
-        )
-        QTimer.singleShot(1200, self._refresh_tunnel_status)
-
-    # ── Worker runner ─────────────────────────────────────────
-    def _run_cmd(self, cmd: str, callback, apply_context: bool = True):
-        if not self.ssh:
-            return
-        if apply_context:
-            cmd = self._apply_context_to_command(cmd)
-        self.progress.show()
-        worker = CommandWorker(self.ssh, cmd)
-
-        def on_done(out):
-            self.progress.hide()
-            callback(out)
-
-        def on_error(e):
-            self.progress.hide()
-            self._log(f"[error] {e}")
-
-        worker.done.connect(on_done)
-        worker.error.connect(on_error)
-        track_worker(self._workers, worker)
-        worker.start()
-
-    def _log(self, text: str):
-        self._append_pre(text)
-        self.status_msg.emit(text.split("\n")[0][:80])
+      )
+
+    # Statuses just changed — re-apply the Active/Inactive toggle (and
+    # the text search) now that they're known, rather than waiting for
+    # the user to touch the search box again.
+    self._filter_tunnel_services()
+
+  def _set_all_tunnel_checks(self, checked: bool):
+    """Check/uncheck every currently VISIBLE row — i.e. respects
+    whatever the search box and Active/Inactive toggle are currently
+    hiding, rather than reaching through the filter to rows the user
+    can't see."""
+    state = Qt.Checked if checked else Qt.Unchecked
+    self.tunnel_list.blockSignals(True)
+    for i in range(self.tunnel_list.count()):
+      item = self.tunnel_list.item(i)
+      if item.isHidden():
+        continue
+      if item.flags() & Qt.ItemIsUserCheckable:
+        item.setCheckState(state)
+    self.tunnel_list.blockSignals(False)
+    self._update_tunnel_cmd_preview()
+
+  def _selected_tunnel_services(self) -> list:
+    selected = []
+    for i in range(self.tunnel_list.count()):
+      item = self.tunnel_list.item(i)
+      if (item.flags() & Qt.ItemIsUserCheckable) and item.checkState() == Qt.Checked:
+        selected.append(item.data(Qt.UserRole))
+    return selected
+
+  def _build_tunnel_cmd(self, services: list):
+    """Returns (cmd_list, None) on success or (None, error_message) on failure."""
+    if not services:
+      return None, "Select at least one service to tunnel."
+    if not self._conn_host or not self._conn_user:
+      return None, "Connect to an instance first."
+    if not self._conn_pem:
+      return None, "A private-key (.pem) connection is required for tunnelling."
+
+    seen_ports = {}
+    forwards = []
+    for svc in services:
+      port = svc["port"]
+      if port in seen_ports and seen_ports[port] != svc["name"]:
+        return None, (f"Port {port} is used by both '{seen_ports[port]}' and "
+               f"'{svc['name']}' — can't forward the same local port twice.")
+      seen_ports[port] = svc["name"]
+      forwards += ["-L", f"{port}:127.0.0.1:{port}"]
+
+    cmd = ["ssh", "-nNT"] + forwards
+    if self._conn_port and int(self._conn_port) != 22:
+      cmd += ["-p", str(self._conn_port)]
+    cmd += ["-i", self._conn_pem, f"{self._conn_user}@{self._conn_host}"]
+    return cmd, None
+
+  def _update_tunnel_cmd_preview(self, *_):
+    services = self._selected_tunnel_services()
+    cmd, err = self._build_tunnel_cmd(services)
+    self.tunnel_cmd_preview.setText(" ".join(cmd) if cmd else (err or ""))
+
+  def _start_tunnel(self):
+    if self._tunnel_process is not None and self._tunnel_process.state() != QProcess.NotRunning:
+      QMessageBox.information(self, "Tunnel already running",
+                  "Stop the current tunnel before starting a new one.")
+      return
+
+    services = self._selected_tunnel_services()
+    cmd, err = self._build_tunnel_cmd(services)
+    if not cmd:
+      QMessageBox.warning(self, "Can't start tunnel", err)
+      return
+
+    self.tunnel_log.clear()
+    append_terminal_html(self.tunnel_log, f"<span style='color:{T['ACCENT2']}'>$ {self._esc(' '.join(cmd))}</span>")
+
+    proc = QProcess(self)
+    proc.setProcessChannelMode(QProcess.MergedChannels)
+    proc.readyReadStandardOutput.connect(lambda: self._on_tunnel_output(proc))
+    proc.errorOccurred.connect(self._on_tunnel_error)
+    proc.finished.connect(self._on_tunnel_finished)
+    proc.start(cmd[0], cmd[1:])
+    self._tunnel_process = proc
+
+    self.tunnel_start_btn.setEnabled(False)
+    self.tunnel_stop_btn.setEnabled(True)
+    self.tunnel_status_lbl.setText(f"● Tunnelling {len(services)} service(s)")
+    self.tunnel_status_lbl.setStyleSheet(f"color: {T['SUCCESS']}; font-size: 12px;")
+
+  def _stop_tunnel(self):
+    if self._tunnel_process is not None and self._tunnel_process.state() != QProcess.NotRunning:
+      self._tunnel_process.terminate()
+      if not self._tunnel_process.waitForFinished(2000):
+        self._tunnel_process.kill()
+        self._tunnel_process.waitForFinished(1000)
+    # _on_tunnel_finished (connected above) resets buttons/status when the
+    # process actually exits; if there was never a process, reset here.
+    if self._tunnel_process is None:
+      self.tunnel_start_btn.setEnabled(True)
+      self.tunnel_stop_btn.setEnabled(False)
+      self.tunnel_status_lbl.setText("● Not tunnelling")
+      self.tunnel_status_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px;")
+
+  def _on_ports_killed(self, out):
+    if out.strip():
+      append_terminal_text(self.tunnel_log, out)
+
+    self._refresh_tunnel_status()
+
+  def _kill_selected_ports(self):
+    if not self.ssh:
+      QMessageBox.warning(self, "Not connected", "Connect to an instance first.")
+      return
+    services = self._selected_tunnel_services()
+    if not services:
+      QMessageBox.warning(
+        self,
+        "No services selected",
+        "Select one or more services first."
+      )
+      return
+    ports = [str(svc["port"]) for svc in services]
+    # Kill anything listening on the selected ports
+    cmd = " ; ".join(
+      [
+        f"pid=$(lsof -ti:{port} 2>/dev/null); "
+        f'[ -n "$pid" ] && kill -9 $pid || echo "Nothing running on {port}"'
+        for port in ports
+      ]
+    )
+    cmd = f"bash -lc {shlex.quote(cmd)}"
+    append_terminal_html(
+      self.tunnel_log,
+      f"<span style='color:{T['ACCENT2']}'>$ {self._esc(cmd)}</span>"
+    )
+    self._run_cmd(cmd, self._on_ports_killed)
+
+  def _on_tunnel_output(self, proc):
+    data = bytes(proc.readAllStandardOutput()).decode(errors="replace")
+    if data:
+      append_terminal_text(self.tunnel_log, data)
+
+  def _on_tunnel_error(self, error):
+    append_terminal_html(self.tunnel_log, f"<span style='color:{T['DANGER']}'>[process error: {error}]</span>")
+
+  def _on_tunnel_finished(self, exit_code, _exit_status):
+    color = T['SUCCESS'] if exit_code == 0 else T['DANGER']
+    append_terminal_html(self.tunnel_log, f"<span style='color:{color}'>[tunnel closed, exit code {exit_code}]</span>")
+    self.tunnel_start_btn.setEnabled(True)
+    self.tunnel_stop_btn.setEnabled(False)
+    self.tunnel_status_lbl.setText("● Not tunnelling")
+    self.tunnel_status_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px;")
+    self._tunnel_process = None
+
+  # ── Remote kubectl port-forward restart ───────────────────
+  # Distinct from the SSH -L tunnel above: this runs 'kubectl port-forward'
+  # directly on the connected VM, in the exact format:
+  #  nohup kubectl -n <namespace> port-forward svc/<name> <port>:<port> &
+  # Supports restarting several services in one go.
+  def _build_kubectl_tunnel_restart_cmd(self, services: list) -> str:
+    """Kill whatever's already on the port, then relaunch — mirrors the
+    kill_kubectl_port.sh + nohup pattern used by the real restart script."""
+    cmds = []
+
+    for svc in services:
+      name = svc["name"]
+      port = svc["port"]
+      container_port = svc.get("container_port", port)
+      ns = svc["namespace"]
+
+      cmds.append(
+        f'pid=$(lsof -ti:{port} 2>/dev/null); [ -n "$pid" ] && kill -9 $pid'
+      )
+      cmds.append(
+        f"nohup kubectl {self._context_flag()} -n {ns} port-forward svc/{name} {port}:{container_port} > /dev/null 2>&1 &"
+      )
+
+    # ';' not '&&' — the kill script may exit nonzero if nothing was listening
+    inner = " ; ".join(cmds)
+    # exec_command() opens a non-login shell, which skips /etc/profile —
+    # exactly where kubectl's PATH entry usually lives (Homebrew, snap,
+    # etc.). "bash -lc" forces a login shell so those get sourced.
+    return f"bash -lc {shlex.quote(inner)}"
+
+  def _restart_kubectl_tunnels(self):
+    if not self.ssh:
+      QMessageBox.warning(self, "Not connected", "Connect to an instance first.")
+      return
+
+    services = self._selected_tunnel_services()
+    if not services:
+      QMessageBox.warning(self, "No services selected",
+                "Check one or more services below to restart their tunnel.")
+      return
+
+    # Each service's restart is an independent SSH command (kill-port +
+    # nohup port-forward), so there's no dependency between them — but
+    # each one's CommandWorker opens its own channel(s) on the *same*
+    # SSH transport, and sshd caps how many of those can be open at
+    # once (MaxSessions, commonly 10). Firing every selected service at
+    # once used to blow past that ceiling as soon as more than a
+    # handful were selected, and every worker beyond the limit failed
+    # with ChannelException/"Unable to open channel." Instead, queue
+    # everything and keep only MAX_CONCURRENT_TUNNEL_RESTARTS workers
+    # in flight; each finished worker pulls the next one off the queue.
+    self._tunnel_restart_queue  = list(services)
+    self._tunnel_restart_pending = len(services)
+    self._tunnel_restart_failed  = []
+    self._tunnel_restart_inflight = 0
+
+    self.tunnel_restart_btn.setEnabled(False)
+    self.progress.show()
+
+    for _ in range(min(self.MAX_CONCURRENT_TUNNEL_RESTARTS, len(self._tunnel_restart_queue))):
+      self._start_next_tunnel_restart()
+
+  def _start_next_tunnel_restart(self):
+    if not self._tunnel_restart_queue:
+      return
+    service = self._tunnel_restart_queue.pop(0)
+    self._tunnel_restart_inflight += 1
+
+    cmd = self._build_kubectl_tunnel_restart_cmd([service]) # single-service cmd
+    append_terminal_html(
+      self.tunnel_log,
+      f"<span style='color:{T['ACCENT2']}'>$ {self._esc(cmd)}</span>"
+    )
+    worker = CommandWorker(self.ssh, cmd)
+    worker.done.connect(lambda out, svc=service: self._on_tunnel_step_done(svc, out))
+    worker.error.connect(lambda err, svc=service: self._on_tunnel_step_error(svc, err))
+    track_worker(self._workers, worker)
+    worker.start()
+
+  def _on_tunnel_step_done(self, service, output):
+    append_terminal_html(
+      self.tunnel_log,
+      f"<span style='color:{T['SUCCESS']}'> {self._esc(service['name'])}</span>"
+    )
+    self._on_tunnel_step_finished()
+
+  def _on_tunnel_step_error(self, service, err):
+    self._tunnel_restart_failed.append(service['name'])
+    append_terminal_html(
+      self.tunnel_log,
+      f"<span style='color:{T['DANGER']}'> {self._esc(service['name'])}: {self._esc(str(err))}</span>"
+    )
+    self._on_tunnel_step_finished()
+
+  def _on_tunnel_step_finished(self):
+    # Workers finish in whatever order the remote shell happens to
+    # complete them, not the order they were started. Each completion
+    # frees up one of the MAX_CONCURRENT_TUNNEL_RESTARTS slots, so pull
+    # the next queued service (if any) in before checking whether the
+    # whole batch is done.
+    self._tunnel_restart_inflight -= 1
+    self._tunnel_restart_pending -= 1
+    if self._tunnel_restart_queue:
+      self._start_next_tunnel_restart()
+    elif self._tunnel_restart_pending <= 0:
+      self._finish_kubectl_tunnel_restarts()
+
+  def _finish_kubectl_tunnel_restarts(self):
+    if self._tunnel_restart_failed:
+      self._on_kubectl_tunnel_restart_error(
+        f"{len(self._tunnel_restart_failed)} service(s) failed: {', '.join(self._tunnel_restart_failed)}"
+      )
+    else:
+      self._on_kubectl_tunnel_restart_done("all tunnels restarted")
+
+  def _on_kubectl_tunnel_restart_done(self, out: str):
+    self.progress.hide()
+    self.tunnel_restart_btn.setEnabled(True)
+    if out.strip():
+      append_terminal_text(self.tunnel_log, out)
+    # Give kubectl a moment to bind, then check what's actually listening.
+    QTimer.singleShot(1200, self._refresh_tunnel_status)
+
+  def _on_kubectl_tunnel_restart_error(self, err: str):
+    # Even if this fires (e.g. a slow-starting kubectl, or any other
+    # transient hiccup), the button must never stay stuck disabled, and
+    # we should still check whether the tunnel actually came up.
+    self.progress.hide()
+    self.tunnel_restart_btn.setEnabled(True)
+    append_terminal_html(
+      self.tunnel_log,
+      f"<span style='color:{T['DANGER']}'>[error] {self._esc(err)}</span>"
+    )
+    QTimer.singleShot(1200, self._refresh_tunnel_status)
+
+  # ── Worker runner ─────────────────────────────────────────
+  def _run_cmd(self, cmd: str, callback, apply_context: bool = True):
+    if not self.ssh:
+      return
+    if apply_context:
+      cmd = self._apply_context_to_command(cmd)
+    self.progress.show()
+    worker = CommandWorker(self.ssh, cmd)
+
+    def on_done(out):
+      self.progress.hide()
+      callback(out)
+
+    def on_error(e):
+      self.progress.hide()
+      self._log(f"[error] {e}")
+
+    worker.done.connect(on_done)
+    worker.error.connect(on_error)
+    track_worker(self._workers, worker)
+    worker.start()
+
+  def _log(self, text: str):
+    self._append_pre(text)
+    self.status_msg.emit(text.split("\n")[0][:80])
