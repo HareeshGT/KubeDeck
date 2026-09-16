@@ -1,7 +1,7 @@
 # KubeDeck
 
 <p align="center">
-  <strong>A powerful desktop control center for AWS EC2, Kubernetes, Docker, SSH, SFTP, FTP, and cloud operations.</strong>
+  <strong>A powerful desktop control center for AWS EC2, Kubernetes, SSH, SFTP, FTP, and cloud operations.</strong>
 </p>
 
 <p align="center">
@@ -37,7 +37,6 @@ Instead of using separate applications for:
 - FTP
 - Remote file management
 - Kubernetes
-- Docker
 - Terminal sessions
 - Port forwarding
 - Logs
@@ -85,7 +84,6 @@ Use it for:
 
 ```bash
 kubectl get pods
-docker ps
 systemctl status nginx
 journalctl -u my-service
 df -h
@@ -260,21 +258,6 @@ This is useful for accessing internal services such as:
 
 without exposing those services publicly.
 
----
-
-# 🐳 Docker
-
-KubeDeck includes Docker management functionality for working with Docker environments.
-
-The Docker interface is intended to provide a graphical alternative to repeatedly switching between Docker CLI commands.
-
-Common workflows include inspecting:
-
-- Containers
-- Images
-- Container logs
-- Container state
-- Container execution
 
 ---
 
@@ -393,7 +376,6 @@ KubeDeck is primarily built with:
 - Qt / PyQt
 - SSH/SFTP tooling
 - Kubernetes tooling
-- Docker tooling
 - AWS infrastructure
 - FTP
 - AI APIs
@@ -413,8 +395,6 @@ KubeDeck
    │
    ├── FTP
    │
-   ├── Docker
-   │
    ├── kubectl
    │
    ├── Kubernetes
@@ -433,7 +413,6 @@ Depending on the features being used, you may need:
 - Python 3
 - SSH client
 - `kubectl`
-- Docker
 - Kubernetes credentials / kubeconfig
 - AWS credentials where required
 - Appropriate SSH keys
@@ -803,24 +782,6 @@ chmod 600 <private-key>
 
 ---
 
-## Docker is unavailable
-
-Verify Docker:
-
-```bash
-docker version
-```
-
-and:
-
-```bash
-docker ps
-```
-
-Make sure Docker Desktop or the relevant Docker daemon is running.
-
----
-
 ## Port forwarding does not work
 
 Check:
@@ -874,7 +835,6 @@ Potential future improvements include:
 
 - Improved multi-cluster management
 - More Kubernetes resource actions
-- Improved Docker management
 - Better remote filesystem operations
 - Additional cloud-provider integrations
 - Enhanced AI-assisted troubleshooting
@@ -944,7 +904,6 @@ When reporting a bug, include:
 - Expected behavior
 - Actual behavior
 - Kubernetes version, if applicable
-- Docker version, if applicable
 
 Avoid posting credentials, tokens, private keys, passwords, or other sensitive information.
 
@@ -962,7 +921,6 @@ Suggested sections:
 - SSH terminal
 - Kubernetes dashboard
 - Kubernetes resource view
-- Docker manager
 - FTP manager
 - AI/Ops assistant
 - Settings and themes
