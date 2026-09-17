@@ -7,9 +7,17 @@ from PyQt5.QtGui import QColor, QPalette
 from PyQt5.QtCore import Qt, QPropertyAnimation, QEasingCurve
 
 from themes import T, build_qss
+from file_stream_lifecycle import install as _install_file_stream_lifecycle
 from main_window import EC2FileManager
 from splash import SplashScreen
 from webapp import app as webapp_app
+
+
+# Install the file/preview worker lifecycle fix before any UI instance can
+# create a FileStreamReadWorker. This keeps existing editor/preview call
+# sites unchanged while ensuring a cancelled reader has stopped before the
+# next reader starts.
+_install_file_stream_lifecycle()
 
 
 def _build_palette() -> QPalette:
