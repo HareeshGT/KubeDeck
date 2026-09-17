@@ -2,15 +2,35 @@
 
 Icons are stored under assets/icons and rendered with Qt's SVG renderer.
 The helpers below preserve the public API used by the existing application.
+
+Rendering notes
+----------------
+Every icon in the app funnels through ``icon()`` / ``icon_pixmap()`` /
+``set_icon()`` below, so this is the single place that controls how crisp
+icons look. Two things used to make icons look blurry on modern (HiDPI)
+displays:
+
+1. Icons were rasterised once at the exact *logical* pixel size requested
+   (e.g. 18x18) with no ``devicePixelRatio`` set on the resulting
+   ``QPixmap``. On a 2x/3x display, Qt then had to stretch that small
+   bitmap to fill the physical pixels, which is what produced the blur.
+2. The renderer never set ``Antialiasing`` / ``SmoothPixmapTransform``
+   hints, so even 1x renders had rough, aliased edges.
+
+``icon()`` now renders every SVG at the highest device pixel ratio among
+the app's screens (so it stays crisp if the window is dragged to a
+higher-DPI monitor), tags the pixmap with that ratio so Qt paints it at
+native resolution, and caches the result so repeated lookups (the same
+icon/color/size is requested constantly while building the UI) are cheap.
 """
 
 from pathlib import Path
 from typing import Optional
 
-from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtCore import Qt, QSize, QRectF
 from PyQt5.QtGui import QColor, QIcon, QPixmap, QPainter
 from PyQt5.QtSvg import QSvgRenderer
-from PyQt5.QtWidgets import QPushButton
+from PyQt5.QtWidgets import QApplication, QPushButton
 
 try:
     from themes import T
@@ -23,6 +43,12 @@ except Exception:
 
 ICON_DIR = Path(__file__).resolve().parent / "assets" / "icons"
 
+# Cache of rendered QIcons, keyed by (path, color-as-string, size, dpr).
+# Small and bounded in practice: a fixed icon set x a handful of theme
+# colors x a handful of sizes x the screen(s) in use.
+_ICON_CACHE: dict = {}
+_MAX_CACHE_ENTRIES = 512
+
 
 def _to_qcolor(value, fallback="#E8EAF0") -> QColor:
     """Convert a color string/QColor into a valid QColor."""
@@ -34,6 +60,37 @@ def _to_qcolor(value, fallback="#E8EAF0") -> QColor:
         color = QColor(fallback)
 
     return color
+
+
+def _device_pixel_ratio() -> float:
+    """Highest devicePixelRatio across the app's screens (>= 1.0).
+
+    Rendering at this ratio, rather than always 1.0, is what makes icons
+    render crisp instead of blurry on HiDPI/Retina displays. Using the
+    *highest* screen ratio (rather than just the primary screen) keeps
+    icons sharp even if the window is later moved to a higher-DPI
+    monitor in a mixed-DPI multi-monitor setup.
+    """
+    app = QApplication.instance()
+    if app is None:
+        return 1.0
+
+    try:
+        ratios = [s.devicePixelRatio() for s in app.screens() if s is not None]
+        ratios = [r for r in ratios if r and r > 0]
+        if ratios:
+            return max(ratios)
+    except Exception:
+        pass
+
+    try:
+        dpr = app.devicePixelRatio()
+        if dpr and dpr > 0:
+            return dpr
+    except Exception:
+        pass
+
+    return 1.0
 
 
 def icon_path(name: str) -> str:
@@ -51,41 +108,87 @@ def icon_path(name: str) -> str:
     return str(ICON_DIR / filename)
 
 
-def icon(
-    name: str,
-    color: Optional[str] = None,
-    size: int = 18,
-) -> QIcon:
-    """Load and optionally tint an SVG icon."""
-    size = max(1, int(size))
-    path = icon_path(name)
+def _render_pixmap(path: str, color: Optional[str], size: int) -> Optional[QPixmap]:
+    """Rasterise one SVG at the screen's device pixel ratio, cached.
 
-    if not path or not Path(path).is_file():
-        return QIcon()
+    Shared by ``icon()`` and ``icon_pixmap()`` so both go through the same
+    crisp, antialiased, HiDPI-aware path — the pixmap this returns already
+    carries the correct ``devicePixelRatio``, so callers can hand it
+    straight to ``QLabel.setPixmap`` or ``QIcon.addPixmap`` without any
+    further scaling (extra scaling is exactly what reintroduces blur).
+    """
+    color_key = None
+    if color is not None:
+        color_key = color.name() if isinstance(color, QColor) else str(color)
+
+    dpr = _device_pixel_ratio()
+    cache_key = ("pixmap", path, color_key, size, round(dpr, 2))
+
+    cached = _ICON_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     renderer = QSvgRenderer(path)
-
     if not renderer.isValid():
-        return QIcon()
+        return None
 
-    pixmap = QPixmap(size, size)
+    # Rasterise at size * dpr physical pixels, then tell the pixmap what
+    # ratio that corresponds to. Qt then paints it 1:1 on a matching
+    # HiDPI screen instead of upscaling a low-res bitmap (the source of
+    # the blur).
+    physical = max(1, round(size * dpr))
+    pixmap = QPixmap(physical, physical)
     pixmap.fill(Qt.transparent)
+    pixmap.setDevicePixelRatio(dpr)
 
     painter = QPainter(pixmap)
 
     try:
-        renderer.render(painter)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
+        # Target rect is in logical (device-independent) coordinates —
+        # QPainter already accounts for the pixmap's devicePixelRatio.
+        renderer.render(painter, QRectF(0, 0, size, size))
 
         if color is not None:
             painter.setCompositionMode(
                 QPainter.CompositionMode_SourceIn
             )
             painter.fillRect(
-                pixmap.rect(),
+                QRectF(0, 0, size, size),
                 _to_qcolor(color),
             )
     finally:
         painter.end()
+
+    if len(_ICON_CACHE) >= _MAX_CACHE_ENTRIES:
+        _ICON_CACHE.clear()
+    _ICON_CACHE[cache_key] = pixmap
+
+    return pixmap
+
+
+def icon(
+    name: str,
+    color: Optional[str] = None,
+    size: int = 18,
+) -> QIcon:
+    """Load and optionally tint an SVG icon.
+
+    Rendered at the screen's device pixel ratio with antialiasing so the
+    result is crisp (not blurry) on both standard and HiDPI displays, and
+    cached so repeated calls for the same icon/color/size are free.
+    """
+    size = max(1, int(size))
+    path = icon_path(name)
+
+    if not path or not Path(path).is_file():
+        return QIcon()
+
+    pixmap = _render_pixmap(path, color, size)
+    if pixmap is None:
+        return QIcon()
 
     result = QIcon()
     result.addPixmap(pixmap)
@@ -119,14 +222,22 @@ def icon_pixmap(
     color: Optional[str] = None,
     size: int = 18,
 ) -> QPixmap:
-    """Return a rendered SVG icon as a QPixmap."""
-    qt_icon = icon(
-        name,
-        color=color,
-        size=size,
-    )
+    """Return a rendered SVG icon as a QPixmap.
 
-    return qt_icon.pixmap(QSize(size, size))
+    Renders directly at the screen's device pixel ratio (see
+    ``_render_pixmap``) rather than asking a ``QIcon`` for a pixmap of a
+    given logical size — that round trip can hand back a pixmap tagged
+    with the wrong devicePixelRatio, which is what caused labels using
+    ``setPixmap(icon_pixmap(...))`` to look soft on HiDPI screens.
+    """
+    size = max(1, int(size))
+    path = icon_path(name)
+
+    if not path or not Path(path).is_file():
+        return QPixmap()
+
+    pixmap = _render_pixmap(path, color, size)
+    return pixmap if pixmap is not None else QPixmap()
 
 
 # ============================================================

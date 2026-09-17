@@ -17,7 +17,7 @@ import sys
 
 from PyQt5.QtWidgets import QApplication, QStyleFactory
 from PyQt5.QtGui import QColor, QPalette
-from PyQt5.QtCore import QPropertyAnimation, QEasingCurve
+from PyQt5.QtCore import Qt, QPropertyAnimation, QEasingCurve
 
 from themes import T, CURRENT_THEME, build_qss, apply_theme_vars
 from main_window import EC2FileManager
@@ -45,6 +45,25 @@ def _build_palette() -> QPalette:
 
 
 def main() -> int:
+    # ── HiDPI setup ──────────────────────────────────────────
+    # Must run before QApplication is constructed. Without these, Qt
+    # renders everything (including our SVG icons, which are separately
+    # rasterised crisp per-screen in ui_icons.py) at a flat 1x and then
+    # lets the OS stretch the whole window on HiDPI/Retina displays —
+    # that OS-level stretch is what makes text and icons look blurry
+    # rather than native-sharp.
+    if hasattr(Qt, "AA_EnableHighDpiScaling"):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, "AA_UseHighDpiPixmaps"):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    if hasattr(Qt, "HighDpiScaleFactorRoundingPolicy"):
+        # PassThrough keeps fractional scale factors (e.g. 1.5x) exact
+        # instead of Qt rounding them to the nearest integer, which is
+        # what causes visible softness on fractionally-scaled displays.
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+
     # ── Qt application ────────────────────────────────────────
     app = QApplication(sys.argv)
     app.setApplicationName("KubeDeck")
