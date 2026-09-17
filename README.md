@@ -268,7 +268,7 @@ The settings are loaded dynamically by the embedded server, so credential change
 The embedded server writes logs to:
 
 ```text
-~/.vm_visualizer/webapp.log
+~/.vm_visualizer/logs/webapp.log
 ```
 
 ### Web App configuration
@@ -758,7 +758,7 @@ Check that KubeDeck is running and the embedded server has started.
 Check the log file:
 
 ```bash
-cat ~/.vm_visualizer/webapp.log
+cat ~/.vm_visualizer/logs/webapp.log
 ```
 
 Make sure the listening port is reachable from the client device and that the configured Web App credentials are correct.
