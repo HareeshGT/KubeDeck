@@ -1,0 +1,294 @@
+"""Embedded KubeDeck Web server.
+
+The desktop application supplies its live Paramiko SSHClient through
+``configure_runtime``. This module never creates an SSH connection of its
+own; commands use KubeDeck's managed SSH session helper from workers.py.
+"""
+
+from __future__ import annotations
+
+import base64
+import gzip
+import json
+import logging
+import os
+import secrets
+import shlex
+import threading
+from pathlib import Path
+from typing import Callable, Optional
+
+import paramiko
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel
+
+from themes import load_settings
+try:
+    from workers import managed_exec_command
+except ImportError:  # pragma: no cover
+    managed_exec_command = None
+
+APP_DIR = Path(__file__).resolve().parent
+STATE_DIR = Path(os.path.expanduser("~")) / ".vm_visualizer"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = STATE_DIR / "webapp.log"
+
+logger = logging.getLogger("kubedeck.webapp")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(fh)
+    logger.propagate = False
+
+_SSH_PROVIDER: Optional[Callable[[], Optional[paramiko.SSHClient]]] = None
+_RUNTIME_LOCK = threading.RLock()
+
+
+def configure_runtime(ssh_provider: Callable[[], Optional[paramiko.SSHClient]]) -> None:
+    global _SSH_PROVIDER
+    with _RUNTIME_LOCK:
+        _SSH_PROVIDER = ssh_provider
+    logger.info("Web runtime attached to KubeDeck SSH provider")
+
+
+def _ssh() -> paramiko.SSHClient:
+    with _RUNTIME_LOCK:
+        provider = _SSH_PROVIDER
+    if provider is None:
+        raise HTTPException(503, "KubeDeck SSH runtime is not attached")
+    try:
+        client = provider()
+    except Exception:
+        logger.exception("SSH provider failed")
+        raise HTTPException(503, "KubeDeck SSH runtime is unavailable")
+    if client is None:
+        raise HTTPException(503, "Connect to a VM in KubeDeck first")
+    transport = client.get_transport()
+    if transport is None or not transport.is_active():
+        raise HTTPException(503, "KubeDeck SSH connection is not active")
+    return client
+
+
+def _credentials() -> tuple[str, str]:
+    settings = load_settings() or {}
+    return str(settings.get("webapp_username", "")).strip(), str(settings.get("webapp_password", ""))
+
+
+def _exec(ssh: paramiko.SSHClient, command: str, timeout: int = 30) -> tuple[int, str, str]:
+    if managed_exec_command is None:
+        stdin, stdout, stderr = ssh.exec_command(command, timeout=timeout)
+        code = stdout.channel.recv_exit_status()
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        for stream in (stdin, stdout, stderr):
+            try: stream.close()
+            except Exception: pass
+        return code, out, err
+
+    with managed_exec_command(ssh, command, channel_timeout=10) as (_stdin, stdout, stderr):
+        code = stdout.channel.recv_exit_status()
+        return code, stdout.read().decode("utf-8", errors="replace"), stderr.read().decode("utf-8", errors="replace")
+
+
+def _kubectl(args: str, timeout: int = 30, json_output: bool = False):
+    code, out, err = _exec(_ssh(), f"kubectl {args}", timeout)
+    if code != 0:
+        logger.warning("kubectl failed (%s): %s", code, err.strip())
+        raise HTTPException(502, err.strip() or "kubectl command failed")
+    if not json_output:
+        return out
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        raise HTTPException(502, "kubectl returned non-JSON output")
+
+
+security = HTTPBasic()
+
+
+def require_login(credentials: HTTPBasicCredentials = Depends(security)) -> None:
+    username, password = _credentials()
+    if not username or not password:
+        raise HTTPException(503, "Web App login is not configured in KubeDeck Settings")
+    if not (secrets.compare_digest(credentials.username, username) and secrets.compare_digest(credentials.password, password)):
+        logger.warning("Rejected web login for username=%r", credentials.username)
+        raise HTTPException(401, "Invalid credentials", headers={"WWW-Authenticate": "Basic"})
+
+
+app = FastAPI(title="KubeDeck Web")
+
+
+def _ready(status_obj: dict) -> str:
+    cs = status_obj.get("containerStatuses") or []
+    return f"{sum(1 for c in cs if c.get('ready'))}/{len(cs)}"
+
+
+def _restarts(status_obj: dict) -> int:
+    return sum(c.get("restartCount", 0) for c in (status_obj.get("containerStatuses") or []))
+
+
+def _ns(namespace: Optional[str]) -> str:
+    return f"-n {shlex.quote(namespace)}" if namespace and namespace != "all" else "-A"
+
+
+@app.get("/api/health")
+def health(_: None = Depends(require_login)) -> dict:
+    code, *_ = _exec(_ssh(), "kubectl version --client=true -o json 2>&1", 10)
+    return {"ssh_ok": code == 0}
+
+
+@app.get("/api/namespaces")
+def namespaces(_: None = Depends(require_login)) -> list:
+    data = _kubectl("get namespaces -o json", json_output=True)
+    return [x["metadata"]["name"] for x in data.get("items", [])]
+
+
+@app.get("/api/pods")
+def pods(namespace: Optional[str] = None, _: None = Depends(require_login)) -> list:
+    data = _kubectl(f"get pods {_ns(namespace)} -o json", json_output=True)
+    result = []
+    for item in data.get("items", []):
+        meta, stat, spec = item.get("metadata", {}), item.get("status", {}), item.get("spec", {})
+        result.append({"name": meta.get("name"), "namespace": meta.get("namespace"), "phase": stat.get("phase"), "ready": _ready(stat), "restarts": _restarts(stat), "node": spec.get("nodeName"), "containers": [c.get("name") for c in spec.get("containers", [])], "startTime": stat.get("startTime")})
+    return result
+
+
+@app.get("/api/deployments")
+def deployments(namespace: Optional[str] = None, _: None = Depends(require_login)) -> list:
+    data = _kubectl(f"get deployments {_ns(namespace)} -o json", json_output=True)
+    result = []
+    for item in data.get("items", []):
+        meta, stat, spec = item.get("metadata", {}), item.get("status", {}), item.get("spec", {})
+        result.append({"name": meta.get("name"), "namespace": meta.get("namespace"), "replicas": spec.get("replicas", 0), "ready": stat.get("readyReplicas", 0), "available": stat.get("availableReplicas", 0), "updated": stat.get("updatedReplicas", 0)})
+    return result
+
+
+@app.get("/api/services")
+def services(namespace: Optional[str] = None, _: None = Depends(require_login)) -> list:
+    data = _kubectl(f"get services {_ns(namespace)} -o json", json_output=True)
+    result = []
+    for item in data.get("items", []):
+        meta, spec = item.get("metadata", {}), item.get("spec", {})
+        ports = [f"{p.get('port')}:{p.get('targetPort')}/{p.get('protocol', 'TCP')}" for p in spec.get("ports", [])]
+        result.append({"name": meta.get("name"), "namespace": meta.get("namespace"), "type": spec.get("type"), "clusterIP": spec.get("clusterIP"), "ports": ports})
+    return result
+
+
+@app.get("/api/nodes")
+def nodes(_: None = Depends(require_login)) -> list:
+    data = _kubectl("get nodes -o json", json_output=True)
+    result = []
+    for item in data.get("items", []):
+        meta, stat = item.get("metadata", {}), item.get("status", {})
+        conditions = {c.get("type"): c.get("status") for c in stat.get("conditions", [])}
+        result.append({"name": meta.get("name"), "ready": conditions.get("Ready") == "True", "cpu": stat.get("capacity", {}).get("cpu"), "memory": stat.get("capacity", {}).get("memory"), "version": stat.get("nodeInfo", {}).get("kubeletVersion")})
+    return result
+
+
+@app.get("/api/events")
+def events(namespace: Optional[str] = None, _: None = Depends(require_login)) -> list:
+    data = _kubectl(f"get events {_ns(namespace)} --sort-by=.lastTimestamp -o json", json_output=True)
+    result = []
+    for item in data.get("items", []):
+        obj = item.get("involvedObject", {})
+        result.append({"type": item.get("type"), "reason": item.get("reason"), "message": item.get("message"), "object": f"{obj.get('kind', '')}/{obj.get('name', '')}", "namespace": item.get("metadata", {}).get("namespace"), "lastTimestamp": item.get("lastTimestamp") or item.get("eventTime"), "count": item.get("count", 1)})
+    return list(reversed(result))[:100]
+
+
+@app.get("/api/logs/{namespace}/{pod}")
+def logs(namespace: str, pod: str, container: Optional[str] = None, tail: int = 200, _: None = Depends(require_login)) -> dict:
+    tail = max(1, min(tail, 2000))
+    container_flag = f"-c {shlex.quote(container)} " if container else ""
+    out = _kubectl(f"logs {shlex.quote(pod)} -n {shlex.quote(namespace)} {container_flag}--tail={tail} 2>&1", timeout=20)
+    return {"logs": out}
+
+
+class ScaleRequest(BaseModel):
+    replicas: int
+
+
+@app.post("/api/deployments/{namespace}/{name}/restart")
+def restart(namespace: str, name: str, _: None = Depends(require_login)) -> dict:
+    out = _kubectl(f"rollout restart deployment/{shlex.quote(name)} -n {shlex.quote(namespace)} 2>&1")
+    return {"ok": True, "output": out.strip()}
+
+
+@app.post("/api/deployments/{namespace}/{name}/scale")
+def scale(namespace: str, name: str, body: ScaleRequest, _: None = Depends(require_login)) -> dict:
+    if body.replicas < 0 or body.replicas > 100:
+        raise HTTPException(400, "replicas must be between 0 and 100")
+    out = _kubectl(f"scale deployment/{shlex.quote(name)} -n {shlex.quote(namespace)} --replicas={body.replicas} 2>&1")
+    return {"ok": True, "output": out.strip()}
+
+
+@app.post("/api/pods/{namespace}/{name}/delete")
+def delete(namespace: str, name: str, _: None = Depends(require_login)) -> dict:
+    out = _kubectl(f"delete pod {shlex.quote(name)} -n {shlex.quote(namespace)} 2>&1")
+    return {"ok": True, "output": out.strip()}
+
+
+def _static_response():
+    static_file = APP_DIR / "static" / "index.html"
+    if static_file.exists():
+        return FileResponse(str(static_file))
+    try:
+        from webapp.static_content import INDEX_HTML
+    except ImportError:
+        logger.exception("Missing packaged Web UI")
+        raise HTTPException(500, "Web UI assets are missing")
+    return HTMLResponse(INDEX_HTML)
+
+
+@app.get("/")
+def index(_: None = Depends(require_login)):
+    return _static_response()
+
+
+_server: Optional[uvicorn.Server] = None
+_server_thread: Optional[threading.Thread] = None
+_SERVER_LOCK = threading.RLock()
+
+
+def start_server(ssh_provider: Callable[[], Optional[paramiko.SSHClient]], host: Optional[str] = None, port: Optional[int] = None) -> bool:
+    global _server, _server_thread
+    host = (host or os.environ.get("WEBAPP_HOST", "0.0.0.0")).strip() or "0.0.0.0"
+    try:
+        port = int(port or os.environ.get("WEBAPP_PORT", "8000"))
+    except ValueError:
+        port = 8000
+    configure_runtime(ssh_provider)
+    with _SERVER_LOCK:
+        if _server_thread is not None and _server_thread.is_alive():
+            return False
+        config = uvicorn.Config(app, host=host, port=port, log_level="info", access_log=True, log_config=None)
+        _server = uvicorn.Server(config)
+
+        def run() -> None:
+            logger.info("Starting KubeDeck Web on http://%s:%s", host, port)
+            try:
+                _server.run()
+            except Exception:
+                logger.exception("Embedded web server stopped with an error")
+            finally:
+                logger.info("KubeDeck Web server stopped")
+
+        _server_thread = threading.Thread(target=run, name="KubeDeck-Web", daemon=True)
+        _server_thread.start()
+        return True
+
+
+def stop_server(timeout: float = 3.0) -> None:
+    global _server, _server_thread
+    with _SERVER_LOCK:
+        server, thread = _server, _server_thread
+        _server = None
+        _server_thread = None
+    if server is not None:
+        logger.info("Stopping KubeDeck Web server")
+        server.should_exit = True
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=timeout)
