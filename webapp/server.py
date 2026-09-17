@@ -39,7 +39,7 @@ except ImportError:  # pragma: no cover
 APP_DIR = Path(__file__).resolve().parent
 STATE_DIR = Path(os.path.expanduser("~")) / ".vm_visualizer"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = STATE_DIR / "logs/webapp.log"
+LOG_FILE = STATE_DIR / "webapp.log"
 
 logger = logging.getLogger("kubedeck.webapp")
 if not logger.handlers:
@@ -74,7 +74,7 @@ def _ssh() -> paramiko.SSHClient:
     try:
         client = provider()
     except Exception:
-        logger.exception("[%s] SSH provider failed", _REQUEST_ID.get())
+        logger.exception("SSH provider failed")
         raise HTTPException(503, "KubeDeck SSH runtime is unavailable")
     if client is None:
         raise HTTPException(503, "Connect to a VM in KubeDeck first")
@@ -86,7 +86,10 @@ def _ssh() -> paramiko.SSHClient:
 
 def _credentials() -> tuple[str, str]:
     settings = load_settings() or {}
-    return str(settings.get("webapp_username", "")).strip(), str(settings.get("webapp_password", ""))
+    return (
+        str(settings.get("webapp_username", "")).strip(),
+        str(settings.get("webapp_password", "")),
+    )
 
 
 def _client_ip(request: Request) -> str:
@@ -101,15 +104,18 @@ def _safe_user_agent(request: Request) -> str:
 def _lookup_client_mac(client_ip: str) -> str:
     """Best-effort MAC lookup from the KubeDeck host's local neighbor/ARP table.
 
-    A MAC is normally available only when the requesting device is on the same
-    Layer-2 network as the KubeDeck host. Never trust a forwarded MAC/IP header.
+    MAC addresses are normally available only when the requesting device is on
+    the same Layer-2 network as the KubeDeck host. Forwarded MAC/IP headers are
+    intentionally ignored.
     """
     try:
         ip = ipaddress.ip_address(client_ip)
     except ValueError:
         return "N/A"
 
-    if not isinstance(ip, ipaddress.IPv4Address) or ip.is_loopback:
+    if not isinstance(ip, ipaddress.IPv4Address):
+        return "N/A"
+    if ip.is_loopback or not ip.is_private:
         return "N/A"
 
     now = perf_counter()
@@ -127,11 +133,13 @@ def _lookup_client_mac(client_ip: str) -> str:
     elif system == "Windows":
         commands.append(["arp", "-a", client_ip])
     else:
-        commands.extend([
-            ["ip", "neigh", "show", client_ip],
-            ["arp", "-n", client_ip],
-            ["arp", "-a", client_ip],
-        ])
+        commands.extend(
+            [
+                ["ip", "neigh", "show", client_ip],
+                ["arp", "-n", client_ip],
+                ["arp", "-a", client_ip],
+            ]
+        )
 
     mac = "N/A"
     for command in commands:
@@ -170,7 +178,11 @@ def _log_client_identity(request: Request, username: str) -> None:
     )
 
 
-def _exec(ssh: paramiko.SSHClient, command: str, timeout: int = 30) -> tuple[int, str, str]:
+def _exec(
+    ssh: paramiko.SSHClient,
+    command: str,
+    timeout: int = 30,
+) -> tuple[int, str, str]:
     request_id = _REQUEST_ID.get()
     started = perf_counter()
     logger.info(
@@ -192,7 +204,11 @@ def _exec(ssh: paramiko.SSHClient, command: str, timeout: int = 30) -> tuple[int
                 except Exception:
                     pass
         else:
-            with managed_exec_command(ssh, command, channel_timeout=10) as (_stdin, stdout, stderr):
+            with managed_exec_command(
+                ssh,
+                command,
+                channel_timeout=10,
+            ) as (_stdin, stdout, stderr):
                 code = stdout.channel.recv_exit_status()
                 out = stdout.read().decode("utf-8", errors="replace")
                 err = stderr.read().decode("utf-8", errors="replace")
@@ -217,7 +233,12 @@ def _exec(ssh: paramiko.SSHClient, command: str, timeout: int = 30) -> tuple[int
         len(err),
     )
     if err.strip():
-        logger.info("[req=%s] KUBECTL STDERR user=%r: %s", request_id, _AUTH_USER.get(), err.strip()[:4000])
+        logger.info(
+            "[req=%s] KUBECTL STDERR user=%r: %s",
+            request_id,
+            _AUTH_USER.get(),
+            err.strip()[:4000],
+        )
 
     return code, out, err
 
@@ -238,7 +259,11 @@ def _kubectl(args: str, timeout: int = 30, json_output: bool = False):
     try:
         return json.loads(out)
     except json.JSONDecodeError:
-        logger.error("[req=%s] kubectl returned invalid JSON user=%r", _REQUEST_ID.get(), _AUTH_USER.get())
+        logger.error(
+            "[req=%s] kubectl returned invalid JSON user=%r",
+            _REQUEST_ID.get(),
+            _AUTH_USER.get(),
+        )
         raise HTTPException(502, "kubectl returned non-JSON output")
 
 
@@ -251,8 +276,15 @@ def require_login(
 ) -> None:
     username, password = _credentials()
     if not username or not password:
-        raise HTTPException(503, "Web App login is not configured in KubeDeck Settings")
-    if not (secrets.compare_digest(credentials.username, username) and secrets.compare_digest(credentials.password, password)):
+        raise HTTPException(
+            503,
+            "Web App login is not configured in KubeDeck Settings",
+        )
+
+    if not (
+        secrets.compare_digest(credentials.username, username)
+        and secrets.compare_digest(credentials.password, password)
+    ):
         logger.warning(
             "[req=%s] Rejected web login username=%r client_ip=%s user_agent=%r",
             _REQUEST_ID.get(),
@@ -260,11 +292,18 @@ def require_login(
             _client_ip(request),
             _safe_user_agent(request),
         )
-        raise HTTPException(401, "Invalid credentials", headers={"WWW-Authenticate": "Basic"})
+        raise HTTPException(
+            401,
+            "Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
 
-    token = _AUTH_USER.set(username)
+    # Keep the username in this request's context for kubectl tracing. Do not
+    # reset this ContextVar from middleware: Starlette/FastAPI may execute the
+    # dependency in a different context from BaseHTTPMiddleware.
+    _AUTH_USER.set(username)
+    request.state.auth_user = username
     _log_client_identity(request, username)
-    request.state.auth_context_token = token
 
 
 app = FastAPI(title="KubeDeck Web")
@@ -278,6 +317,7 @@ async def trace_requests(request: Request, call_next):
     query = request.url.query
     target = request.url.path + (f"?{query}" if query else "")
     client_ip = _client_ip(request)
+
     logger.info(
         "[req=%s] HTTP START: %s %s client_ip=%s user_agent=%r",
         request_id,
@@ -290,10 +330,11 @@ async def trace_requests(request: Request, call_next):
     try:
         response = await call_next(request)
         duration_ms = (perf_counter() - started) * 1000
+        username = getattr(request.state, "auth_user", "-")
         logger.info(
             "[req=%s] HTTP END user=%r: %s %s -> %s duration=%.1f ms client_ip=%s",
             request_id,
-            _AUTH_USER.get(),
+            username,
             request.method,
             target,
             response.status_code,
@@ -302,10 +343,11 @@ async def trace_requests(request: Request, call_next):
         )
         return response
     except Exception:
+        username = getattr(request.state, "auth_user", "-")
         logger.exception(
             "[req=%s] HTTP EXCEPTION user=%r: %s %s client_ip=%s (%.1f ms)",
             request_id,
-            _AUTH_USER.get(),
+            username,
             request.method,
             target,
             client_ip,
@@ -313,9 +355,6 @@ async def trace_requests(request: Request, call_next):
         )
         raise
     finally:
-        auth_token = getattr(request.state, "auth_context_token", None)
-        if auth_token is not None:
-            _AUTH_USER.reset(auth_token)
         _REQUEST_ID.reset(request_token)
 
 
@@ -325,16 +364,27 @@ def _ready(status_obj: dict) -> str:
 
 
 def _restarts(status_obj: dict) -> int:
-    return sum(c.get("restartCount", 0) for c in (status_obj.get("containerStatuses") or []))
+    return sum(
+        c.get("restartCount", 0)
+        for c in (status_obj.get("containerStatuses") or [])
+    )
 
 
 def _ns(namespace: Optional[str]) -> str:
-    return f"-n {shlex.quote(namespace)}" if namespace and namespace != "all" else "-A"
+    return (
+        f"-n {shlex.quote(namespace)}"
+        if namespace and namespace != "all"
+        else "-A"
+    )
 
 
 @app.get("/api/health")
 def health(_: None = Depends(require_login)) -> dict:
-    code, *_ = _exec(_ssh(), "kubectl version --client=true -o json 2>&1", 10)
+    code, *_ = _exec(
+        _ssh(),
+        "kubectl version --client=true -o json 2>&1",
+        10,
+    )
     return {"ssh_ok": code == 0}
 
 
@@ -345,33 +395,89 @@ def namespaces(_: None = Depends(require_login)) -> list:
 
 
 @app.get("/api/pods")
-def pods(namespace: Optional[str] = None, _: None = Depends(require_login)) -> list:
-    data = _kubectl(f"get pods {_ns(namespace)} -o json", json_output=True)
+def pods(
+    namespace: Optional[str] = None,
+    _: None = Depends(require_login),
+) -> list:
+    data = _kubectl(
+        f"get pods {_ns(namespace)} -o json",
+        json_output=True,
+    )
     result = []
     for item in data.get("items", []):
-        meta, stat, spec = item.get("metadata", {}), item.get("status", {}), item.get("spec", {})
-        result.append({"name": meta.get("name"), "namespace": meta.get("namespace"), "phase": stat.get("phase"), "ready": _ready(stat), "restarts": _restarts(stat), "node": spec.get("nodeName"), "containers": [c.get("name") for c in spec.get("containers", [])], "startTime": stat.get("startTime")})
+        meta = item.get("metadata", {})
+        stat = item.get("status", {})
+        spec = item.get("spec", {})
+        result.append(
+            {
+                "name": meta.get("name"),
+                "namespace": meta.get("namespace"),
+                "phase": stat.get("phase"),
+                "ready": _ready(stat),
+                "restarts": _restarts(stat),
+                "node": spec.get("nodeName"),
+                "containers": [
+                    c.get("name") for c in spec.get("containers", [])
+                ],
+                "startTime": stat.get("startTime"),
+            }
+        )
     return result
 
 
 @app.get("/api/deployments")
-def deployments(namespace: Optional[str] = None, _: None = Depends(require_login)) -> list:
-    data = _kubectl(f"get deployments {_ns(namespace)} -o json", json_output=True)
+def deployments(
+    namespace: Optional[str] = None,
+    _: None = Depends(require_login),
+) -> list:
+    data = _kubectl(
+        f"get deployments {_ns(namespace)} -o json",
+        json_output=True,
+    )
     result = []
     for item in data.get("items", []):
-        meta, stat, spec = item.get("metadata", {}), item.get("status", {}), item.get("spec", {})
-        result.append({"name": meta.get("name"), "namespace": meta.get("namespace"), "replicas": spec.get("replicas", 0), "ready": stat.get("readyReplicas", 0), "available": stat.get("availableReplicas", 0), "updated": stat.get("updatedReplicas", 0)})
+        meta = item.get("metadata", {})
+        stat = item.get("status", {})
+        spec = item.get("spec", {})
+        result.append(
+            {
+                "name": meta.get("name"),
+                "namespace": meta.get("namespace"),
+                "replicas": spec.get("replicas", 0),
+                "ready": stat.get("readyReplicas", 0),
+                "available": stat.get("availableReplicas", 0),
+                "updated": stat.get("updatedReplicas", 0),
+            }
+        )
     return result
 
 
 @app.get("/api/services")
-def services(namespace: Optional[str] = None, _: None = Depends(require_login)) -> list:
-    data = _kubectl(f"get services {_ns(namespace)} -o json", json_output=True)
+def services(
+    namespace: Optional[str] = None,
+    _: None = Depends(require_login),
+) -> list:
+    data = _kubectl(
+        f"get services {_ns(namespace)} -o json",
+        json_output=True,
+    )
     result = []
     for item in data.get("items", []):
-        meta, spec = item.get("metadata", {}), item.get("spec", {})
-        ports = [f"{p.get('port')}:{p.get('targetPort')}/{p.get('protocol', 'TCP')}" for p in spec.get("ports", [])]
-        result.append({"name": meta.get("name"), "namespace": meta.get("namespace"), "type": spec.get("type"), "clusterIP": spec.get("clusterIP"), "ports": ports})
+        meta = item.get("metadata", {})
+        spec = item.get("spec", {})
+        ports = [
+            f"{p.get('port')}:{p.get('targetPort')}/{p.get('protocol', 'TCP')}"
+            for p in spec.get("ports", [])
+        ]
+        result.append(
+            {
+                "name": meta.get("name"),
+                "namespace": meta.get("namespace"),
+                "type": spec.get("type"),
+                "clusterIP": spec.get("clusterIP"),
+                "ports": ports,
+            }
+        )
     return result
 
 
@@ -380,27 +486,66 @@ def nodes(_: None = Depends(require_login)) -> list:
     data = _kubectl("get nodes -o json", json_output=True)
     result = []
     for item in data.get("items", []):
-        meta, stat = item.get("metadata", {}), item.get("status", {})
-        conditions = {c.get("type"): c.get("status") for c in stat.get("conditions", [])}
-        result.append({"name": meta.get("name"), "ready": conditions.get("Ready") == "True", "cpu": stat.get("capacity", {}).get("cpu"), "memory": stat.get("capacity", {}).get("memory"), "version": stat.get("nodeInfo", {}).get("kubeletVersion")})
+        meta = item.get("metadata", {})
+        stat = item.get("status", {})
+        conditions = {
+            c.get("type"): c.get("status")
+            for c in stat.get("conditions", [])
+        }
+        result.append(
+            {
+                "name": meta.get("name"),
+                "ready": conditions.get("Ready") == "True",
+                "cpu": stat.get("capacity", {}).get("cpu"),
+                "memory": stat.get("capacity", {}).get("memory"),
+                "version": stat.get("nodeInfo", {}).get("kubeletVersion"),
+            }
+        )
     return result
 
 
 @app.get("/api/events")
-def events(namespace: Optional[str] = None, _: None = Depends(require_login)) -> list:
-    data = _kubectl(f"get events {_ns(namespace)} --sort-by=.lastTimestamp -o json", json_output=True)
+def events(
+    namespace: Optional[str] = None,
+    _: None = Depends(require_login),
+) -> list:
+    data = _kubectl(
+        f"get events {_ns(namespace)} --sort-by=.lastTimestamp -o json",
+        json_output=True,
+    )
     result = []
     for item in data.get("items", []):
         obj = item.get("involvedObject", {})
-        result.append({"type": item.get("type"), "reason": item.get("reason"), "message": item.get("message"), "object": f"{obj.get('kind', '')}/{obj.get('name', '')}", "namespace": item.get("metadata", {}).get("namespace"), "lastTimestamp": item.get("lastTimestamp") or item.get("eventTime"), "count": item.get("count", 1)})
+        result.append(
+            {
+                "type": item.get("type"),
+                "reason": item.get("reason"),
+                "message": item.get("message"),
+                "object": f"{obj.get('kind', '')}/{obj.get('name', '')}",
+                "namespace": item.get("metadata", {}).get("namespace"),
+                "lastTimestamp": item.get("lastTimestamp")
+                or item.get("eventTime"),
+                "count": item.get("count", 1),
+            }
+        )
     return list(reversed(result))[:100]
 
 
 @app.get("/api/logs/{namespace}/{pod}")
-def logs(namespace: str, pod: str, container: Optional[str] = None, tail: int = 200, _: None = Depends(require_login)) -> dict:
+def logs(
+    namespace: str,
+    pod: str,
+    container: Optional[str] = None,
+    tail: int = 200,
+    _: None = Depends(require_login),
+) -> dict:
     tail = max(1, min(tail, 2000))
     container_flag = f"-c {shlex.quote(container)} " if container else ""
-    out = _kubectl(f"logs {shlex.quote(pod)} -n {shlex.quote(namespace)} {container_flag}--tail={tail} 2>&1", timeout=20)
+    out = _kubectl(
+        f"logs {shlex.quote(pod)} -n {shlex.quote(namespace)} "
+        f"{container_flag}--tail={tail} 2>&1",
+        timeout=20,
+    )
     return {"logs": out}
 
 
@@ -409,22 +554,44 @@ class ScaleRequest(BaseModel):
 
 
 @app.post("/api/deployments/{namespace}/{name}/restart")
-def restart(namespace: str, name: str, _: None = Depends(require_login)) -> dict:
-    out = _kubectl(f"rollout restart deployment/{shlex.quote(name)} -n {shlex.quote(namespace)} 2>&1")
+def restart(
+    namespace: str,
+    name: str,
+    _: None = Depends(require_login),
+) -> dict:
+    out = _kubectl(
+        f"rollout restart deployment/{shlex.quote(name)} "
+        f"-n {shlex.quote(namespace)} 2>&1"
+    )
     return {"ok": True, "output": out.strip()}
 
 
 @app.post("/api/deployments/{namespace}/{name}/scale")
-def scale(namespace: str, name: str, body: ScaleRequest, _: None = Depends(require_login)) -> dict:
+def scale(
+    namespace: str,
+    name: str,
+    body: ScaleRequest,
+    _: None = Depends(require_login),
+) -> dict:
     if body.replicas < 0 or body.replicas > 100:
         raise HTTPException(400, "replicas must be between 0 and 100")
-    out = _kubectl(f"scale deployment/{shlex.quote(name)} -n {shlex.quote(namespace)} --replicas={body.replicas} 2>&1")
+    out = _kubectl(
+        f"scale deployment/{shlex.quote(name)} "
+        f"-n {shlex.quote(namespace)} --replicas={body.replicas} 2>&1"
+    )
     return {"ok": True, "output": out.strip()}
 
 
 @app.post("/api/pods/{namespace}/{name}/delete")
-def delete(namespace: str, name: str, _: None = Depends(require_login)) -> dict:
-    out = _kubectl(f"delete pod {shlex.quote(name)} -n {shlex.quote(namespace)} 2>&1")
+def delete(
+    namespace: str,
+    name: str,
+    _: None = Depends(require_login),
+) -> dict:
+    out = _kubectl(
+        f"delete pod {shlex.quote(name)} "
+        f"-n {shlex.quote(namespace)} 2>&1"
+    )
     return {"ok": True, "output": out.strip()}
 
 
@@ -451,7 +618,11 @@ _server_port: Optional[int] = None
 _SERVER_LOCK = threading.RLock()
 
 
-def _reserve_port(host: str, preferred_port: int, attempts: int = 100) -> tuple[int, socket.socket]:
+def _reserve_port(
+    host: str,
+    preferred_port: int,
+    attempts: int = 100,
+) -> tuple[int, socket.socket]:
     last_error = None
     for candidate in range(preferred_port, preferred_port + attempts):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -461,12 +632,19 @@ def _reserve_port(host: str, preferred_port: int, attempts: int = 100) -> tuple[
             sock.listen(socket.SOMAXCONN)
             sock.setblocking(False)
             if candidate != preferred_port:
-                logger.warning("Web port %s is occupied; using port %s instead", preferred_port, candidate)
+                logger.warning(
+                    "Web port %s is occupied; using port %s instead",
+                    preferred_port,
+                    candidate,
+                )
             return candidate, sock
         except OSError as exc:
             last_error = exc
             sock.close()
-    raise OSError(f"Unable to bind Web App to ports {preferred_port}-{preferred_port + attempts - 1}: {last_error}")
+    raise OSError(
+        f"Unable to bind Web App to ports {preferred_port}-"
+        f"{preferred_port + attempts - 1}: {last_error}"
+    )
 
 
 def get_server_url() -> str:
@@ -480,30 +658,48 @@ def get_server_url() -> str:
     return f"http://127.0.0.1:{port}"
 
 
-def start_server(ssh_provider: Callable[[], Optional[paramiko.SSHClient]], host: Optional[str] = None, port: Optional[int] = None) -> bool:
+def start_server(
+    ssh_provider: Callable[[], Optional[paramiko.SSHClient]],
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+) -> bool:
     global _server, _server_thread, _server_port
     host = (host or os.environ.get("WEBAPP_HOST", "0.0.0.0")).strip() or "0.0.0.0"
     try:
         preferred_port = int(port or os.environ.get("WEBAPP_PORT", "8000"))
     except ValueError:
         preferred_port = 8000
+
     configure_runtime(ssh_provider)
+
     with _SERVER_LOCK:
         if _server_thread is not None and _server_thread.is_alive():
             return False
+
         try:
             selected_port, reserved_socket = _reserve_port(host, preferred_port)
         except OSError:
             logger.exception("Unable to start KubeDeck Web server")
             return False
 
-        config = uvicorn.Config(app, host=host, port=selected_port, log_level="info", access_log=True, log_config=None)
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=selected_port,
+            log_level="info",
+            access_log=True,
+            log_config=None,
+        )
         server = uvicorn.Server(config)
         _server = server
         _server_port = selected_port
 
         def run() -> None:
-            logger.info("Starting KubeDeck Web on http://%s:%s", host, selected_port)
+            logger.info(
+                "Starting KubeDeck Web on http://%s:%s",
+                host,
+                selected_port,
+            )
             try:
                 server.run(sockets=[reserved_socket])
             except Exception:
@@ -515,7 +711,11 @@ def start_server(ssh_provider: Callable[[], Optional[paramiko.SSHClient]], host:
                     pass
                 logger.info("KubeDeck Web server stopped")
 
-        _server_thread = threading.Thread(target=run, name="KubeDeck-Web", daemon=True)
+        _server_thread = threading.Thread(
+            target=run,
+            name="KubeDeck-Web",
+            daemon=True,
+        )
         _server_thread.start()
         return True
 
@@ -527,8 +727,10 @@ def stop_server(timeout: float = 3.0) -> None:
         _server = None
         _server_thread = None
         _server_port = None
+
     if server is not None:
         logger.info("Stopping KubeDeck Web server")
         server.should_exit = True
+
     if thread is not None and thread.is_alive():
         thread.join(timeout=timeout)
