@@ -1985,7 +1985,7 @@ class KubernetesTab(QWidget):
     ctrl_row.addWidget(self.port_kill)
 
     self.tunnel_restart_btn = self._toolbar_btn(
-      "↻ Restart Tunneling",
+      " Restart Tunneling",
       tooltip=(
         "Runs 'kubectl port-forward' directly on the connected VM for each\n"
         "selected service, e.g.:\n"

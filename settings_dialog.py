@@ -191,10 +191,10 @@ class SettingsDialog(QDialog):
         lay.addWidget(title)
 
         tabs = SwipeTabWidget()
-        tabs.addTab(self._build_security_tab(), "🔒  Security")
-        tabs.addTab(self._build_k8s_tab(), "⎈  Kubernetes Tabs")
-        tabs.addTab(self._build_ai_tab(), "🤖  AI")
-        tabs.addTab(self._build_webapp_tab(), "🌐  Web App")
+        tabs.addTab(self._build_security_tab(), " 🔒  Security ")
+        tabs.addTab(self._build_k8s_tab(), " ⎈  Kubernetes Tabs ")
+        tabs.addTab(self._build_ai_tab(), " 🤖  AI ")
+        tabs.addTab(self._build_webapp_tab(), " 🌐  Web App ")
         lay.addWidget(tabs, 1)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
