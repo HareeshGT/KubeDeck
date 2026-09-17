@@ -113,7 +113,7 @@ elif [ ! -t 0 ]; then
   # curl on a freshly provisioned instance, driven by cloud-init/CI,
   # run over a non-interactive SSH command, etc.) — a `read` prompt
   # here would just hang forever with no one able to answer it. Fall
-  # back to main/master, same as `git clone` would pick by default.
+  # back to the repository's default branch.
   echo "No TTY detected and no branch given — defaulting to the default branch."
 
   DEFAULT_BRANCH="$(
@@ -170,7 +170,6 @@ echo
 if [ -d "$DIR/.git" ]; then
   echo "Repository already exists. Updating..."
   cd "$DIR"
-  rm -rf ./webapp
 
   git fetch --prune origin
 
@@ -400,11 +399,7 @@ fi
 echo
 echo "Checking pip..."
 
-if [[ "$OS" == "Darwin" ]]; then
-  "$PYTHON" -m pip --version
-else
-  "$PYTHON" -m pip --version
-fi
+"$PYTHON" -m pip --version
 
 # --------------------------------------------------
 # Install Python Requirements
@@ -523,6 +518,50 @@ if ! "$PYTHON" -c "import PyInstaller" >/dev/null 2>&1; then
 fi
 
 # --------------------------------------------------
+# Prepare Web App Static Assets
+# --------------------------------------------------
+
+echo
+echo "Preparing KubeDeck Web UI assets..."
+
+WEBAPP_INDEX="webapp/static/index.html"
+WEBAPP_FALLBACK="webapp/static_content.py"
+
+if [ ! -f "$WEBAPP_INDEX" ]; then
+  echo
+  echo "ERROR: KubeDeck Web UI was not found:"
+  echo "$WEBAPP_INDEX"
+  exit 1
+fi
+
+# Keep the PyInstaller fallback synchronized with the real index.html.
+# Normal builds package webapp/static directly; the fallback remains useful
+# when the static directory cannot be resolved from a frozen application.
+"$PYTHON" - <<'PY'
+from pathlib import Path
+import base64
+import gzip
+
+source = Path("webapp/static/index.html")
+target = Path("webapp/static_content.py")
+
+html = source.read_bytes()
+encoded = base64.b64encode(gzip.compress(html, compresslevel=9)).decode("ascii")
+target.write_text(
+    "# Auto-generated fallback used when KubeDeck runs from a PyInstaller bundle.\n"
+    "# Source: webapp/static/index.html\n"
+    "import base64\n"
+    "import gzip\n\n"
+    "INDEX_HTML = gzip.decompress(base64.b64decode(\n"
+    "    '''" + encoded + "'''\n"
+    ")).decode(\"utf-8\")\n",
+    encoding="utf-8",
+)
+print(f"[OK] Web UI source: {source} ({len(html):,} bytes)")
+print(f"[OK] Web UI fallback synchronized: {target}")
+PY
+
+# --------------------------------------------------
 # Select Icon
 # --------------------------------------------------
 
@@ -581,6 +620,10 @@ CMD=(
   --hidden-import=paramiko
   --collect-all=paramiko
 
+  # Embedded Web App
+  --hidden-import=webapp
+  --hidden-import=webapp.server
+
   # AI provider support
   --hidden-import=ai_assist
 
@@ -619,6 +662,22 @@ else
   )
 fi
 
+# Bundle the actual Web App HTML so the packaged application always uses
+# the same UI as webapp/static/index.html in the selected GitHub branch.
+if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
+  CMD=(
+    "${CMD[@]:0:${#CMD[@]}-1}"
+    "--add-data=webapp/static;webapp/static"
+    "main.py"
+  )
+else
+  CMD=(
+    "${CMD[@]:0:${#CMD[@]}-1}"
+    "--add-data=webapp/static:webapp/static"
+    "main.py"
+  )
+fi
+
 "${CMD[@]}"
 
 # --------------------------------------------------
@@ -644,14 +703,22 @@ if [[ "$OS" == "Darwin" ]]; then
     exit 1
   fi
 
-  /usr/libexec/PlistBuddy     -c "Delete :NSMicrophoneUsageDescription"     "$APP_PLIST" 2>/dev/null || true
+  /usr/libexec/PlistBuddy \
+    -c "Delete :NSMicrophoneUsageDescription" \
+    "$APP_PLIST" 2>/dev/null || true
 
-  /usr/libexec/PlistBuddy     -c "Add :NSMicrophoneUsageDescription string 'KubeDeck uses the microphone for Kubernetes voice commands.'"     "$APP_PLIST"
+  /usr/libexec/PlistBuddy \
+    -c "Add :NSMicrophoneUsageDescription string 'KubeDeck uses the microphone for Kubernetes voice commands.'" \
+    "$APP_PLIST"
 
   # Give the application a stable bundle identifier.
-  /usr/libexec/PlistBuddy     -c "Delete :CFBundleIdentifier"     "$APP_PLIST" 2>/dev/null || true
+  /usr/libexec/PlistBuddy \
+    -c "Delete :CFBundleIdentifier" \
+    "$APP_PLIST" 2>/dev/null || true
 
-  /usr/libexec/PlistBuddy     -c "Add :CFBundleIdentifier string 'com.hareeshgt.ec2manager'"     "$APP_PLIST"
+  /usr/libexec/PlistBuddy \
+    -c "Add :CFBundleIdentifier string 'com.hareeshgt.ec2manager'" \
+    "$APP_PLIST"
 
   echo "Microphone usage description added."
   echo "Bundle identifier: com.hareeshgt.ec2manager"
@@ -662,16 +729,14 @@ if [[ "$OS" == "Darwin" ]]; then
   echo
   echo "Re-signing macOS application..."
 
-  codesign     --deep     --force     --sign -     "$APP_PATH"
+  codesign \
+    --deep \
+    --force \
+    --sign - \
+    "$APP_PATH"
 
   echo "Application re-signed."
 
-  # The application is launched from Finder, so its PATH cannot be
-  # assumed to contain Homebrew's bin directory.
-  #
-  # The Python application itself adds /opt/homebrew/bin to PATH before
-  # speech recognition, while this check verifies that native FLAC is
-  # available during installation.
   if [ -x "$(brew --prefix)/bin/flac" ]; then
     echo
     echo "Using native Homebrew FLAC:"
@@ -683,7 +748,9 @@ if [[ "$OS" == "Darwin" ]]; then
 
   # Verify the privacy key survived the final bundle/signing step.
   MICROPHONE_DESC=$(
-    /usr/libexec/PlistBuddy       -c "Print :NSMicrophoneUsageDescription"       "$APP_PLIST" 2>/dev/null || true
+    /usr/libexec/PlistBuddy \
+      -c "Print :NSMicrophoneUsageDescription" \
+      "$APP_PLIST" 2>/dev/null || true
   )
 
   if [ -z "$MICROPHONE_DESC" ]; then
@@ -742,12 +809,6 @@ Linux)
   $SUDO mkdir -p "/opt/KubeDeck"
   $SUDO cp -R "dist/KubeDeck/." "/opt/KubeDeck/"
 
-  # A raw copy under /opt isn't launchable on its own — a plain PATH
-  # symlink covers terminal use on any distro/instance, and a .desktop
-  # entry (freedesktop.org standard, so it works across GNOME/KDE/XFCE/
-  # etc.) covers being launchable from a graphical menu wherever one
-  # exists. Both are best-effort: headless instances have no
-  # /usr/share/applications consumer, so a failure there is harmless.
   if [ -d "/usr/local/bin" ] || $SUDO mkdir -p "/usr/local/bin" 2>/dev/null; then
     $SUDO ln -sf "/opt/KubeDeck/KubeDeck" "/usr/local/bin/kubedeck" 2>/dev/null || true
   fi
@@ -835,4 +896,6 @@ echo " [OK] Google Web Speech voice input"
 echo " [OK] PyAudio microphone support"
 echo " [OK] Native FLAC support"
 echo " [OK] AI operation history"
+echo " [OK] Current Web App UI"
+echo " [OK] Embedded Web App static assets"
 echo
