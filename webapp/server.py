@@ -39,7 +39,7 @@ except ImportError:  # pragma: no cover
 APP_DIR = Path(__file__).resolve().parent
 STATE_DIR = Path(os.path.expanduser("~")) / ".vm_visualizer"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = STATE_DIR / "webapp.log"
+LOG_FILE = STATE_DIR / "logs/webapp.log"
 
 logger = logging.getLogger("kubedeck.webapp")
 if not logger.handlers:
