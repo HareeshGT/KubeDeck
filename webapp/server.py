@@ -7,8 +7,6 @@ own; commands use KubeDeck's managed SSH session helper from workers.py.
 
 from __future__ import annotations
 
-import base64
-import gzip
 import json
 import logging
 import os
@@ -20,7 +18,7 @@ from typing import Callable, Optional
 
 import paramiko
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
@@ -88,7 +86,6 @@ def _exec(ssh: paramiko.SSHClient, command: str, timeout: int = 30) -> tuple[int
             try: stream.close()
             except Exception: pass
         return code, out, err
-
     with managed_exec_command(ssh, command, channel_timeout=10) as (_stdin, stdout, stderr):
         code = stdout.channel.recv_exit_status()
         return code, stdout.read().decode("utf-8", errors="replace"), stderr.read().decode("utf-8", errors="replace")
