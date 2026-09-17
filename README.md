@@ -1,11 +1,11 @@
 # KubeDeck
 
 <p align="center">
-  <strong>A powerful desktop control center for AWS EC2, Kubernetes, SSH, SFTP, FTP, and cloud operations.</strong>
+  <strong>A desktop control center for AWS EC2, Kubernetes, SSH, SFTP, FTP, remote files, and cloud operations.</strong>
 </p>
 
 <p align="center">
-  Manage your infrastructure from a single desktop application instead of jumping between terminals, SSH clients, file managers, and Kubernetes tools.
+  Manage infrastructure from one desktop application instead of switching between terminals, SSH clients, file managers, Kubernetes tools, and dashboards.
 </p>
 
 <p align="center">
@@ -27,25 +27,23 @@
 
 ## Overview
 
-**KubeDeck** is a desktop infrastructure management application designed to bring common cloud and DevOps workflows into a single interface.
+**KubeDeck** is a Python desktop infrastructure-management application built around common DevOps and cloud workflows.
 
-Instead of using separate applications for:
+It combines:
 
-- AWS EC2 management
-- SSH
-- SFTP
-- FTP
+- AWS EC2 access
+- SSH and SFTP
 - Remote file management
-- Kubernetes
-- Terminal sessions
-- Port forwarding
-- Logs
-- Cluster dashboards
-- Infrastructure troubleshooting
+- FTP
+- Integrated terminal access
+- Kubernetes management
+- Pod logs and exec
+- Port forwarding and tunnels
+- AI-assisted operations
+- An embedded mobile-friendly Web App
+- Application security and settings
 
-KubeDeck provides a unified desktop experience.
-
-It is particularly useful for developers, DevOps engineers, SREs, platform engineers, and anyone who regularly works with remote Linux systems and Kubernetes clusters.
+The goal is to make remote infrastructure feel like a single, consistent workspace.
 
 ---
 
@@ -53,24 +51,20 @@ It is particularly useful for developers, DevOps engineers, SREs, platform engin
 
 ## ☁️ AWS EC2 Management
 
-Connect to and work with remote EC2 instances from a desktop interface.
+Connect to and work with remote EC2 instances from the desktop application.
 
 Features include:
 
 - EC2 instance connections
 - SSH connectivity
-- SFTP file management
 - Recent instance tracking
 - Remote filesystem browsing
 - Remote command execution
-- Integrated terminal
-- File upload/download
+- File upload and download
 - Remote file editing
 - Search
 - Media/file handling
 - Sudo filesystem access
-
-KubeDeck is designed to make an EC2 instance feel more like a local workstation.
 
 ---
 
@@ -78,9 +72,7 @@ KubeDeck is designed to make an EC2 instance feel more like a local workstation.
 
 KubeDeck includes an integrated terminal for remote systems.
 
-Instead of opening a separate terminal application for every server, you can work directly inside KubeDeck.
-
-Use it for:
+You can run normal Linux and infrastructure commands directly inside the application, for example:
 
 ```bash
 kubectl get pods
@@ -90,19 +82,16 @@ df -h
 top
 ```
 
-and other normal Linux workflows.
-
 ---
 
 ## 📁 Remote File Manager
 
-KubeDeck provides a Finder-style remote filesystem interface.
+A Finder-style interface for remote filesystems.
 
 You can:
 
 - Browse directories
-- Create files
-- Create directories
+- Create files and directories
 - Rename files
 - Delete files
 - Upload files
@@ -113,40 +102,21 @@ You can:
 - Open remote media
 - Work with privileged directories
 
-The interface is designed to reduce the need for repeated commands such as:
-
-```text
-scp
-sftp
-ssh
-cp
-mv
-rm
-vim
-nano
-```
-
 ---
 
 ## 🔐 Sudo Filesystem Access
 
-Many production systems restrict important directories to `root`.
+KubeDeck supports privileged filesystem operations when protected paths require elevated access.
 
-KubeDeck supports switching into a privileged filesystem context when required.
-
-This makes it possible to work with protected paths without manually performing repetitive privilege escalation operations.
+This is intended to reduce repetitive manual privilege-escalation workflows when working with server files.
 
 ---
 
 # ☸️ Kubernetes Management
 
-KubeDeck includes a dedicated Kubernetes management interface.
+KubeDeck provides a dedicated Kubernetes management interface for common cluster operations.
 
-It works with clusters accessible through your local Kubernetes configuration and provides a graphical interface for common Kubernetes operations.
-
-### Supported resources
-
-The Kubernetes interface includes views for resources such as:
+Supported resource views include:
 
 - Pods
 - Deployments
@@ -168,21 +138,9 @@ The Kubernetes interface includes views for resources such as:
 
 ## 📊 Kubernetes Dashboard
 
-The dashboard provides a high-level view of cluster activity.
+The Kubernetes dashboard provides a high-level view of cluster activity, workloads, resources, events, and health information.
 
-You can inspect:
-
-- Cluster resources
-- Workloads
-- Pods
-- Services
-- Storage
-- Resource usage
-- Kubernetes objects
-- Events
-- Workload health
-
-The goal is to provide useful operational information without requiring every action to begin with:
+It is designed to reduce the need to start every investigation from commands such as:
 
 ```bash
 kubectl get ...
@@ -192,26 +150,26 @@ kubectl get ...
 
 ## 📦 Pod Management
 
-KubeDeck provides operational tools for Kubernetes pods.
-
-You can inspect:
+KubeDeck provides pod-focused operational workflows including:
 
 - Pod status
-- Pod details
 - Container information
+- Restart counts
+- Node information
+- Pod details
 - Pod logs
-- Events
+- Kubernetes events
 - Container execution
 
-You can also open an interactive terminal inside containers where supported.
+Running containers can also be opened for interactive shell access where supported.
 
 ---
 
 ## 📜 Kubernetes Logs
 
-Inspect pod and container logs directly from the application.
+Inspect pod and container logs directly from KubeDeck.
 
-This is useful for quickly investigating:
+Useful for investigating:
 
 - Application failures
 - CrashLoopBackOff
@@ -224,7 +182,7 @@ This is useful for quickly investigating:
 
 ## 🖥️ Kubernetes Exec
 
-Open an interactive shell inside a running container.
+Open an interactive shell inside a running container from the UI.
 
 Typical workflows such as:
 
@@ -238,15 +196,15 @@ or:
 kubectl exec -it <pod> -- /bin/sh
 ```
 
-can be performed from the application.
+can be performed without leaving KubeDeck.
 
 ---
 
 ## 🔀 Port Forwarding & Tunnels
 
-KubeDeck provides support for Kubernetes port-forwarding and remote tunnels.
+KubeDeck supports Kubernetes port forwarding and remote tunnel workflows.
 
-This is useful for accessing internal services such as:
+This can be useful for accessing internal services such as:
 
 - Grafana
 - Prometheus
@@ -256,84 +214,163 @@ This is useful for accessing internal services such as:
 - Development services
 - Kubernetes dashboards
 
-without exposing those services publicly.
-
-
----
-
-# 📡 FTP
-
-KubeDeck also includes FTP functionality for working with FTP-connected systems.
-
-The FTP interface provides a graphical file-management experience for connected devices and remote filesystems.
+without directly exposing those services publicly.
 
 ---
 
-# 🧠 AI / Ops Assistant
+# 🌐 Embedded Web App
 
-KubeDeck includes AI-assisted operational functionality.
+KubeDeck now includes an **embedded Web App** that starts automatically with the desktop application.
 
-The goal is to make infrastructure troubleshooting more accessible by combining infrastructure context with an AI assistant.
+The Web App provides a mobile-friendly interface for monitoring and performing common Kubernetes operations from a phone, tablet, or another device that can reach the KubeDeck host.
 
-Depending on the configured provider, AI functionality can be used to help with:
+### Web App capabilities
+
+- Mobile-friendly Kubernetes dashboard
+- Namespace listing
+- Pod listing
+- Deployment listing
+- Service listing
+- Node listing
+- Kubernetes events
+- Pod/container logs
+- Deployment restart
+- Deployment scaling
+- Pod deletion
+- Basic authentication
+- Health endpoint
+
+### Existing SSH connection is reused
+
+The embedded Web App does **not** create a second SSH connection to the VM.
+
+KubeDeck passes its existing live SSH client to the Web App runtime, and Web App Kubernetes operations are executed through that managed session.
+
+This keeps the desktop and Web App on the same connection path and avoids unnecessary duplicate SSH sessions.
+
+### Web App credentials
+
+Web App credentials are configured from:
+
+```text
+Settings → Web App
+```
+
+You can configure:
+
+- Web App username
+- Web App password
+
+The settings are loaded dynamically by the embedded server, so credential changes take effect without duplicating them in a separate Web App `.env` file.
+
+### Web App logging
+
+The embedded server writes logs to:
+
+```text
+~/.vm_visualizer/webapp.log
+```
+
+### Web App configuration
+
+The Web App can use environment variables for its listener configuration:
+
+```text
+WEBAPP_HOST
+WEBAPP_PORT
+```
+
+The server normally binds to an externally reachable host address while keeping the UI login protected by Basic Authentication.
+
+### Remote access
+
+Because the Web App is a network service, remote-device access depends on network connectivity between the client and the machine running KubeDeck.
+
+A private network such as a VPN or mesh VPN can be used when you need to access the Web App while the phone and computer are on different physical networks.
+
+---
+
+# 👆 Swipeable Settings
+
+The Settings dialog supports swipe-style navigation between its tabs.
+
+You can:
+
+- Swipe left to move to the next Settings tab
+- Swipe right to move to the previous Settings tab
+- Use horizontal trackpad gestures on supported systems
+- Drag horizontally with the mouse
+- Continue using normal tab clicks
+
+The swipe can begin from the tab content area, so navigation does not depend on clicking the tab header itself.
+
+---
+
+# 🤖 AI / Ops Assistant
+
+KubeDeck includes AI-assisted infrastructure workflows.
+
+Depending on the configured provider, AI functionality can help with:
 
 - Troubleshooting
-- Understanding errors
-- Explaining infrastructure output
-- Kubernetes investigation
 - Log analysis
+- Explaining infrastructure errors
+- Kubernetes investigation
 - Command assistance
 - Operational questions
+- Pod diagnosis
 
-The AI functionality is designed as an assistant rather than a replacement for normal infrastructure controls.
+AI provider settings are managed from the application Settings dialog.
+
+---
+
+# 🎨 UI, Themes & SVG Icons
+
+KubeDeck uses a consistent desktop UI with persistent theme settings and SVG-based icons.
+
+The SVG icon system centralizes icon rendering through `ui_icons.py` and supports crisp HiDPI rendering, including Retina displays.
+
+The application can map semantic labels to icons so controls can stay consistent across different parts of the UI.
 
 ---
 
 # 🔒 Security
 
-Security is an important part of KubeDeck.
-
 ## Application Lock
 
-KubeDeck supports application locking using a PIN.
+KubeDeck supports a PIN-protected application lock.
 
-The application can automatically lock after inactivity.
+The app can lock automatically after a configurable inactivity period.
 
----
+## PIN Storage
 
-## PIN Security
-
-The application lock uses password-derived cryptographic storage rather than storing the PIN as plain text.
+PIN-related security uses password-derived cryptographic storage rather than storing the PIN itself as plain text.
 
 PBKDF2-SHA256 is used for PIN-related security.
 
+## Web App Authentication
+
+The embedded Web App requires a username and password configured in KubeDeck Settings.
+
+## Credential Handling
+
+Do not commit private keys, passwords, API keys, tokens, or other secrets to the repository.
+
 ---
 
-## SSH Credentials
+# 📡 FTP
 
-KubeDeck is designed to work with SSH credentials without requiring credentials to be embedded directly into application source code.
+KubeDeck also provides FTP functionality for connected devices and remote filesystems.
 
-Users should still follow normal credential-management practices and avoid committing private keys, passwords, tokens, or other secrets to Git repositories.
-
----
-
-# 🎨 Themes
-
-KubeDeck supports a customizable desktop interface with persistent theme settings.
-
-The application includes a dark, infrastructure-oriented visual design and supports configurable themes.
-
-Settings are persisted so that the application can retain user preferences between sessions.
+The FTP interface is designed for graphical file-management workflows similar to the remote SFTP experience.
 
 ---
 
 # 🧩 Architecture
 
-KubeDeck is a Python desktop application built around a modular UI architecture.
+KubeDeck is being actively modularized so major infrastructure capabilities can evolve independently instead of putting application logic into one monolithic file.
 
-The application separates major infrastructure functions into dedicated components.
-
-Some of the major areas include:
+Key areas include:
 
 ```text
 KubeDeck/
@@ -347,12 +384,14 @@ KubeDeck/
 │
 ├── terminal_widget.py
 ├── editor_widgets.py
+├── file_widgets.py
 │
 ├── dialogs.py
 ├── workers.py
 │
 ├── settings_dialog.py
 ├── themes.py
+├── ui_icons.py
 │
 ├── security.py
 ├── lock_screen.py
@@ -360,11 +399,17 @@ KubeDeck/
 │
 ├── ftp_fs.py
 ├── ai_assist.py
+├── k8s_ai_ops.py
+│
+├── webapp/
+│   ├── app.py
+│   ├── server.py
+│   ├── static/
+│   │   └── index.html
+│   └── ...
 │
 └── ...
 ```
-
-The project is being actively modularized so that individual infrastructure features can evolve independently instead of placing all application functionality into a single monolithic file.
 
 ---
 
@@ -373,33 +418,39 @@ The project is being actively modularized so that individual infrastructure feat
 KubeDeck is primarily built with:
 
 - Python
-- Qt / PyQt
-- SSH/SFTP tooling
+- PyQt / Qt
+- Paramiko
 - Kubernetes tooling
+- `kubectl`
 - AWS infrastructure
-- FTP
+- FTP/SFTP tooling
+- FastAPI
+- Uvicorn
 - AI APIs
 - Shell commands
 - JSON-based application settings
 
-The application integrates with existing infrastructure tools rather than attempting to replace the underlying platforms.
-
-For example:
+Architecture at a high level:
 
 ```text
-KubeDeck
-   │
-   ├── AWS / EC2
-   │
-   ├── SSH / SFTP
-   │
-   ├── FTP
-   │
-   ├── kubectl
-   │
-   ├── Kubernetes
-   │
-   └── AI providers
+                    ┌──────────────────────┐
+                    │       KubeDeck       │
+                    │   Desktop UI / App   │
+                    └──────────┬───────────┘
+                               │
+             ┌─────────────────┼─────────────────┐
+             │                 │                 │
+             ▼                 ▼                 ▼
+        AWS / EC2         Kubernetes       Remote Files
+             │                 │                 │
+             ▼                 ▼                 ▼
+         SSH / SFTP        kubectl/API       SFTP / FTP
+                               │
+                               ▼
+                       Embedded Web App
+                               │
+                               ▼
+                       Phone / Tablet UI
 ```
 
 ---
@@ -408,7 +459,7 @@ KubeDeck
 
 KubeDeck is primarily developed and tested on macOS.
 
-Depending on the features being used, you may need:
+Depending on the features you use, you may need:
 
 - Python 3
 - SSH client
@@ -416,60 +467,41 @@ Depending on the features being used, you may need:
 - Kubernetes credentials / kubeconfig
 - AWS credentials where required
 - Appropriate SSH keys
-- Network access to the target systems
+- Network access to target systems
 
-For Kubernetes functionality, a working Kubernetes configuration is expected.
-
-Verify your Kubernetes configuration with:
+For Kubernetes workflows, verify that Kubernetes access is working in your environment.
 
 ```bash
 kubectl config get-contexts
-```
-
-and:
-
-```bash
 kubectl cluster-info
+kubectl get nodes
 ```
 
 ---
 
 # 🚀 Installation
 
-## 1. Clone the repository
+## Clone the repository
 
 ```bash
 git clone https://github.com/HareeshGT/KubeDeck.git
 cd KubeDeck
 ```
 
----
-
-## 2. Create a virtual environment
+## Create a virtual environment
 
 ```bash
 python3 -m venv .venv
-```
-
-Activate it:
-
-### macOS / Linux
-
-```bash
 source .venv/bin/activate
 ```
 
-### Windows
+On Windows:
 
 ```powershell
 .venv\Scripts\activate
 ```
 
----
-
-## 3. Install dependencies
-
-If the repository contains a `requirements.txt`:
+## Install dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -485,33 +517,23 @@ From the project directory:
 python3 main.py
 ```
 
-If your environment uses a specific Python executable:
-
-```bash
-/usr/bin/python3 main.py
-```
-
 or:
 
 ```bash
 python main.py
 ```
 
-depending on your environment.
-
 ---
 
 # ☸️ Kubernetes Setup
 
-KubeDeck uses your Kubernetes configuration for cluster access.
-
-Check your available contexts:
+Check available contexts:
 
 ```bash
 kubectl config get-contexts
 ```
 
-Select the required context:
+Select the context you need:
 
 ```bash
 kubectl config use-context <context-name>
@@ -523,13 +545,11 @@ Verify access:
 kubectl get nodes
 ```
 
-Once `kubectl` can communicate with the cluster, KubeDeck can use the same Kubernetes environment.
-
 ---
 
 # ☁️ AWS Setup
 
-For EC2 workflows, configure AWS credentials using the standard AWS credential mechanisms supported by your environment.
+For EC2 workflows, configure AWS credentials using the standard AWS mechanisms available in your environment.
 
 For example:
 
@@ -543,48 +563,101 @@ Verify:
 aws sts get-caller-identity
 ```
 
-KubeDeck can then work with EC2 infrastructure using the credentials available to the environment.
-
 ---
 
 # 🔑 SSH Setup
 
-For SSH-based EC2 connections, ensure that the required SSH credentials are available.
-
-Example:
+Make sure the SSH key has appropriate permissions:
 
 ```bash
 chmod 600 ~/.ssh/my-key.pem
 ```
 
-You should be able to connect to the target instance normally:
+Test SSH access independently:
 
 ```bash
 ssh -i ~/.ssh/my-key.pem ubuntu@<EC2-IP>
 ```
 
-Once SSH access works, the same connection information can be configured in KubeDeck.
+Once the SSH connection works, configure the corresponding connection details in KubeDeck.
 
 ---
 
 # ⚙️ Application Settings
 
-KubeDeck stores application preferences locally.
+The Settings dialog provides configuration for application behavior and infrastructure features.
 
-Settings can include:
+Available areas include:
 
-- Theme
-- UI preferences
-- Recent connections
-- Application behavior
-- Download locations
-- Other persistent configuration
+- Security / PIN lock
+- Kubernetes tab visibility
+- Protected Kubernetes namespaces
+- AI providers, models, and API keys
+- Web App username and password
+- Theme and other application preferences
 
-Downloads default to the user's:
+---
+
+# 🌐 Web App Quick Start
+
+1. Start KubeDeck.
+2. Connect to the VM as usual.
+3. Open **Settings → Web App**.
+4. Configure the Web App username and password.
+5. Make sure the Web App port is reachable from the client device.
+6. Open the Web App URL from your phone or tablet.
+
+For devices on different physical networks, use a private VPN or mesh VPN between the devices or their networks.
+
+---
+
+# 🧪 Development
+
+Clone the repository:
+
+```bash
+git clone https://github.com/HareeshGT/KubeDeck.git
+cd KubeDeck
+```
+
+Create the environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Run the application:
+
+```bash
+python3 main.py
+```
+
+---
+
+# 📦 Building the Application
+
+KubeDeck includes an installer script for packaging the application.
+
+```bash
+./installer.sh
+```
+
+The installer can work with a selected Git branch and packages the Web App static assets with the desktop application.
+
+The current Web App UI source of truth is:
 
 ```text
-~/Downloads
+webapp/static/index.html
 ```
+
+During packaging, the installer also regenerates the packaged fallback Web UI from the current `index.html`, preventing an outdated embedded UI from being shipped.
 
 ---
 
@@ -608,14 +681,12 @@ Inspect logs
 Edit / transfer files
 ```
 
----
-
 ## Troubleshoot Kubernetes
 
 ```text
 Open Kubernetes
       ↓
-Select cluster
+Select cluster / context
       ↓
 Inspect namespace
       ↓
@@ -630,99 +701,21 @@ Exec into container
 Investigate / fix
 ```
 
----
-
-## Access an internal service
+## Monitor Kubernetes from a phone
 
 ```text
-Kubernetes
-    ↓
-Select service
-    ↓
-Create port-forward
-    ↓
-localhost:<port>
-    ↓
-Open service locally
+Phone
+  ↓
+Private VPN / reachable network
+  ↓
+KubeDeck Web App
+  ↓
+Existing KubeDeck SSH session
+  ↓
+Remote kubectl
+  ↓
+Kubernetes cluster
 ```
-
----
-
-# 🔄 Remote File Workflow
-
-A typical remote-file workflow looks like:
-
-```text
-EC2
- │
- ├── Connect
- │
- ├── Browse
- │
- ├── Search
- │
- ├── Edit
- │
- ├── Upload
- │
- ├── Download
- │
- └── Execute
-```
-
-This allows common server administration tasks to be performed without repeatedly switching applications.
-
----
-
-# 🧪 Development
-
-Clone the project:
-
-```bash
-git clone https://github.com/HareeshGT/KubeDeck.git
-cd KubeDeck
-```
-
-Create a development environment:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-Install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-Run:
-
-```bash
-python3 main.py
-```
-
----
-
-# 📦 Building a macOS Application
-
-KubeDeck can be packaged as a standalone macOS application using Python application-packaging tooling.
-
-A typical packaging workflow is:
-
-```text
-Python source
-     ↓
-Dependency collection
-     ↓
-Application packaging
-     ↓
-macOS application
-     ↓
-DMG distribution
-```
-
-The exact build command should follow the packaging configuration currently included in the repository.
 
 ---
 
@@ -734,27 +727,15 @@ Verify:
 
 ```bash
 kubectl config get-contexts
-```
-
-Then:
-
-```bash
 kubectl cluster-info
-```
-
-Finally:
-
-```bash
 kubectl get nodes
 ```
 
 If these commands fail outside KubeDeck, fix the Kubernetes configuration first.
 
----
-
 ## SSH connection fails
 
-Test the connection outside KubeDeck:
+Test independently:
 
 ```bash
 ssh -i <key> <user>@<host>
@@ -765,12 +746,40 @@ Check:
 - Host/IP
 - Username
 - SSH key
-- File permissions
+- Key permissions
 - Security groups
 - Network connectivity
 - SSH server availability
 
----
+## Web App cannot be reached
+
+Check that KubeDeck is running and the embedded server has started.
+
+Check the log file:
+
+```bash
+cat ~/.vm_visualizer/webapp.log
+```
+
+Make sure the listening port is reachable from the client device and that the configured Web App credentials are correct.
+
+If using a VPN or mesh VPN, verify both devices are connected to the same private network and can reach one another.
+
+## Web App shows an old UI
+
+The packaged UI should come from:
+
+```text
+webapp/static/index.html
+```
+
+Rebuild the application with:
+
+```bash
+./installer.sh
+```
+
+The installer regenerates the packaged fallback from the current Web App HTML during the build process.
 
 ## Permission denied on SSH key
 
@@ -779,8 +788,6 @@ Use:
 ```bash
 chmod 600 <private-key>
 ```
-
----
 
 ## Port forwarding does not work
 
@@ -791,7 +798,7 @@ kubectl get pods
 kubectl get svc
 ```
 
-Then verify that the target service and port actually exist.
+Then verify that the target service and port exist and are reachable.
 
 ---
 
@@ -815,15 +822,10 @@ private keys
 
 Use environment variables, OS credential stores, SSH agents, or other secure credential-management mechanisms where appropriate.
 
-Before publishing changes, check:
+Before publishing changes, review:
 
 ```bash
 git status
-```
-
-and:
-
-```bash
 git diff
 ```
 
@@ -833,19 +835,18 @@ git diff
 
 Potential future improvements include:
 
-- Improved multi-cluster management
 - More Kubernetes resource actions
-- Better remote filesystem operations
-- Additional cloud-provider integrations
-- Enhanced AI-assisted troubleshooting
-- Improved log analysis
-- Better connection management
+- Improved multi-cluster workflows
+- Better log analysis
+- More AI-assisted troubleshooting
+- More cloud-provider integrations
+- Improved connection management
 - More automation workflows
-- Performance improvements
 - Additional platform support
-- More extensive testing
+- More extensive automated testing
+- Further UI modularization
 
-The project is actively evolving, and the roadmap may change as new infrastructure-management requirements are added.
+The roadmap may change as the project evolves.
 
 ---
 
@@ -853,23 +854,15 @@ The project is actively evolving, and the roadmap may change as new infrastructu
 
 Contributions are welcome.
 
-## Development workflow
-
-Fork the repository:
-
-https://github.com/HareeshGT/KubeDeck
-
-Create a branch:
+Create a feature branch:
 
 ```bash
 git checkout -b feature/my-feature
 ```
 
-Make your changes.
+Make and test your changes.
 
-Test the application.
-
-Review the changes:
+Review them:
 
 ```bash
 git diff
@@ -898,31 +891,30 @@ When reporting a bug, include:
 
 - Operating system
 - Python version
-- KubeDeck version/commit
+- KubeDeck version or commit
 - Relevant logs
 - Steps to reproduce
 - Expected behavior
 - Actual behavior
 - Kubernetes version, if applicable
 
-Avoid posting credentials, tokens, private keys, passwords, or other sensitive information.
+Never include credentials, tokens, private keys, passwords, or other sensitive information in bug reports.
 
 ---
 
 # 📸 Screenshots
 
-Screenshots and demonstrations can be added here as the project UI evolves.
-
-Suggested sections:
+Suggested documentation sections as the project evolves:
 
 - Main dashboard
 - EC2 manager
 - Remote file manager
 - SSH terminal
 - Kubernetes dashboard
-- Kubernetes resource view
+- Kubernetes resource views
 - FTP manager
-- AI/Ops assistant
+- AI / Ops assistant
+- Web App
 - Settings and themes
 
 ---
@@ -968,7 +960,7 @@ If KubeDeck is useful to you:
 
 **KubeDeck**
 
-A unified desktop workspace for cloud and Kubernetes operations.
+A unified desktop workspace for cloud, Kubernetes, and infrastructure operations.
 
 Built for developers, DevOps engineers, SREs, and infrastructure teams.
 
