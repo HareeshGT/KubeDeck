@@ -170,6 +170,7 @@ echo
 if [ -d "$DIR/.git" ]; then
   echo "Repository already exists. Updating..."
   cd "$DIR"
+  rm -rf ./webapp
 
   git fetch --prune origin
 

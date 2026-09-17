@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#151726">
+<title>KubeDeck</title>
+<style>
+  :root {
+    --bg-dark:   #0f1119;
+    --bg-panel:  #171a27;
+    --bg-item:   #1e2233;
+    --bg-hover:  #262b40;
+    --border:    #2a2f42;
+    --text:      #e8eaf0;
+    --text-dim:  #a7acb8;
+    --text-muted:#6b7086;
+    --accent:    #a855f7;
+    --accent2:   #c084fc;
+    --ok:        #22c55e;
+    --warn:      #eab308;
+    --err:       #ef4444;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg-dark); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 15px;
+  }
+  #app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 16px calc(10px + env(safe-area-inset-top, 0px));
+    padding-top: calc(14px + env(safe-area-inset-top, 0px));
+    background: var(--bg-panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    font-size: 17px; margin: 0; display: flex; align-items: center; gap: 8px;
+    font-weight: 600;
+  }
+  header h1 .glyph { color: var(--accent); font-size: 19px; }
+  header .ns-select {
+    background: var(--bg-item); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; font-size: 13px;
+  }
+  #refresh-btn {
+    background: none; border: none; color: var(--text-dim); font-size: 18px;
+    padding: 4px 8px; margin-left: 6px;
+  }
+  #refresh-btn.spinning { animation: spin 0.7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  nav {
+    display: flex; background: var(--bg-panel); border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+  }
+  nav button {
+    flex: 1; background: none; border: none; color: var(--text-dim);
+    padding: 10px 6px; font-size: 13px; font-weight: 500;
+    border-bottom: 2px solid transparent; white-space: nowrap;
+  }
+  nav button.active { color: var(--text); border-bottom-color: var(--accent); }
+
+  main { flex: 1; overflow-y: auto; padding: 10px 12px calc(20px + env(safe-area-inset-bottom, 0px)); }
+
+  .card {
+    background: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 14px; margin-bottom: 10px;
+  }
+  .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+  .card-title { font-weight: 600; font-size: 14.5px; word-break: break-all; }
+  .card-sub { color: var(--text-muted); font-size: 12.5px; margin-top: 2px; }
+  .badge {
+    font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 999px;
+    white-space: nowrap; text-transform: uppercase; letter-spacing: 0.02em;
+  }
+  .badge.ok    { background: rgba(34,197,94,0.15);  color: var(--ok); }
+  .badge.warn  { background: rgba(234,179,8,0.15);   color: var(--warn); }
+  .badge.err   { background: rgba(239,68,68,0.15);   color: var(--err); }
+  .badge.muted { background: rgba(167,172,184,0.15); color: var(--text-dim); }
+
+  .card-meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; font-size: 12.5px; color: var(--text-dim); }
+  .card-meta span b { color: var(--text); font-weight: 600; }
+
+  .card-actions { display: flex; gap: 8px; margin-top: 10px; }
+  .card-actions button {
+    flex: 1; background: var(--bg-item); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px; font-size: 12.5px; font-weight: 600;
+  }
+  .card-actions button.danger { color: var(--err); border-color: rgba(239,68,68,0.35); }
+  .card-actions button.accent { color: var(--accent2); border-color: rgba(168,85,247,0.35); }
+
+  .empty, .loading, .error {
+    text-align: center; color: var(--text-muted); padding: 40px 20px; font-size: 13.5px;
+  }
+  .error { color: var(--err); }
+
+  /* Logs / detail modal */
+  #modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 50;
+    display: none; align-items: flex-end;
+  }
+  #modal-backdrop.open { display: flex; }
+  #modal {
+    background: var(--bg-panel); width: 100%; max-height: 82vh;
+    border-radius: 16px 16px 0 0; display: flex; flex-direction: column;
+    border-top: 1px solid var(--border);
+  }
+  #modal-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 16px; border-bottom: 1px solid var(--border);
+  }
+  #modal-header h2 { font-size: 14.5px; margin: 0; word-break: break-all; padding-right: 10px; }
+  #modal-close { background: none; border: none; color: var(--text-dim); font-size: 20px; }
+  #modal-body {
+    padding: 12px 14px calc(16px + env(safe-area-inset-bottom, 0px));
+    overflow-y: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; white-space: pre-wrap; word-break: break-word; color: var(--text-dim);
+  }
+
+  #toast {
+    position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+    transform: translateX(-50%) translateY(20px); background: var(--bg-item);
+    border: 1px solid var(--border); color: var(--text); padding: 10px 16px;
+    border-radius: 10px; font-size: 13px; opacity: 0; transition: all 0.2s ease;
+    z-index: 60; max-width: 90%; text-align: center;
+  }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  #login-gate {
+    position: fixed; inset: 0; background: var(--bg-dark); z-index: 100;
+    display: flex; align-items: center; justify-content: center; text-align: center;
+    padding: 20px; color: var(--text-dim); font-size: 13.5px;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1><span class="glyph">⎈</span> KubeDeck</h1>
+    <div style="display:flex; align-items:center;">
+      <select id="ns-select" class="ns-select"><option value="all">all namespaces</option></select>
+      <button id="refresh-btn" title="Refresh">⟳</button>
+    </div>
+  </header>
+
+  <nav id="tabs">
+    <button data-tab="pods" class="active">Pods</button>
+    <button data-tab="deployments">Deployments</button>
+    <button data-tab="services">Services</button>
+    <button data-tab="nodes">Nodes</button>
+    <button data-tab="events">Events</button>
+  </nav>
+
+  <main id="content">
+    <div class="loading">Loading…</div>
+  </main>
+</div>
+
+<div id="modal-backdrop">
+  <div id="modal">
+    <div id="modal-header">
+      <h2 id="modal-title"></h2>
+      <button id="modal-close">✕</button>
+    </div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const state = { tab: "pods", namespace: "all" };
+
+function toast(msg, isError) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.style.color = isError ? "var(--err)" : "var(--text)";
+  el.classList.add("show");
+  setTimeout(() => el.classList.remove("show"), 2200);
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  if (res.status === 401) {
+    document.body.innerHTML = '<div id="login-gate">Session expired.<br>Reload the page to sign in again.</div>';
+    throw new Error("unauthorized");
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.detail || ("Request failed (" + res.status + ")"));
+  }
+  return data;
+}
+
+function openModal(title, bodyText) {
+  document.getElementById("modal-title").textContent = title;
+  document.getElementById("modal-body").textContent = bodyText;
+  document.getElementById("modal-backdrop").classList.add("open");
+}
+document.getElementById("modal-close").onclick = () =>
+  document.getElementById("modal-backdrop").classList.remove("open");
+document.getElementById("modal-backdrop").onclick = (e) => {
+  if (e.target.id === "modal-backdrop") e.target.classList.remove("open");
+};
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function statusBadge(text, kind) {
+  const b = el("span", "badge " + kind, text);
+  return b;
+}
+
+// ---------- renderers ----------
+
+function renderPods(pods) {
+  const content = document.getElementById("content");
+  content.innerHTML = "";
+  if (!pods.length) { content.appendChild(el("div", "empty", "No pods found.")); return; }
+
+  pods.forEach(p => {
+    const card = el("div", "card");
+    const top = el("div", "card-top");
+    const left = el("div");
+    left.appendChild(el("div", "card-title", p.name));
+    left.appendChild(el("div", "card-sub", p.namespace + (p.node ? " · " + p.node : "")));
+    top.appendChild(left);
+
+    let kind = "muted";
+    if (p.phase === "Running") kind = "ok";
+    else if (p.phase === "Pending") kind = "warn";
+    else if (p.phase === "Failed" || p.phase === "Unknown") kind = "err";
+    top.appendChild(statusBadge(p.phase || "?", kind));
+    card.appendChild(top);
+
+    const meta = el("div", "card-meta");
+    meta.appendChild(el("span", null)).innerHTML = "ready <b>" + p.ready + "</b>";
+    meta.appendChild(el("span", null)).innerHTML = "restarts <b>" + p.restarts + "</b>";
+    card.appendChild(meta);
+
+    const actions = el("div", "card-actions");
+    const logsBtn = el("button", null, "Logs");
+    logsBtn.onclick = () => showLogs(p.namespace, p.name, p.containers[0]);
+    actions.appendChild(logsBtn);
+
+    const delBtn = el("button", "danger", "Delete");
+    delBtn.onclick = () => confirmDeletePod(p.namespace, p.name);
+    actions.appendChild(delBtn);
+    card.appendChild(actions);
+
+    content.appendChild(card);
+  });
+}
+
+function renderDeployments(deps) {
+  const content = document.getElementById("content");
+  content.innerHTML = "";
+  if (!deps.length) { content.appendChild(el("div", "empty", "No deployments found.")); return; }
+
+  deps.forEach(d => {
+    const card = el("div", "card");
+    const top = el("div", "card-top");
+    const left = el("div");
+    left.appendChild(el("div", "card-title", d.name));
+    left.appendChild(el("div", "card-sub", d.namespace));
+    top.appendChild(left);
+
+    const healthy = d.ready === d.replicas && d.replicas > 0;
+    top.appendChild(statusBadge(d.ready + "/" + d.replicas, healthy ? "ok" : "warn"));
+    card.appendChild(top);
+
+    const actions = el("div", "card-actions");
+    const restartBtn = el("button", "accent", "Restart");
+    restartBtn.onclick = () => restartDeployment(d.namespace, d.name);
+    actions.appendChild(restartBtn);
+
+    const scaleBtn = el("button", null, "Scale");
+    scaleBtn.onclick = () => scaleDeployment(d.namespace, d.name, d.replicas);
+    actions.appendChild(scaleBtn);
+    card.appendChild(actions);
+
+    content.appendChild(card);
+  });
+}
+
+function renderServices(services) {
+  const content = document.getElementById("content");
+  content.innerHTML = "";
+  if (!services.length) { content.appendChild(el("div", "empty", "No services found.")); return; }
+
+  services.forEach(s => {
+    const card = el("div", "card");
+    const top = el("div", "card-top");
+    const left = el("div");
+    left.appendChild(el("div", "card-title", s.name));
+    left.appendChild(el("div", "card-sub", s.namespace + " · " + s.clusterIP));
+    top.appendChild(left);
+    top.appendChild(statusBadge(s.type || "?", "muted"));
+    card.appendChild(top);
+
+    if (s.ports && s.ports.length) {
+      const meta = el("div", "card-meta");
+      meta.appendChild(el("span", null, s.ports.join(", ")));
+      card.appendChild(meta);
+    }
+    content.appendChild(card);
+  });
+}
+
+function renderNodes(nodes) {
+  const content = document.getElementById("content");
+  content.innerHTML = "";
+  if (!nodes.length) { content.appendChild(el("div", "empty", "No nodes found.")); return; }
+
+  nodes.forEach(n => {
+    const card = el("div", "card");
+    const top = el("div", "card-top");
+    const left = el("div");
+    left.appendChild(el("div", "card-title", n.name));
+    left.appendChild(el("div", "card-sub", n.version || ""));
+    top.appendChild(left);
+    top.appendChild(statusBadge(n.ready ? "Ready" : "Not Ready", n.ready ? "ok" : "err"));
+    card.appendChild(top);
+
+    const meta = el("div", "card-meta");
+    meta.appendChild(el("span", null)).innerHTML = "cpu <b>" + (n.cpu || "?") + "</b>";
+    meta.appendChild(el("span", null)).innerHTML = "mem <b>" + (n.memory || "?") + "</b>";
+    card.appendChild(meta);
+
+    content.appendChild(card);
+  });
+}
+
+function renderEvents(events) {
+  const content = document.getElementById("content");
+  content.innerHTML = "";
+  if (!events.length) { content.appendChild(el("div", "empty", "No recent events.")); return; }
+
+  events.forEach(ev => {
+    const card = el("div", "card");
+    const top = el("div", "card-top");
+    const left = el("div");
+    left.appendChild(el("div", "card-title", ev.reason || "Event"));
+    left.appendChild(el("div", "card-sub", ev.object + " · " + (ev.namespace || "")));
+    top.appendChild(left);
+    top.appendChild(statusBadge(ev.type || "?", ev.type === "Warning" ? "warn" : "muted"));
+    card.appendChild(top);
+
+    card.appendChild(el("div", "card-meta")).appendChild(el("span", null, ev.message || ""));
+    content.appendChild(card);
+  });
+}
+
+// ---------- actions ----------
+
+async function showLogs(namespace, pod, container) {
+  openModal(pod, "Loading logs…");
+  try {
+    const q = container ? ("?container=" + encodeURIComponent(container)) : "";
+    const data = await api("/api/logs/" + encodeURIComponent(namespace) + "/" + encodeURIComponent(pod) + q);
+    document.getElementById("modal-body").textContent = data.logs || "(no output)";
+  } catch (e) {
+    document.getElementById("modal-body").textContent = "Error: " + e.message;
+  }
+}
+
+async function confirmDeletePod(namespace, name) {
+  if (!confirm("Delete pod \"" + name + "\" in " + namespace + "?\nIts controller will usually recreate it.")) return;
+  try {
+    await api("/api/pods/" + encodeURIComponent(namespace) + "/" + encodeURIComponent(name) + "/delete", { method: "POST" });
+    toast("Pod deleted");
+    loadCurrentTab();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function restartDeployment(namespace, name) {
+  if (!confirm("Rolling-restart \"" + name + "\" in " + namespace + "?")) return;
+  try {
+    await api("/api/deployments/" + encodeURIComponent(namespace) + "/" + encodeURIComponent(name) + "/restart", { method: "POST" });
+    toast("Restart triggered");
+    loadCurrentTab();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function scaleDeployment(namespace, name, current) {
+  const input = prompt("Scale \"" + name + "\" to how many replicas?", current);
+  if (input === null) return;
+  const replicas = parseInt(input, 10);
+  if (isNaN(replicas) || replicas < 0) { toast("Enter a valid replica count", true); return; }
+  try {
+    await api("/api/deployments/" + encodeURIComponent(namespace) + "/" + encodeURIComponent(name) + "/scale", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ replicas }),
+    });
+    toast("Scaled to " + replicas);
+    loadCurrentTab();
+  } catch (e) { toast(e.message, true); }
+}
+
+// ---------- tab loading ----------
+
+const TAB_CONFIG = {
+  pods:        { url: "/api/pods",        render: renderPods,        nsAware: true },
+  deployments: { url: "/api/deployments", render: renderDeployments, nsAware: true },
+  services:    { url: "/api/services",    render: renderServices,    nsAware: true },
+  nodes:       { url: "/api/nodes",       render: renderNodes,       nsAware: false },
+  events:      { url: "/api/events",      render: renderEvents,      nsAware: true },
+};
+
+async function loadCurrentTab() {
+  const cfg = TAB_CONFIG[state.tab];
+  const btn = document.getElementById("refresh-btn");
+  btn.classList.add("spinning");
+  const content = document.getElementById("content");
+  content.innerHTML = '<div class="loading">Loading…</div>';
+  try {
+    let url = cfg.url;
+    if (cfg.nsAware) url += "?namespace=" + encodeURIComponent(state.namespace);
+    const data = await api(url);
+    cfg.render(data);
+  } catch (e) {
+    content.innerHTML = '';
+    content.appendChild(el("div", "error", e.message));
+  } finally {
+    btn.classList.remove("spinning");
+  }
+}
+
+async function loadNamespaces() {
+  try {
+    const namespaces = await api("/api/namespaces");
+    const select = document.getElementById("ns-select");
+    namespaces.forEach(ns => {
+      const opt = document.createElement("option");
+      opt.value = ns; opt.textContent = ns;
+      select.appendChild(opt);
+    });
+  } catch (e) { /* non-fatal — "all namespaces" still works */ }
+}
+
+document.querySelectorAll("#tabs button").forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll("#tabs button").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    state.tab = btn.dataset.tab;
+    loadCurrentTab();
+  };
+});
+
+document.getElementById("ns-select").onchange = (e) => {
+  state.namespace = e.target.value;
+  loadCurrentTab();
+};
+
+document.getElementById("refresh-btn").onclick = loadCurrentTab;
+
+loadNamespaces();
+loadCurrentTab();
+</script>
+</body>
+</html>
