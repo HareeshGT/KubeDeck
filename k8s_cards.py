@@ -14,7 +14,7 @@ via currentItemChanged).
 from PyQt5.QtWidgets import QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSizePolicy
 from PyQt5.QtCore import Qt, pyqtSignal
 
-from ui_icons import set_icon, icon_pixmap, icon_button
+from ui_icons import set_icon, icon_pixmap, icon_button, apply_text_icon
 from themes import T
 from utils import monospace_font
 
