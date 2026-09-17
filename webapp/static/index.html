@@ -3,145 +3,199 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#151726">
+<meta name="theme-color" content="#0a0c10">
 <title>KubeDeck</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg-dark:   #0f1119;
-    --bg-panel:  #171a27;
-    --bg-item:   #1e2233;
-    --bg-hover:  #262b40;
-    --border:    #2a2f42;
-    --text:      #e8eaf0;
-    --text-dim:  #a7acb8;
-    --text-muted:#6b7086;
-    --accent:    #a855f7;
-    --accent2:   #c084fc;
-    --ok:        #22c55e;
-    --warn:      #eab308;
-    --err:       #ef4444;
+    /* -- color -- */
+    --bg:         #0a0c10;
+    --bg-panel:   #12151c;
+    --bg-elevated:#171b24;
+    --bg-hover:   #1d222c;
+    --border:     #232838;
+    --border-soft:#1a1e29;
+    --text:       #eef0f4;
+    --text-dim:   #9aa1b0;
+    --text-faint: #5b6172;
+    --accent:     #5ce1c6;
+    --accent-dim: rgba(92,225,198,0.14);
+    --ok:         #3ecf8e;
+    --warn:       #f2b84b;
+    --err:        #f2506d;
+    --muted:      #6b7284;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
     margin: 0; padding: 0; height: 100%;
-    background: var(--bg-dark); color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+    font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     font-size: 15px;
+    -webkit-font-smoothing: antialiased;
   }
+  ::selection { background: var(--accent-dim); color: var(--text); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 4px; }
+
   #app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
 
+  /* ---------- header ---------- */
   header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 14px 16px calc(10px + env(safe-area-inset-top, 0px));
+    padding: 14px 16px 12px;
     padding-top: calc(14px + env(safe-area-inset-top, 0px));
-    background: var(--bg-panel); border-bottom: 1px solid var(--border);
+    background: var(--bg-panel); border-bottom: 1px solid var(--border-soft);
   }
   header h1 {
-    font-size: 17px; margin: 0; display: flex; align-items: center; gap: 8px;
-    font-weight: 600;
+    font-size: 16px; margin: 0; display: flex; align-items: baseline; gap: 8px;
+    font-weight: 600; letter-spacing: 0.01em;
   }
-  header h1 .glyph { color: var(--accent); font-size: 19px; }
+  header h1 .glyph {
+    color: var(--accent); font-size: 17px; line-height: 1;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+  .ns-picker { display: flex; align-items: center; gap: 2px; }
+  .ns-picker::before {
+    content: "ns:"; color: var(--text-faint); font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px; margin-right: 2px;
+  }
   header .ns-select {
-    background: var(--bg-item); color: var(--text); border: 1px solid var(--border);
-    border-radius: 8px; padding: 6px 10px; font-size: 13px;
+    background: none; color: var(--accent); border: none;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12.5px; padding: 4px 4px; max-width: 30vw;
   }
   #refresh-btn {
-    background: none; border: none; color: var(--text-dim); font-size: 18px;
-    padding: 4px 8px; margin-left: 6px;
+    background: none; border: none; color: var(--text-dim); font-size: 17px;
+    padding: 4px 6px 4px 10px; line-height: 1;
   }
   #refresh-btn.spinning { animation: spin 0.7s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    #refresh-btn.spinning { animation: none; }
+  }
 
+  /* ---------- tabs ---------- */
   nav {
     display: flex; background: var(--bg-panel); border-bottom: 1px solid var(--border);
-    overflow-x: auto;
+    overflow-x: auto; padding: 0 8px;
   }
+  nav::-webkit-scrollbar { display: none; }
   nav button {
     flex: 1; background: none; border: none; color: var(--text-dim);
-    padding: 10px 6px; font-size: 13px; font-weight: 500;
+    padding: 11px 10px 10px; font-size: 13px; font-weight: 500;
     border-bottom: 2px solid transparent; white-space: nowrap;
   }
   nav button.active { color: var(--text); border-bottom-color: var(--accent); }
 
-  main { flex: 1; overflow-y: auto; padding: 10px 12px calc(20px + env(safe-area-inset-bottom, 0px)); }
+  main { flex: 1; overflow-y: auto; padding: 0 0 calc(24px + env(safe-area-inset-bottom, 0px)); }
 
+  /* ---------- rows ---------- */
   .card {
-    background: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px;
-    padding: 12px 14px; margin-bottom: 10px;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border-soft);
+    border-left: 3px solid var(--border);
+    padding: 13px 16px 13px 13px;
   }
-  .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
-  .card-title { font-weight: 600; font-size: 14.5px; word-break: break-all; }
-  .card-sub { color: var(--text-muted); font-size: 12.5px; margin-top: 2px; }
+  .card.status-ok    { border-left-color: var(--ok); }
+  .card.status-warn  { border-left-color: var(--warn); }
+  .card.status-err   { border-left-color: var(--err); }
+  .card.status-muted { border-left-color: var(--muted); }
+
+  .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+  .card-title {
+    font-weight: 500; font-size: 14px; word-break: break-all;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+  .card-sub { color: var(--text-faint); font-size: 12px; margin-top: 3px; }
+
   .badge {
-    font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 999px;
-    white-space: nowrap; text-transform: uppercase; letter-spacing: 0.02em;
+    font-size: 12px; font-weight: 500; white-space: nowrap;
+    display: flex; align-items: center; gap: 5px; padding-top: 1px;
   }
-  .badge.ok    { background: rgba(34,197,94,0.15);  color: var(--ok); }
-  .badge.warn  { background: rgba(234,179,8,0.15);   color: var(--warn); }
-  .badge.err   { background: rgba(239,68,68,0.15);   color: var(--err); }
-  .badge.muted { background: rgba(167,172,184,0.15); color: var(--text-dim); }
+  .badge::before {
+    content: ""; width: 6px; height: 6px; border-radius: 50%; flex: none;
+    background: currentColor;
+  }
+  .badge.ok    { color: var(--ok); }
+  .badge.warn  { color: var(--warn); }
+  .badge.err   { color: var(--err); }
+  .badge.muted { color: var(--muted); }
 
-  .card-meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; font-size: 12.5px; color: var(--text-dim); }
-  .card-meta span b { color: var(--text); font-weight: 600; }
+  .card-meta {
+    display: flex; flex-wrap: wrap; gap: 12px; margin-top: 9px;
+    font-size: 12px; color: var(--text-dim); font-family: 'IBM Plex Mono', monospace;
+  }
+  .card-meta span b { color: var(--text); font-weight: 500; }
 
-  .card-actions { display: flex; gap: 8px; margin-top: 10px; }
+  .card-actions { display: flex; gap: 8px; margin-top: 11px; }
   .card-actions button {
-    flex: 1; background: var(--bg-item); color: var(--text); border: 1px solid var(--border);
-    border-radius: 8px; padding: 8px; font-size: 12.5px; font-weight: 600;
+    flex: 1; background: var(--bg-elevated); color: var(--text-dim); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px; font-size: 12.5px; font-weight: 500;
   }
-  .card-actions button.danger { color: var(--err); border-color: rgba(239,68,68,0.35); }
-  .card-actions button.accent { color: var(--accent2); border-color: rgba(168,85,247,0.35); }
+  .card-actions button:active { background: var(--bg-hover); }
+  .card-actions button.danger { color: var(--err); border-color: rgba(242,80,109,0.3); }
+  .card-actions button.accent { color: var(--accent); border-color: rgba(92,225,198,0.3); }
 
   .empty, .loading, .error {
-    text-align: center; color: var(--text-muted); padding: 40px 20px; font-size: 13.5px;
+    text-align: center; color: var(--text-faint); padding: 60px 24px; font-size: 13.5px;
+    font-family: 'IBM Plex Mono', monospace;
   }
   .error { color: var(--err); }
 
-  /* Logs / detail modal */
+  /* ---------- log / detail sheet ---------- */
   #modal-backdrop {
-    position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 50;
+    position: fixed; inset: 0; background: rgba(5,6,9,0.65); z-index: 50;
     display: none; align-items: flex-end;
   }
   #modal-backdrop.open { display: flex; }
   #modal {
     background: var(--bg-panel); width: 100%; max-height: 82vh;
-    border-radius: 16px 16px 0 0; display: flex; flex-direction: column;
+    border-radius: 14px 14px 0 0; display: flex; flex-direction: column;
     border-top: 1px solid var(--border);
   }
   #modal-header {
     display: flex; justify-content: space-between; align-items: center;
-    padding: 14px 16px; border-bottom: 1px solid var(--border);
+    padding: 14px 16px; border-bottom: 1px solid var(--border-soft);
   }
-  #modal-header h2 { font-size: 14.5px; margin: 0; word-break: break-all; padding-right: 10px; }
-  #modal-close { background: none; border: none; color: var(--text-dim); font-size: 20px; }
+  #modal-header h2 {
+    font-size: 13.5px; margin: 0; word-break: break-all; padding-right: 10px;
+    font-family: 'IBM Plex Mono', monospace; font-weight: 500; color: var(--text-dim);
+  }
+  #modal-close { background: none; border: none; color: var(--text-dim); font-size: 19px; padding: 2px 4px; }
   #modal-body {
-    padding: 12px 14px calc(16px + env(safe-area-inset-bottom, 0px));
-    overflow-y: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 12px; white-space: pre-wrap; word-break: break-word; color: var(--text-dim);
+    padding: 14px 16px calc(18px + env(safe-area-inset-bottom, 0px));
+    overflow-y: auto; font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; color: var(--text-dim);
+    background: var(--bg);
   }
 
   #toast {
     position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom, 0px));
-    transform: translateX(-50%) translateY(20px); background: var(--bg-item);
+    transform: translateX(-50%) translateY(20px); background: var(--bg-elevated);
     border: 1px solid var(--border); color: var(--text); padding: 10px 16px;
-    border-radius: 10px; font-size: 13px; opacity: 0; transition: all 0.2s ease;
+    border-radius: 8px; font-size: 13px; opacity: 0; transition: all 0.2s ease;
     z-index: 60; max-width: 90%; text-align: center;
+    font-family: 'IBM Plex Mono', monospace;
   }
   #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
   #login-gate {
-    position: fixed; inset: 0; background: var(--bg-dark); z-index: 100;
+    position: fixed; inset: 0; background: var(--bg); z-index: 100;
     display: flex; align-items: center; justify-content: center; text-align: center;
     padding: 20px; color: var(--text-dim); font-size: 13.5px;
+    font-family: 'IBM Plex Mono', monospace;
   }
 </style>
 </head>
 <body>
 <div id="app">
   <header>
-    <h1><span class="glyph">⎈</span> KubeDeck</h1>
+    <h1><span class="glyph">⎈</span>KubeDeck</h1>
     <div style="display:flex; align-items:center;">
-      <select id="ns-select" class="ns-select"><option value="all">all namespaces</option></select>
+      <div class="ns-picker">
+        <select id="ns-select" class="ns-select"><option value="all">all</option></select>
+      </div>
       <button id="refresh-btn" title="Refresh">⟳</button>
     </div>
   </header>
@@ -155,7 +209,7 @@
   </nav>
 
   <main id="content">
-    <div class="loading">Loading…</div>
+    <div class="loading">loading…</div>
   </main>
 </div>
 
@@ -214,8 +268,7 @@ function el(tag, cls, text) {
 }
 
 function statusBadge(text, kind) {
-  const b = el("span", "badge " + kind, text);
-  return b;
+  return el("span", "badge " + kind, text);
 }
 
 // ---------- renderers ----------
@@ -223,20 +276,20 @@ function statusBadge(text, kind) {
 function renderPods(pods) {
   const content = document.getElementById("content");
   content.innerHTML = "";
-  if (!pods.length) { content.appendChild(el("div", "empty", "No pods found.")); return; }
+  if (!pods.length) { content.appendChild(el("div", "empty", "No pods in this namespace.")); return; }
 
   pods.forEach(p => {
-    const card = el("div", "card");
+    let kind = "muted";
+    if (p.phase === "Running") kind = "ok";
+    else if (p.phase === "Pending") kind = "warn";
+    else if (p.phase === "Failed" || p.phase === "Unknown") kind = "err";
+
+    const card = el("div", "card status-" + kind);
     const top = el("div", "card-top");
     const left = el("div");
     left.appendChild(el("div", "card-title", p.name));
     left.appendChild(el("div", "card-sub", p.namespace + (p.node ? " · " + p.node : "")));
     top.appendChild(left);
-
-    let kind = "muted";
-    if (p.phase === "Running") kind = "ok";
-    else if (p.phase === "Pending") kind = "warn";
-    else if (p.phase === "Failed" || p.phase === "Unknown") kind = "err";
     top.appendChild(statusBadge(p.phase || "?", kind));
     card.appendChild(top);
 
@@ -262,18 +315,19 @@ function renderPods(pods) {
 function renderDeployments(deps) {
   const content = document.getElementById("content");
   content.innerHTML = "";
-  if (!deps.length) { content.appendChild(el("div", "empty", "No deployments found.")); return; }
+  if (!deps.length) { content.appendChild(el("div", "empty", "No deployments in this namespace.")); return; }
 
   deps.forEach(d => {
-    const card = el("div", "card");
+    const healthy = d.ready === d.replicas && d.replicas > 0;
+    const kind = healthy ? "ok" : "warn";
+
+    const card = el("div", "card status-" + kind);
     const top = el("div", "card-top");
     const left = el("div");
     left.appendChild(el("div", "card-title", d.name));
     left.appendChild(el("div", "card-sub", d.namespace));
     top.appendChild(left);
-
-    const healthy = d.ready === d.replicas && d.replicas > 0;
-    top.appendChild(statusBadge(d.ready + "/" + d.replicas, healthy ? "ok" : "warn"));
+    top.appendChild(statusBadge(d.ready + "/" + d.replicas, kind));
     card.appendChild(top);
 
     const actions = el("div", "card-actions");
@@ -293,10 +347,10 @@ function renderDeployments(deps) {
 function renderServices(services) {
   const content = document.getElementById("content");
   content.innerHTML = "";
-  if (!services.length) { content.appendChild(el("div", "empty", "No services found.")); return; }
+  if (!services.length) { content.appendChild(el("div", "empty", "No services in this namespace.")); return; }
 
   services.forEach(s => {
-    const card = el("div", "card");
+    const card = el("div", "card status-muted");
     const top = el("div", "card-top");
     const left = el("div");
     left.appendChild(el("div", "card-title", s.name));
@@ -320,13 +374,14 @@ function renderNodes(nodes) {
   if (!nodes.length) { content.appendChild(el("div", "empty", "No nodes found.")); return; }
 
   nodes.forEach(n => {
-    const card = el("div", "card");
+    const kind = n.ready ? "ok" : "err";
+    const card = el("div", "card status-" + kind);
     const top = el("div", "card-top");
     const left = el("div");
     left.appendChild(el("div", "card-title", n.name));
     left.appendChild(el("div", "card-sub", n.version || ""));
     top.appendChild(left);
-    top.appendChild(statusBadge(n.ready ? "Ready" : "Not Ready", n.ready ? "ok" : "err"));
+    top.appendChild(statusBadge(n.ready ? "Ready" : "Not ready", kind));
     card.appendChild(top);
 
     const meta = el("div", "card-meta");
@@ -344,13 +399,14 @@ function renderEvents(events) {
   if (!events.length) { content.appendChild(el("div", "empty", "No recent events.")); return; }
 
   events.forEach(ev => {
-    const card = el("div", "card");
+    const kind = ev.type === "Warning" ? "warn" : "muted";
+    const card = el("div", "card status-" + kind);
     const top = el("div", "card-top");
     const left = el("div");
     left.appendChild(el("div", "card-title", ev.reason || "Event"));
     left.appendChild(el("div", "card-sub", ev.object + " · " + (ev.namespace || "")));
     top.appendChild(left);
-    top.appendChild(statusBadge(ev.type || "?", ev.type === "Warning" ? "warn" : "muted"));
+    top.appendChild(statusBadge(ev.type || "?", kind));
     card.appendChild(top);
 
     card.appendChild(el("div", "card-meta")).appendChild(el("span", null, ev.message || ""));
@@ -361,7 +417,7 @@ function renderEvents(events) {
 // ---------- actions ----------
 
 async function showLogs(namespace, pod, container) {
-  openModal(pod, "Loading logs…");
+  openModal(pod, "loading logs…");
   try {
     const q = container ? ("?container=" + encodeURIComponent(container)) : "";
     const data = await api("/api/logs/" + encodeURIComponent(namespace) + "/" + encodeURIComponent(pod) + q);
@@ -420,7 +476,7 @@ async function loadCurrentTab() {
   const btn = document.getElementById("refresh-btn");
   btn.classList.add("spinning");
   const content = document.getElementById("content");
-  content.innerHTML = '<div class="loading">Loading…</div>';
+  content.innerHTML = '<div class="loading">loading…</div>';
   try {
     let url = cfg.url;
     if (cfg.nsAware) url += "?namespace=" + encodeURIComponent(state.namespace);
@@ -443,7 +499,7 @@ async function loadNamespaces() {
       opt.value = ns; opt.textContent = ns;
       select.appendChild(opt);
     });
-  } catch (e) { /* non-fatal — "all namespaces" still works */ }
+  } catch (e) { /* non-fatal — "all" still works */ }
 }
 
 document.querySelectorAll("#tabs button").forEach(btn => {
