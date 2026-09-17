@@ -9,6 +9,28 @@ OS="$(uname -s)"
 echo "Detected OS: $OS"
 
 # --------------------------------------------------
+# Privilege helper
+# --------------------------------------------------
+#
+# Cloud/VM instances and containers are frequently accessed (and this
+# script frequently run) as root already — a common case on freshly
+# provisioned EC2/GCE/Azure instances and inside Docker images — and
+# many of those minimal images don't even ship a `sudo` binary. Calling
+# bare `sudo` there fails with "command not found" and aborts the whole
+# install. $SUDO resolves to nothing when already root, to `sudo` when
+# available, and only errors out (with a clear message) if elevated
+# privileges are genuinely required and there is no way to get them.
+if [ "$(id -u)" = "0" ]; then
+  SUDO=""
+elif command -v sudo >/dev/null 2>&1; then
+  SUDO="sudo"
+else
+  SUDO=""
+  echo "NOTE: not running as root and 'sudo' was not found."
+  echo "      Package-manager steps that need elevated privileges may fail below."
+fi
+
+# --------------------------------------------------
 # Windows: Relaunch as Administrator if needed
 # --------------------------------------------------
 if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
@@ -85,6 +107,26 @@ if [ -n "$SELECTED_BRANCH" ]; then
     echo "Available branches:"
     printf '%s\n' "$BRANCH_LIST" | sed 's/^/ - /'
     exit 1
+  fi
+elif [ ! -t 0 ]; then
+  # No branch argument and no interactive terminal attached (piped from
+  # curl on a freshly provisioned instance, driven by cloud-init/CI,
+  # run over a non-interactive SSH command, etc.) — a `read` prompt
+  # here would just hang forever with no one able to answer it. Fall
+  # back to main/master, same as `git clone` would pick by default.
+  echo "No TTY detected and no branch given — defaulting to the default branch."
+
+  DEFAULT_BRANCH="$(
+    git ls-remote --symref "$REPO" HEAD 2>/dev/null |
+    awk '/^ref:/ {sub("refs/heads/", "", $2); print $2}'
+  )"
+
+  if [ -n "$DEFAULT_BRANCH" ] && printf '%s\n' "$BRANCH_LIST" | grep -Fxq "$DEFAULT_BRANCH"; then
+    SELECTED_BRANCH="$DEFAULT_BRANCH"
+  elif printf '%s\n' "$BRANCH_LIST" | grep -Fxq "main"; then
+    SELECTED_BRANCH="main"
+  else
+    SELECTED_BRANCH="$(printf '%s\n' "$BRANCH_LIST" | head -n 1)"
   fi
 else
   # Build a numbered branch list.
@@ -273,13 +315,17 @@ elif [[ "$OS" == "Linux" ]]; then
   echo
   echo "Checking Linux native dependencies..."
 
-  # PyAudio needs PortAudio development headers.
+  # PyAudio needs PortAudio development headers. Covering apt/dnf/yum/
+  # pacman/zypper/apk means this works unmodified on Debian/Ubuntu,
+  # Fedora/RHEL/Amazon Linux 2023, older RHEL/Amazon Linux 2, Arch,
+  # openSUSE, and Alpine — i.e. whatever base image the "instance"
+  # happens to be running, not just one distro family.
   if command -v apt-get >/dev/null 2>&1; then
 
     echo "Using apt-get..."
 
-    sudo apt-get update
-    sudo apt-get install -y \
+    $SUDO apt-get update
+    $SUDO apt-get install -y \
       portaudio19-dev \
       libportaudiocpp0 \
       flac \
@@ -289,7 +335,7 @@ elif [[ "$OS" == "Linux" ]]; then
 
     echo "Using dnf..."
 
-    sudo dnf install -y \
+    $SUDO dnf install -y \
       portaudio-devel \
       flac \
       ffmpeg
@@ -298,7 +344,7 @@ elif [[ "$OS" == "Linux" ]]; then
 
     echo "Using yum..."
 
-    sudo yum install -y \
+    $SUDO yum install -y \
       portaudio-devel \
       flac \
       ffmpeg
@@ -307,8 +353,26 @@ elif [[ "$OS" == "Linux" ]]; then
 
     echo "Using pacman..."
 
-    sudo pacman -Sy --noconfirm \
+    $SUDO pacman -Sy --noconfirm \
       portaudio \
+      flac \
+      ffmpeg
+
+  elif command -v zypper >/dev/null 2>&1; then
+
+    echo "Using zypper..."
+
+    $SUDO zypper --non-interactive install \
+      portaudio-devel \
+      flac \
+      ffmpeg
+
+  elif command -v apk >/dev/null 2>&1; then
+
+    echo "Using apk..."
+
+    $SUDO apk add --no-cache \
+      portaudio-dev \
       flac \
       ffmpeg
 
@@ -653,8 +717,8 @@ Darwin)
     exit 1
   fi
 
-  sudo rm -rf "/Applications/KubeDeck.app"
-  sudo cp -R "$APP_PATH" "/Applications/"
+  $SUDO rm -rf "/Applications/KubeDeck.app"
+  $SUDO cp -R "$APP_PATH" "/Applications/"
 
   echo
   echo "Installed:"
@@ -673,13 +737,45 @@ Linux)
     exit 1
   fi
 
-  sudo rm -rf "/opt/KubeDeck"
-  sudo mkdir -p "/opt/KubeDeck"
-  sudo cp -R "dist/KubeDeck/." "/opt/KubeDeck/"
+  $SUDO rm -rf "/opt/KubeDeck"
+  $SUDO mkdir -p "/opt/KubeDeck"
+  $SUDO cp -R "dist/KubeDeck/." "/opt/KubeDeck/"
+
+  # A raw copy under /opt isn't launchable on its own — a plain PATH
+  # symlink covers terminal use on any distro/instance, and a .desktop
+  # entry (freedesktop.org standard, so it works across GNOME/KDE/XFCE/
+  # etc.) covers being launchable from a graphical menu wherever one
+  # exists. Both are best-effort: headless instances have no
+  # /usr/share/applications consumer, so a failure there is harmless.
+  if [ -d "/usr/local/bin" ] || $SUDO mkdir -p "/usr/local/bin" 2>/dev/null; then
+    $SUDO ln -sf "/opt/KubeDeck/KubeDeck" "/usr/local/bin/kubedeck" 2>/dev/null || true
+  fi
+
+  if [ -n "$ICON" ] && [ -f "$ICON" ]; then
+    $SUDO mkdir -p "/opt/KubeDeck/icon" 2>/dev/null || true
+    $SUDO cp "$ICON" "/opt/KubeDeck/icon/KubeDeck.ico" 2>/dev/null || true
+  fi
+
+  if $SUDO mkdir -p "/usr/share/applications" 2>/dev/null; then
+    DESKTOP_FILE="$(mktemp)"
+    cat > "$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Name=KubeDeck
+Comment=Kubernetes / VM visualizer and manager
+Exec=/opt/KubeDeck/KubeDeck
+Icon=/opt/KubeDeck/icon/KubeDeck.ico
+Terminal=false
+Categories=Development;Utility;
+EOF
+    $SUDO cp "$DESKTOP_FILE" "/usr/share/applications/kubedeck.desktop" 2>/dev/null || true
+    rm -f "$DESKTOP_FILE"
+  fi
 
   echo
   echo "Installed:"
   echo "/opt/KubeDeck"
+  echo "Run from any terminal with: kubedeck"
   ;;
 
 MINGW*|MSYS*|CYGWIN*)
