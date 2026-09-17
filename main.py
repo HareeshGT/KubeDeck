@@ -1,17 +1,4 @@
-"""main.py — Application entry point for KubeDeck.
-
-Imports:
-    themes      — theme palette definitions, QSS builder, apply helpers
-    utils       — file-type helpers, size formatting, recent-instances CSV
-    workers     — background QThread workers (SSH commands, file transfers)
-    sudo_fs     — SudoFS SFTP wrapper for transparent sudo operations
-    dialogs     — ConnectDialog, FileTransferDialog, LogViewerDialog, ExecDialog
-    sidebar     — quick-access Sidebar widget
-    preview     — PreviewPane widget (right column of file manager)
-    file_widgets — FileRowWidget and FileGridWidget (list/grid item views)
-    kubernetes_tab — KubernetesTab widget
-    main_window — EC2FileManager QMainWindow
-"""
+"""main.py — Application entry point for KubeDeck."""
 
 import sys
 
@@ -19,82 +6,61 @@ from PyQt5.QtWidgets import QApplication, QStyleFactory
 from PyQt5.QtGui import QColor, QPalette
 from PyQt5.QtCore import Qt, QPropertyAnimation, QEasingCurve
 
-from themes import T, CURRENT_THEME, build_qss, apply_theme_vars
+from themes import T, build_qss
 from main_window import EC2FileManager
 from splash import SplashScreen
+from webapp import app as webapp_app
 
 
 def _build_palette() -> QPalette:
-    """Construct a QPalette that matches the active theme so native widgets
-    inherit the right colours even before QSS kicks in."""
-    
     pal = QPalette()
-    pal.setColor(QPalette.Window,          QColor(T["BG_DARK"]))
-    pal.setColor(QPalette.WindowText,      QColor(T["TEXT_PRIMARY"]))
-    pal.setColor(QPalette.Base,            QColor(T["BG_PANEL"]))
-    pal.setColor(QPalette.AlternateBase,   QColor(T["BG_ITEM"]))
-    pal.setColor(QPalette.Text,            QColor(T["TEXT_PRIMARY"]))
-    pal.setColor(QPalette.Button,          QColor(T["BG_ITEM"]))
-    pal.setColor(QPalette.ButtonText,      QColor(T["TEXT_PRIMARY"]))
-    pal.setColor(QPalette.Highlight,       QColor(T["ACCENT"]))
+    pal.setColor(QPalette.Window, QColor(T["BG_DARK"]))
+    pal.setColor(QPalette.WindowText, QColor(T["TEXT_PRIMARY"]))
+    pal.setColor(QPalette.Base, QColor(T["BG_PANEL"]))
+    pal.setColor(QPalette.AlternateBase, QColor(T["BG_ITEM"]))
+    pal.setColor(QPalette.Text, QColor(T["TEXT_PRIMARY"]))
+    pal.setColor(QPalette.Button, QColor(T["BG_ITEM"]))
+    pal.setColor(QPalette.ButtonText, QColor(T["TEXT_PRIMARY"]))
+    pal.setColor(QPalette.Highlight, QColor(T["ACCENT"]))
     pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
-    pal.setColor(QPalette.ToolTipBase,     QColor(T["BG_PANEL"]))
-    pal.setColor(QPalette.ToolTipText,     QColor(T["TEXT_PRIMARY"]))
+    pal.setColor(QPalette.ToolTipBase, QColor(T["BG_PANEL"]))
+    pal.setColor(QPalette.ToolTipText, QColor(T["TEXT_PRIMARY"]))
     pal.setColor(QPalette.PlaceholderText, QColor(T["TEXT_MUTED"]))
     return pal
 
 
 def main() -> int:
-    # ── HiDPI setup ──────────────────────────────────────────
-    # Must run before QApplication is constructed. Without these, Qt
-    # renders everything (including our SVG icons, which are separately
-    # rasterised crisp per-screen in ui_icons.py) at a flat 1x and then
-    # lets the OS stretch the whole window on HiDPI/Retina displays —
-    # that OS-level stretch is what makes text and icons look blurry
-    # rather than native-sharp.
     if hasattr(Qt, "AA_EnableHighDpiScaling"):
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     if hasattr(Qt, "AA_UseHighDpiPixmaps"):
         QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     if hasattr(Qt, "HighDpiScaleFactorRoundingPolicy"):
-        # PassThrough keeps fractional scale factors (e.g. 1.5x) exact
-        # instead of Qt rounding them to the nearest integer, which is
-        # what causes visible softness on fractionally-scaled displays.
         QApplication.setHighDpiScaleFactorRoundingPolicy(
             Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
         )
 
-    # ── Qt application ────────────────────────────────────────
     app = QApplication(sys.argv)
     app.setApplicationName("KubeDeck")
     app.setOrganizationName("EC2Manager")
 
-    # On macOS, Qt's native 'macos' style renders combo-box and menu popups
-    # through the OS itself and ignores most QAbstractItemView QSS (dark
-    # background, rounded row highlight, custom fonts) — the popup falls
-    # back to a plain system list no matter what build_qss() says. Fusion
-    # is a full Qt-drawn style, so every themed popup (namespace picker,
-    # sort/config combos, right-click menus) renders identically to the
-    # rest of the themed app on macOS, Windows, and Linux alike.
     if "Fusion" in QStyleFactory.keys():
         app.setStyle(QStyleFactory.create("Fusion"))
 
-    # Apply the theme that was loaded from saved settings at import time.
-    # (themes.py already called apply_theme_vars() on import, so T is populated.)
     app.setStyleSheet(build_qss())
     app.setPalette(_build_palette())
 
-    # ── Opening animation, then main window ────────────────────
-    # The main window is only constructed once the splash's ring/glyph/
-    # text sequence finishes, so the animation isn't competing with
-    # EC2FileManager's own startup work (theme/QSS already applied above,
-    # window construction, sidebar layout, etc.) for the UI thread.
     splash = SplashScreen()
     window_ref = {}
+
+    # The web server lives with the desktop process. It receives a callback
+    # to the current EC2FileManager.ssh object, so reconnecting in KubeDeck
+    # automatically changes the SSH connection used by the web app too.
+    app.aboutToQuit.connect(webapp_app.stop_server)
 
     def _begin_zoom():
         window = EC2FileManager()
         window_ref["window"] = window
+        webapp_app.start_server(lambda: getattr(window, "ssh", None))
 
         window.setWindowOpacity(0.0)
         window.showFullScreen()
@@ -105,8 +71,6 @@ def main() -> int:
         fade_in.setDuration(SplashScreen.ZOOM_MS)
         fade_in.setEasingCurve(QEasingCurve.InOutCubic)
 
-        # Splash fades out in place while the real window fades in at the
-        # same time, in the same animation group — a plain crossfade.
         splash.zoom_into(None, on_done=_finish, companions=[fade_in])
 
     def _finish():
@@ -114,10 +78,6 @@ def main() -> int:
         window_ref["window"].raise_()
         window_ref["window"].activateWindow()
         splash.close()
-        # Only check whether to show the lock screen once the window is
-        # fully raised/activated and the splash is gone — see
-        # check_initial_lock()'s docstring in main_window.py for why this
-        # can't happen any earlier.
         window_ref["window"].check_initial_lock()
 
     splash.finished.connect(_begin_zoom)
