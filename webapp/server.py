@@ -12,6 +12,7 @@ import logging
 import os
 import secrets
 import shlex
+import socket
 import threading
 from pathlib import Path
 from typing import Callable, Optional
@@ -83,8 +84,10 @@ def _exec(ssh: paramiko.SSHClient, command: str, timeout: int = 30) -> tuple[int
         out = stdout.read().decode("utf-8", errors="replace")
         err = stderr.read().decode("utf-8", errors="replace")
         for stream in (stdin, stdout, stderr):
-            try: stream.close()
-            except Exception: pass
+            try:
+                stream.close()
+            except Exception:
+                pass
         return code, out, err
     with managed_exec_command(ssh, command, channel_timeout=10) as (_stdin, stdout, stderr):
         code = stdout.channel.recv_exit_status()
@@ -247,30 +250,72 @@ def index(_: None = Depends(require_login)):
 
 _server: Optional[uvicorn.Server] = None
 _server_thread: Optional[threading.Thread] = None
+_server_port: Optional[int] = None
 _SERVER_LOCK = threading.RLock()
 
 
+def _reserve_port(host: str, preferred_port: int, attempts: int = 100) -> tuple[int, socket.socket]:
+    last_error = None
+    for candidate in range(preferred_port, preferred_port + attempts):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, candidate))
+            sock.listen(socket.SOMAXCONN)
+            sock.setblocking(False)
+            if candidate != preferred_port:
+                logger.warning("Web port %s is occupied; using port %s instead", preferred_port, candidate)
+            return candidate, sock
+        except OSError as exc:
+            last_error = exc
+            sock.close()
+    raise OSError(f"Unable to bind Web App to ports {preferred_port}-{preferred_port + attempts - 1}: {last_error}")
+
+
+def get_server_url() -> str:
+    with _SERVER_LOCK:
+        port = _server_port
+    if port is None:
+        try:
+            port = int(os.environ.get("WEBAPP_PORT", "8000"))
+        except ValueError:
+            port = 8000
+    return f"http://127.0.0.1:{port}"
+
+
 def start_server(ssh_provider: Callable[[], Optional[paramiko.SSHClient]], host: Optional[str] = None, port: Optional[int] = None) -> bool:
-    global _server, _server_thread
+    global _server, _server_thread, _server_port
     host = (host or os.environ.get("WEBAPP_HOST", "0.0.0.0")).strip() or "0.0.0.0"
     try:
-        port = int(port or os.environ.get("WEBAPP_PORT", "8000"))
+        preferred_port = int(port or os.environ.get("WEBAPP_PORT", "8000"))
     except ValueError:
-        port = 8000
+        preferred_port = 8000
     configure_runtime(ssh_provider)
     with _SERVER_LOCK:
         if _server_thread is not None and _server_thread.is_alive():
             return False
-        config = uvicorn.Config(app, host=host, port=port, log_level="info", access_log=True, log_config=None)
-        _server = uvicorn.Server(config)
+        try:
+            selected_port, reserved_socket = _reserve_port(host, preferred_port)
+        except OSError:
+            logger.exception("Unable to start KubeDeck Web server")
+            return False
+
+        config = uvicorn.Config(app, host=host, port=selected_port, log_level="info", access_log=True, log_config=None)
+        server = uvicorn.Server(config)
+        _server = server
+        _server_port = selected_port
 
         def run() -> None:
-            logger.info("Starting KubeDeck Web on http://%s:%s", host, port)
+            logger.info("Starting KubeDeck Web on http://%s:%s", host, selected_port)
             try:
-                _server.run()
+                server.run(sockets=[reserved_socket])
             except Exception:
                 logger.exception("Embedded web server stopped with an error")
             finally:
+                try:
+                    reserved_socket.close()
+                except OSError:
+                    pass
                 logger.info("KubeDeck Web server stopped")
 
         _server_thread = threading.Thread(target=run, name="KubeDeck-Web", daemon=True)
@@ -279,11 +324,12 @@ def start_server(ssh_provider: Callable[[], Optional[paramiko.SSHClient]], host:
 
 
 def stop_server(timeout: float = 3.0) -> None:
-    global _server, _server_thread
+    global _server, _server_thread, _server_port
     with _SERVER_LOCK:
         server, thread = _server, _server_thread
         _server = None
         _server_thread = None
+        _server_port = None
     if server is not None:
         logger.info("Stopping KubeDeck Web server")
         server.should_exit = True
