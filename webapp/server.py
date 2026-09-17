@@ -14,12 +14,14 @@ import secrets
 import shlex
 import socket
 import threading
+from contextvars import ContextVar
 from pathlib import Path
+from time import perf_counter
 from typing import Callable, Optional
 
 import paramiko
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
@@ -45,6 +47,7 @@ if not logger.handlers:
 
 _SSH_PROVIDER: Optional[Callable[[], Optional[paramiko.SSHClient]]] = None
 _RUNTIME_LOCK = threading.RLock()
+_REQUEST_ID: ContextVar[str] = ContextVar("kubedeck_web_request_id", default="-")
 
 
 def configure_runtime(ssh_provider: Callable[[], Optional[paramiko.SSHClient]]) -> None:
@@ -62,7 +65,7 @@ def _ssh() -> paramiko.SSHClient:
     try:
         client = provider()
     except Exception:
-        logger.exception("SSH provider failed")
+        logger.exception("[%s] SSH provider failed", _REQUEST_ID.get())
         raise HTTPException(503, "KubeDeck SSH runtime is unavailable")
     if client is None:
         raise HTTPException(503, "Connect to a VM in KubeDeck first")
@@ -78,32 +81,61 @@ def _credentials() -> tuple[str, str]:
 
 
 def _exec(ssh: paramiko.SSHClient, command: str, timeout: int = 30) -> tuple[int, str, str]:
-    if managed_exec_command is None:
-        stdin, stdout, stderr = ssh.exec_command(command, timeout=timeout)
-        code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
-        for stream in (stdin, stdout, stderr):
-            try:
-                stream.close()
-            except Exception:
-                pass
-        return code, out, err
-    with managed_exec_command(ssh, command, channel_timeout=10) as (_stdin, stdout, stderr):
-        code = stdout.channel.recv_exit_status()
-        return code, stdout.read().decode("utf-8", errors="replace"), stderr.read().decode("utf-8", errors="replace")
+    request_id = _REQUEST_ID.get()
+    started = perf_counter()
+    logger.info("[req=%s] KUBECTL START: %s", request_id, command)
+
+    try:
+        if managed_exec_command is None:
+            stdin, stdout, stderr = ssh.exec_command(command, timeout=timeout)
+            code = stdout.channel.recv_exit_status()
+            out = stdout.read().decode("utf-8", errors="replace")
+            err = stderr.read().decode("utf-8", errors="replace")
+            for stream in (stdin, stdout, stderr):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+        else:
+            with managed_exec_command(ssh, command, channel_timeout=10) as (_stdin, stdout, stderr):
+                code = stdout.channel.recv_exit_status()
+                out = stdout.read().decode("utf-8", errors="replace")
+                err = stderr.read().decode("utf-8", errors="replace")
+    except Exception:
+        logger.exception(
+            "[req=%s] KUBECTL EXCEPTION: %s (%.1f ms)",
+            request_id,
+            command,
+            (perf_counter() - started) * 1000,
+        )
+        raise
+
+    duration_ms = (perf_counter() - started) * 1000
+    logger.info(
+        "[req=%s] KUBECTL END: exit=%s duration=%.1f ms stdout=%d bytes stderr=%d bytes",
+        request_id,
+        code,
+        duration_ms,
+        len(out),
+        len(err),
+    )
+    if err.strip():
+        logger.info("[req=%s] KUBECTL STDERR: %s", request_id, err.strip()[:4000])
+
+    return code, out, err
 
 
 def _kubectl(args: str, timeout: int = 30, json_output: bool = False):
     code, out, err = _exec(_ssh(), f"kubectl {args}", timeout)
     if code != 0:
-        logger.warning("kubectl failed (%s): %s", code, err.strip())
+        logger.warning("[req=%s] kubectl failed (%s): %s", _REQUEST_ID.get(), code, err.strip())
         raise HTTPException(502, err.strip() or "kubectl command failed")
     if not json_output:
         return out
     try:
         return json.loads(out)
     except json.JSONDecodeError:
+        logger.error("[req=%s] kubectl returned invalid JSON", _REQUEST_ID.get())
         raise HTTPException(502, "kubectl returned non-JSON output")
 
 
@@ -115,11 +147,45 @@ def require_login(credentials: HTTPBasicCredentials = Depends(security)) -> None
     if not username or not password:
         raise HTTPException(503, "Web App login is not configured in KubeDeck Settings")
     if not (secrets.compare_digest(credentials.username, username) and secrets.compare_digest(credentials.password, password)):
-        logger.warning("Rejected web login for username=%r", credentials.username)
+        logger.warning("[req=%s] Rejected web login for username=%r", _REQUEST_ID.get(), credentials.username)
         raise HTTPException(401, "Invalid credentials", headers={"WWW-Authenticate": "Basic"})
 
 
 app = FastAPI(title="KubeDeck Web")
+
+
+@app.middleware("http")
+async def trace_requests(request: Request, call_next):
+    request_id = secrets.token_hex(4)
+    token = _REQUEST_ID.set(request_id)
+    started = perf_counter()
+    query = request.url.query
+    target = request.url.path + (f"?{query}" if query else "")
+    logger.info("[req=%s] HTTP START: %s %s", request_id, request.method, target)
+
+    try:
+        response = await call_next(request)
+        duration_ms = (perf_counter() - started) * 1000
+        logger.info(
+            "[req=%s] HTTP END: %s %s -> %s duration=%.1f ms",
+            request_id,
+            request.method,
+            target,
+            response.status_code,
+            duration_ms,
+        )
+        return response
+    except Exception:
+        logger.exception(
+            "[req=%s] HTTP EXCEPTION: %s %s (%.1f ms)",
+            request_id,
+            request.method,
+            target,
+            (perf_counter() - started) * 1000,
+        )
+        raise
+    finally:
+        _REQUEST_ID.reset(token)
 
 
 def _ready(status_obj: dict) -> str:
