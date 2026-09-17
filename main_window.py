@@ -1040,7 +1040,15 @@ class EC2FileManager(QMainWindow):
     # ── Kubernetes tab ────────────────────────────────────
     self.k8s_tab = KubernetesTab()
     self.k8s_tab.status_msg.connect(lambda m: self.status.showMessage(m))
-    add_icon_tab(self.main_tabs, self.k8s_tab, " Kubernetes")
+    # Kubernetes gets the ⎈ helm-wheel glyph instead of the SVG icon set
+    # used for every other tab — it's the symbol most people recognize
+    # for k8s at a glance, so plain addTab() (not add_icon_tab) here.
+    # Icon+text tabs (add_icon_tab) get an automatic icon-to-text gap
+    # from Qt on top of the QSS side padding; a plain text tab like this
+    # one doesn't, so the leading/trailing space below gives the glyph
+    # and the word the same breathing room the other tabs get for free
+    # — without it the label reads as pressed right up against the edges.
+    self.main_tabs.addTab(self.k8s_tab, " ⎈  Kubernetes ")
 
     # ── Dashboard tab ──────────────────────────────────────
     self.dashboard_tab = DashboardTab()
