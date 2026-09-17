@@ -1,0 +1,1 @@
+"""Embedded KubeDeck Web package."""
