@@ -314,12 +314,9 @@ def build_qss() -> str:
         border: 1px solid rgba(248,113,113,0.4); border-radius: 10px;
         padding: 2px 10px; font-size: 13px; font-weight: 600;
     }}
-    QListWidget#recent_list {{
-        background: {c['BG_DARK']}; border: 1px solid {c['BORDER']}; border-radius: 8px; outline: none;
+    QScrollArea#recent_scroll {{
+        background: transparent; border: none;
     }}
-    QListWidget#recent_list::item {{ border-radius: 8px; padding: 0px; margin: 3px 5px; color: {c['TEXT_PRIMARY']}; }}
-    QListWidget#recent_list::item:hover    {{ background: {c['BG_HOVER']}; }}
-    QListWidget#recent_list::item:selected {{ background: {c['BG_ITEM_SEL']}; color: {c['TEXT_PRIMARY']}; }}
 """
 
 

@@ -12,16 +12,16 @@ import threading
 import sys
 
 from PyQt5.QtWidgets import (
-  QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-  QProgressBar, QDialogButtonBox, QListWidget, QListWidgetItem,
+  QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
+  QProgressBar, QDialogButtonBox,
   QLineEdit, QFrame, QTextEdit, QFileDialog, QSpinBox, QCheckBox,
   QApplication, QComboBox, QMessageBox, QSplitter, QWidget,
   QPlainTextEdit, QTextBrowser, QAbstractItemView, QTreeWidget,
   QTreeWidgetItem, QHeaderView, QShortcut, QSlider,
-  QScrollArea, QStackedWidget, QCompleter,
+  QScrollArea, QStackedWidget, QCompleter, QSizePolicy,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QUrl
-from PyQt5.QtGui import QFont, QColor, QTextCursor, QTextCharFormat, QTextBlockFormat, QKeySequence, QIntValidator
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QUrl, QSize
+from PyQt5.QtGui import QFont, QColor, QTextCursor, QTextCharFormat, QTextBlockFormat, QKeySequence, QIntValidator, QPainter, QFontMetrics
 
 from ui_icons import set_icon, apply_text_icon, icon_button, icon_pixmap
 from themes import T, apply_qss_to
@@ -295,6 +295,98 @@ class FileTransferDialog(QDialog):
     return dlg.exec_() == QDialog.Accepted
 
 
+class MarqueeLabel(QWidget):
+  """A single-line label that behaves like a normal elided label, but
+  scrolls its text like a ticker on hover if the full text doesn't fit
+  — so a long instance name or host is fully readable without stretching
+  the card around it. Has a tiny fixed size hint on purpose, so it never
+  dictates its container's width; it just fills whatever space it's given."""
+
+  def __init__(self, text: str, color: str, px: int, bold: bool = False, parent=None):
+    super().__init__(parent)
+    self._text = text
+    self._color = QColor(color)
+    self._font = QFont()
+    self._font.setPixelSize(px)
+    self._font.setBold(bold)
+    self._gap = 28
+    self._offset = 0
+    self._hovering = False
+    self.setFont(self._font)
+    self.setFixedHeight(px + 6)
+    self.setMouseTracking(True)
+    self.setToolTip(text)
+    self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+    self._timer = QTimer(self)
+    self._timer.setInterval(30)
+    self._timer.timeout.connect(self._advance)
+
+  def sizeHint(self):
+    return QSize(1, self.height())
+
+  def minimumSizeHint(self):
+    return QSize(1, self.height())
+
+  def _text_width(self) -> int:
+    return QFontMetrics(self._font).horizontalAdvance(self._text)
+
+  def _overflowing(self) -> bool:
+    return self._text_width() > self.width()
+
+  def enterEvent(self, event):
+    self._hovering = True
+    if self._overflowing():
+      self._offset = 0
+      self._timer.start()
+    super().enterEvent(event)
+
+  def leaveEvent(self, event):
+    self._hovering = False
+    self._timer.stop()
+    self._offset = 0
+    self.update()
+    super().leaveEvent(event)
+
+  def _advance(self):
+    self._offset += 2
+    if self._offset > self._text_width() + self._gap:
+      self._offset = 0
+    self.update()
+
+  def paintEvent(self, event):
+    painter = QPainter(self)
+    painter.setFont(self._font)
+    painter.setPen(self._color)
+    fm = painter.fontMetrics()
+    y = (self.height() + fm.ascent() - fm.descent()) // 2
+    if self._hovering and self._overflowing():
+      tw = self._text_width()
+      x = -self._offset
+      painter.drawText(x, y, self._text)
+      painter.drawText(x + tw + self._gap, y, self._text)
+    else:
+      painter.drawText(0, y, fm.elidedText(self._text, Qt.ElideRight, self.width()))
+    painter.end()
+
+
+class _RecentCard(QFrame):
+  """Clickable card frame for one entry in the Recent Instances grid.
+  Clicking anywhere on the card (outside the Connect button) fills the
+  form below; the Connect button fills and connects immediately."""
+  clicked = pyqtSignal()
+  doubleClicked = pyqtSignal()
+
+  def mousePressEvent(self, event):
+    if event.button() == Qt.LeftButton:
+      self.clicked.emit()
+    super().mousePressEvent(event)
+
+  def mouseDoubleClickEvent(self, event):
+    if event.button() == Qt.LeftButton:
+      self.doubleClicked.emit()
+    super().mouseDoubleClickEvent(event)
+
+
 # ─── Connect dialog ───────────────────────────────────────────
 class ConnectDialog(QDialog):
   def __init__(self, parent=None):
@@ -321,21 +413,31 @@ class ConnectDialog(QDialog):
         f"letter-spacing: 1px; padding: 4px 0 2px 0;"
       )
       layout.addWidget(recent_lbl)
-      self.recent_list = QListWidget()
-      self.recent_list.setObjectName("recent_list")
-      self.recent_list.setMaximumHeight(210)
-      self.recent_list.setSpacing(0)
-      self.recent_list.setFocusPolicy(Qt.NoFocus)
-      for inst in recent:
-        item = QListWidgetItem()
-        item.setData(Qt.UserRole, inst)
-        row = self._build_recent_row(inst)
-        item.setSizeHint(row.sizeHint())
-        self.recent_list.addItem(item)
-        self.recent_list.setItemWidget(item, row)
-      self.recent_list.itemClicked.connect(self._fill_from_recent)
-      self.recent_list.itemDoubleClicked.connect(self._fill_and_accept)
-      layout.addWidget(self.recent_list)
+
+      scroll = QScrollArea()
+      scroll.setObjectName("recent_scroll")
+      scroll.setWidgetResizable(True)
+      scroll.setMaximumHeight(230)
+      scroll.setFrameShape(QFrame.NoFrame)
+      scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+      grid_host = QWidget()
+      grid_host.setStyleSheet("background: transparent;")
+      grid = QGridLayout(grid_host)
+      grid.setContentsMargins(0, 0, 4, 0)
+      grid.setHorizontalSpacing(8)
+      grid.setVerticalSpacing(8)
+      for col in (0, 1):
+        grid.setColumnStretch(col, 1)
+
+      for idx, inst in enumerate(recent):
+        card = self._build_recent_card(inst)
+        grid.addWidget(card, idx // 2, idx % 2)
+
+      scroll.setWidget(grid_host)
+      layout.addWidget(scroll)
+      self.recent_list = grid_host  # kept for a truthy "has recent" check elsewhere
+
       div = QFrame()
       div.setFrameShape(QFrame.HLine)
       div.setStyleSheet(f"color: {T['BORDER']}; margin: 4px 0;")
@@ -428,15 +530,29 @@ class ConnectDialog(QDialog):
     if path:
       self.pem_input.setText(path)
 
-  def _build_recent_row(self, inst: dict) -> QWidget:
-    """Build one rich row for the Recent Instances list: an icon badge,
-    a bold title (alias, falling back to host), a muted connection-string
-    subtitle, and small pills for protocol / auth method on the right."""
-    row = QWidget()
-    row.setStyleSheet("background: transparent;")
-    h = QHBoxLayout(row)
-    h.setContentsMargins(10, 8, 10, 8)
-    h.setSpacing(10)
+  def _build_recent_card(self, inst: dict) -> QWidget:
+    """Build one grid card for the Recent Instances box: an icon badge,
+    a bold title (alias, falling back to host), a muted host/IP subtitle,
+    small pills for protocol / auth method, and a Connect button that
+    fills the form and connects immediately without an extra click."""
+    card = _RecentCard()
+    card.setObjectName("recent_card")
+    card.setCursor(Qt.PointingHandCursor)
+    card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+    card.setStyleSheet(
+      f"""
+      QFrame#recent_card {{
+        background: {T['BG_ITEM']}; border: 1px solid {T['BORDER']};
+        border-radius: 10px;
+      }}
+      QFrame#recent_card:hover {{
+        border: 1px solid {T['ACCENT']};
+      }}
+      """
+    )
+    v = QVBoxLayout(card)
+    v.setContentsMargins(12, 10, 12, 10)
+    v.setSpacing(8)
 
     alias    = inst.get("alias", "").strip()
     host     = inst.get("host", "")
@@ -444,59 +560,76 @@ class ConnectDialog(QDialog):
     port     = inst.get("port", "22")
     protocol = (inst.get("protocol") or "ssh").upper()
 
-    # Icon badge — tinted circle with a server glyph.
+    # ── Header row: icon badge, title/subtitle, trailing pills ──
+    header = QHBoxLayout()
+    header.setSpacing(10)
+
     badge = QLabel()
-    badge.setFixedSize(34, 34)
+    badge.setFixedSize(32, 32)
     badge.setAlignment(Qt.AlignCenter)
     badge.setStyleSheet(
-      f"background: {_rgba(T['ACCENT'], 0.16)}; border-radius: 17px;"
+      f"background: {_rgba(T['ACCENT'], 0.18)}; border-radius: 8px;"
     )
-    badge.setPixmap(icon_pixmap("server", color=T["ACCENT"], size=17))
-    h.addWidget(badge)
+    badge.setPixmap(icon_pixmap("server", color=T["ACCENT"], size=16))
+    header.addWidget(badge)
 
-    # Title (alias, or host if no alias) + subtitle (full connection string).
     text_col = QVBoxLayout()
-    text_col.setSpacing(1)
+    text_col.setSpacing(0)
 
-    title = QLabel(alias if alias else host)
-    title.setStyleSheet(
-      f"color: {T['TEXT_PRIMARY']}; font-size: 15px; font-weight: 600; background: transparent;"
-    )
+    title = MarqueeLabel(alias if alias else host, T["TEXT_PRIMARY"], px=14, bold=True)
     title.setToolTip(f"{user}@{host}:{port}")
     text_col.addWidget(title)
 
-    subtitle = QLabel(f"{user}@{host}:{port}" if alias else f"user  {user}")
-    subtitle.setStyleSheet(
-      f"color: {T['TEXT_MUTED']}; font-size: 13px; background: transparent;"
-    )
+    subtitle = MarqueeLabel(host, T["TEXT_MUTED"], px=11, bold=False)
+    subtitle.setToolTip(f"{user}@{host}:{port}")
     text_col.addWidget(subtitle)
 
-    h.addLayout(text_col, 1)
+    header.addLayout(text_col, 1)
 
-    # Right-side pills: non-SSH protocol, and key-auth indicator.
     if protocol != "SSH":
       proto_lbl = QLabel(protocol)
       proto_lbl.setStyleSheet(
         f"color: {T['INFO']}; background: {_rgba(T['INFO'], 0.16)}; "
-        f"border-radius: 8px; padding: 2px 7px; font-size: 10px; font-weight: 700;"
+        f"border-radius: 8px; padding: 1px 6px; font-size: 9px; font-weight: 700;"
       )
-      h.addWidget(proto_lbl)
+      header.addWidget(proto_lbl, 0, Qt.AlignTop)
 
     if inst.get("pem", "").strip():
       key_badge = QLabel()
-      key_badge.setFixedSize(22, 22)
+      key_badge.setFixedSize(18, 18)
       key_badge.setAlignment(Qt.AlignCenter)
       key_badge.setToolTip("Connects using a PEM key")
       key_badge.setStyleSheet(
-        f"background: {_rgba(T['TEXT_MUTED'], 0.14)}; border-radius: 11px;"
+        f"background: {_rgba(T['TEXT_MUTED'], 0.14)}; border-radius: 9px;"
       )
-      key_badge.setPixmap(icon_pixmap("key", color=T["TEXT_DIM"], size=12))
-      h.addWidget(key_badge)
+      key_badge.setPixmap(icon_pixmap("key", color=T["TEXT_DIM"], size=10))
+      header.addWidget(key_badge, 0, Qt.AlignTop)
 
-    return row
+    v.addLayout(header)
 
-  def _fill_from_recent(self, item):
-    inst = item.data(Qt.UserRole)
+    # ── Quick-connect button ──
+    connect_btn = QPushButton("Connect")
+    connect_btn.setCursor(Qt.PointingHandCursor)
+    connect_btn.setFixedHeight(26)
+    connect_btn.setStyleSheet(
+      f"""
+      QPushButton {{
+        background: {_rgba(T['ACCENT'], 0.16)}; color: {T['ACCENT2']};
+        border: none; border-radius: 6px; font-size: 12px; font-weight: 600;
+      }}
+      QPushButton:hover {{ background: {_rgba(T['ACCENT'], 0.28)}; }}
+      """
+    )
+    connect_btn.clicked.connect(lambda: self._quick_connect(inst))
+    v.addWidget(connect_btn)
+
+    # Clicking the card body (not the button) just fills the form for editing.
+    card.clicked.connect(lambda: self._fill_from_recent_dict(inst))
+    card.doubleClicked.connect(lambda: self._quick_connect(inst))
+
+    return card
+
+  def _fill_from_recent_dict(self, inst: dict):
     protocol = inst.get("protocol", "ssh").lower()
     self.protocol_input.setCurrentIndex({"ssh": 0, "ftp": 1, "ftps": 2}.get(protocol, 0))
     self.host_input.setText(inst.get("host", ""))
@@ -505,8 +638,10 @@ class ConnectDialog(QDialog):
     self.pem_input.setText(inst.get("pem", ""))
     self.alias_input.setText(inst.get("alias", ""))
 
-  def _fill_and_accept(self, item):
-    self._fill_from_recent(item)
+  def _quick_connect(self, inst: dict):
+    """Fill the form from a recent-instance card and connect immediately
+    (the Connect button / double-click path on a Recent Instances card)."""
+    self._fill_from_recent_dict(inst)
     self.accept()
 
   def _fill_localhost(self):
