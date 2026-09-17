@@ -7,12 +7,16 @@ own; commands use KubeDeck's managed SSH session helper from workers.py.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
+import platform
+import re
 import secrets
 import shlex
 import socket
+import subprocess
 import threading
 from contextvars import ContextVar
 from pathlib import Path
@@ -48,6 +52,11 @@ if not logger.handlers:
 _SSH_PROVIDER: Optional[Callable[[], Optional[paramiko.SSHClient]]] = None
 _RUNTIME_LOCK = threading.RLock()
 _REQUEST_ID: ContextVar[str] = ContextVar("kubedeck_web_request_id", default="-")
+_AUTH_USER: ContextVar[str] = ContextVar("kubedeck_web_auth_user", default="-")
+_MAC_CACHE: dict[str, tuple[float, str]] = {}
+_MAC_CACHE_LOCK = threading.RLock()
+_MAC_CACHE_TTL = 300.0
+_MAC_RE = re.compile(r"(?i)\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b|\b[0-9a-f]{2}(?:-[0-9a-f]{2}){5}\b")
 
 
 def configure_runtime(ssh_provider: Callable[[], Optional[paramiko.SSHClient]]) -> None:
@@ -80,10 +89,96 @@ def _credentials() -> tuple[str, str]:
     return str(settings.get("webapp_username", "")).strip(), str(settings.get("webapp_password", ""))
 
 
+def _client_ip(request: Request) -> str:
+    client = request.client
+    return client.host if client and client.host else "-"
+
+
+def _safe_user_agent(request: Request) -> str:
+    return request.headers.get("user-agent", "-").replace("\r", "").replace("\n", "")[:1000]
+
+
+def _lookup_client_mac(client_ip: str) -> str:
+    """Best-effort MAC lookup from the KubeDeck host's local neighbor/ARP table.
+
+    A MAC is normally available only when the requesting device is on the same
+    Layer-2 network as the KubeDeck host. Never trust a forwarded MAC/IP header.
+    """
+    try:
+        ip = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return "N/A"
+
+    if not isinstance(ip, ipaddress.IPv4Address) or ip.is_loopback:
+        return "N/A"
+
+    now = perf_counter()
+    with _MAC_CACHE_LOCK:
+        cached = _MAC_CACHE.get(client_ip)
+        if cached and now - cached[0] < _MAC_CACHE_TTL:
+            return cached[1]
+
+    system = platform.system()
+    commands: list[list[str]] = []
+    if system == "Linux":
+        commands.append(["ip", "neigh", "show", client_ip])
+    elif system == "Darwin":
+        commands.append(["arp", "-n", client_ip])
+    elif system == "Windows":
+        commands.append(["arp", "-a", client_ip])
+    else:
+        commands.extend([
+            ["ip", "neigh", "show", client_ip],
+            ["arp", "-n", client_ip],
+            ["arp", "-a", client_ip],
+        ])
+
+    mac = "N/A"
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                check=False,
+            )
+        except (FileNotFoundError, OSError, subprocess.SubprocessError):
+            continue
+
+        match = _MAC_RE.search(result.stdout or "")
+        if match:
+            mac = match.group(0).replace("-", ":").lower()
+            break
+
+    with _MAC_CACHE_LOCK:
+        _MAC_CACHE[client_ip] = (now, mac)
+    return mac
+
+
+def _log_client_identity(request: Request, username: str) -> None:
+    client_ip = _client_ip(request)
+    mac = _lookup_client_mac(client_ip)
+    user_agent = _safe_user_agent(request)
+    logger.info(
+        "[req=%s] AUTH user=%r client_ip=%s client_mac=%s user_agent=%r",
+        _REQUEST_ID.get(),
+        username,
+        client_ip,
+        mac,
+        user_agent,
+    )
+
+
 def _exec(ssh: paramiko.SSHClient, command: str, timeout: int = 30) -> tuple[int, str, str]:
     request_id = _REQUEST_ID.get()
     started = perf_counter()
-    logger.info("[req=%s] KUBECTL START: %s", request_id, command)
+    logger.info(
+        "[req=%s] KUBECTL START user=%r: %s",
+        request_id,
+        _AUTH_USER.get(),
+        command,
+    )
 
     try:
         if managed_exec_command is None:
@@ -103,8 +198,9 @@ def _exec(ssh: paramiko.SSHClient, command: str, timeout: int = 30) -> tuple[int
                 err = stderr.read().decode("utf-8", errors="replace")
     except Exception:
         logger.exception(
-            "[req=%s] KUBECTL EXCEPTION: %s (%.1f ms)",
+            "[req=%s] KUBECTL EXCEPTION user=%r: %s (%.1f ms)",
             request_id,
+            _AUTH_USER.get(),
             command,
             (perf_counter() - started) * 1000,
         )
@@ -112,15 +208,16 @@ def _exec(ssh: paramiko.SSHClient, command: str, timeout: int = 30) -> tuple[int
 
     duration_ms = (perf_counter() - started) * 1000
     logger.info(
-        "[req=%s] KUBECTL END: exit=%s duration=%.1f ms stdout=%d bytes stderr=%d bytes",
+        "[req=%s] KUBECTL END user=%r: exit=%s duration=%.1f ms stdout=%d bytes stderr=%d bytes",
         request_id,
+        _AUTH_USER.get(),
         code,
         duration_ms,
         len(out),
         len(err),
     )
     if err.strip():
-        logger.info("[req=%s] KUBECTL STDERR: %s", request_id, err.strip()[:4000])
+        logger.info("[req=%s] KUBECTL STDERR user=%r: %s", request_id, _AUTH_USER.get(), err.strip()[:4000])
 
     return code, out, err
 
@@ -128,27 +225,46 @@ def _exec(ssh: paramiko.SSHClient, command: str, timeout: int = 30) -> tuple[int
 def _kubectl(args: str, timeout: int = 30, json_output: bool = False):
     code, out, err = _exec(_ssh(), f"kubectl {args}", timeout)
     if code != 0:
-        logger.warning("[req=%s] kubectl failed (%s): %s", _REQUEST_ID.get(), code, err.strip())
+        logger.warning(
+            "[req=%s] kubectl failed user=%r (%s): %s",
+            _REQUEST_ID.get(),
+            _AUTH_USER.get(),
+            code,
+            err.strip(),
+        )
         raise HTTPException(502, err.strip() or "kubectl command failed")
     if not json_output:
         return out
     try:
         return json.loads(out)
     except json.JSONDecodeError:
-        logger.error("[req=%s] kubectl returned invalid JSON", _REQUEST_ID.get())
+        logger.error("[req=%s] kubectl returned invalid JSON user=%r", _REQUEST_ID.get(), _AUTH_USER.get())
         raise HTTPException(502, "kubectl returned non-JSON output")
 
 
 security = HTTPBasic()
 
 
-def require_login(credentials: HTTPBasicCredentials = Depends(security)) -> None:
+def require_login(
+    request: Request,
+    credentials: HTTPBasicCredentials = Depends(security),
+) -> None:
     username, password = _credentials()
     if not username or not password:
         raise HTTPException(503, "Web App login is not configured in KubeDeck Settings")
     if not (secrets.compare_digest(credentials.username, username) and secrets.compare_digest(credentials.password, password)):
-        logger.warning("[req=%s] Rejected web login for username=%r", _REQUEST_ID.get(), credentials.username)
+        logger.warning(
+            "[req=%s] Rejected web login username=%r client_ip=%s user_agent=%r",
+            _REQUEST_ID.get(),
+            credentials.username,
+            _client_ip(request),
+            _safe_user_agent(request),
+        )
         raise HTTPException(401, "Invalid credentials", headers={"WWW-Authenticate": "Basic"})
+
+    token = _AUTH_USER.set(username)
+    _log_client_identity(request, username)
+    request.state.auth_context_token = token
 
 
 app = FastAPI(title="KubeDeck Web")
@@ -157,35 +273,50 @@ app = FastAPI(title="KubeDeck Web")
 @app.middleware("http")
 async def trace_requests(request: Request, call_next):
     request_id = secrets.token_hex(4)
-    token = _REQUEST_ID.set(request_id)
+    request_token = _REQUEST_ID.set(request_id)
     started = perf_counter()
     query = request.url.query
     target = request.url.path + (f"?{query}" if query else "")
-    logger.info("[req=%s] HTTP START: %s %s", request_id, request.method, target)
+    client_ip = _client_ip(request)
+    logger.info(
+        "[req=%s] HTTP START: %s %s client_ip=%s user_agent=%r",
+        request_id,
+        request.method,
+        target,
+        client_ip,
+        _safe_user_agent(request),
+    )
 
     try:
         response = await call_next(request)
         duration_ms = (perf_counter() - started) * 1000
         logger.info(
-            "[req=%s] HTTP END: %s %s -> %s duration=%.1f ms",
+            "[req=%s] HTTP END user=%r: %s %s -> %s duration=%.1f ms client_ip=%s",
             request_id,
+            _AUTH_USER.get(),
             request.method,
             target,
             response.status_code,
             duration_ms,
+            client_ip,
         )
         return response
     except Exception:
         logger.exception(
-            "[req=%s] HTTP EXCEPTION: %s %s (%.1f ms)",
+            "[req=%s] HTTP EXCEPTION user=%r: %s %s client_ip=%s (%.1f ms)",
             request_id,
+            _AUTH_USER.get(),
             request.method,
             target,
+            client_ip,
             (perf_counter() - started) * 1000,
         )
         raise
     finally:
-        _REQUEST_ID.reset(token)
+        auth_token = getattr(request.state, "auth_context_token", None)
+        if auth_token is not None:
+            _AUTH_USER.reset(auth_token)
+        _REQUEST_ID.reset(request_token)
 
 
 def _ready(status_obj: dict) -> str:
