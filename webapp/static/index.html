@@ -262,7 +262,7 @@
 <div id="toast"></div>
 
 <script>
-const state = { tab: "pods", namespace: "all", query: "", rawData: null };
+const state = { tab: "pods", namespace: "all", queries: { pods: "", deployments: "", services: "", nodes: "", events: "" }, rawData: null };
 
 const SEARCH_FIELDS = {
   pods:        p  => p.name,
@@ -303,7 +303,7 @@ function updateSearchCount(shown, total, query) {
 
 function renderFiltered() {
   const cfg = TAB_CONFIG[state.tab];
-  const query = state.query.trim();
+  const query = state.queries[state.tab].trim();
   const data = state.rawData || [];
   const filtered = filterData(data, state.tab, query);
   cfg.render(filtered);
@@ -593,10 +593,10 @@ document.querySelectorAll("#tabs button").forEach(btn => {
     document.querySelectorAll("#tabs button").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     state.tab = btn.dataset.tab;
-    state.query = "";
-    document.getElementById("search-input").value = "";
+    const savedQuery = state.queries[state.tab];
+    document.getElementById("search-input").value = savedQuery;
     document.getElementById("search-input").placeholder = "filter " + btn.dataset.tab + " by name…";
-    document.getElementById("search-clear").classList.remove("show");
+    document.getElementById("search-clear").classList.toggle("show", !!savedQuery);
     loadCurrentTab();
   };
 });
@@ -609,13 +609,13 @@ document.getElementById("ns-select").onchange = (e) => {
 document.getElementById("refresh-btn").onclick = loadCurrentTab;
 
 document.getElementById("search-input").oninput = (e) => {
-  state.query = e.target.value;
-  document.getElementById("search-clear").classList.toggle("show", !!state.query);
+  state.queries[state.tab] = e.target.value;
+  document.getElementById("search-clear").classList.toggle("show", !!e.target.value);
   renderFiltered();
 };
 
 document.getElementById("search-clear").onclick = () => {
-  state.query = "";
+  state.queries[state.tab] = "";
   const input = document.getElementById("search-input");
   input.value = "";
   input.focus();
