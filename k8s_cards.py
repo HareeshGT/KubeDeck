@@ -62,6 +62,31 @@ def _meta_label(text: str) -> QLabel:
   return lbl
 
 
+def _icon_badge(name: str, color: str, size: int = 26, tint: bool = True) -> QLabel:
+  """Small rounded badge showing a resource-type SVG icon (from
+  assets/icons), tinted to match the card's accent color. Mirrors the
+  icon-badge pattern used elsewhere in the app (see the connection
+  cards in dialogs.py) so every resource card in the Kubernetes tab
+  carries the same at-a-glance "what kind of thing is this" cue that
+  the sub-tabs themselves already show via add_icon_tab.
+
+  Most icons in assets/icons are single-color line glyphs, so tinting
+  them (recoloring every opaque pixel via SourceIn) to match the
+  card's accent is what makes the badge feel connected to the card.
+  A couple of icons (e.g. pods.svg, the official-style blue/white
+  badge) are multi-color by design — pass tint=False for those so the
+  icon keeps its own colors and only the badge background picks up
+  the accent tint."""
+  badge = QLabel()
+  badge.setFixedSize(size, size)
+  badge.setAlignment(Qt.AlignCenter)
+  badge.setStyleSheet(
+    f"background: rgba({_hex_to_rgb(color)}, 0.16); border-radius: {size // 4}px;"
+  )
+  badge.setPixmap(icon_pixmap(name, color=color if tint else None, size=int(size * 0.58)))
+  return badge
+
+
 def _ai_button(tooltip: str) -> QPushButton:
   """Small pill-shaped SVG AI button used to trigger inline diagnosis."""
   btn = icon_button(" AI")
@@ -164,6 +189,7 @@ class PodCardWidget(_CardBase):
 
     top = QHBoxLayout()
     top.setSpacing(8)
+    top.addWidget(_icon_badge("pods", self._accent, tint=False))
     name_lbl = QLabel(meta.get("name", ""))
     name_lbl.setFont(monospace_font(13, bold=True))
     name_lbl.setStyleSheet(f"color: {T['TEXT_PRIMARY']};")
@@ -233,6 +259,7 @@ class DeploymentCardWidget(_CardBase):
 
     top = QHBoxLayout()
     top.setSpacing(8)
+    top.addWidget(_icon_badge("deployment", self._accent))
     name_lbl = QLabel(meta.get("name", ""))
     name_lbl.setFont(monospace_font(13, bold=True))
     name_lbl.setStyleSheet(f"color: {T['TEXT_PRIMARY']};")
@@ -282,6 +309,7 @@ class StatefulSetCardWidget(_CardBase):
 
     top = QHBoxLayout()
     top.setSpacing(8)
+    top.addWidget(_icon_badge("statefulsets", self._accent))
     name_lbl = QLabel(meta.get("name", ""))
     name_lbl.setFont(monospace_font(13, bold=True))
     name_lbl.setStyleSheet(f"color: {T['TEXT_PRIMARY']};")
@@ -331,6 +359,7 @@ class DaemonSetCardWidget(_CardBase):
 
     top = QHBoxLayout()
     top.setSpacing(8)
+    top.addWidget(_icon_badge("daemonsets", self._accent))
     name_lbl = QLabel(meta.get("name", ""))
     name_lbl.setFont(monospace_font(13, bold=True))
     name_lbl.setStyleSheet(f"color: {T['TEXT_PRIMARY']};")
@@ -449,6 +478,7 @@ class HPACardWidget(_CardBase):
 
     top = QHBoxLayout()
     top.setSpacing(8)
+    top.addWidget(_icon_badge("hpa", self._accent))
     name_lbl = QLabel(meta.get("name", ""))
     name_lbl.setFont(monospace_font(13, bold=True))
     name_lbl.setStyleSheet(f"color: {T['TEXT_PRIMARY']};")
@@ -508,6 +538,7 @@ class ServiceCardWidget(_CardBase):
 
     top = QHBoxLayout()
     top.setSpacing(8)
+    top.addWidget(_icon_badge("services", self._accent))
     name_lbl = QLabel(meta.get("name", ""))
     name_lbl.setFont(monospace_font(13, bold=True))
     name_lbl.setStyleSheet(f"color: {T['TEXT_PRIMARY']};")
@@ -555,6 +586,7 @@ class IngressCardWidget(_CardBase):
 
     top = QHBoxLayout()
     top.setSpacing(8)
+    top.addWidget(_icon_badge("ingress", self._accent))
     name_lbl = QLabel(meta.get("name", ""))
     name_lbl.setFont(monospace_font(13, bold=True))
     name_lbl.setStyleSheet(f"color: {T['TEXT_PRIMARY']};")
@@ -645,6 +677,7 @@ class PVCCardWidget(_CardBase):
 
     top = QHBoxLayout()
     top.setSpacing(8)
+    top.addWidget(_icon_badge("storage", self._accent))
     name_lbl = QLabel(meta.get("name", ""))
     name_lbl.setFont(monospace_font(13, bold=True))
     name_lbl.setStyleSheet(f"color: {T['TEXT_PRIMARY']};")
@@ -701,6 +734,7 @@ class PVCardWidget(_CardBase):
 
     top = QHBoxLayout()
     top.setSpacing(8)
+    top.addWidget(_icon_badge("storage", self._accent))
     name_lbl = QLabel(meta.get("name", ""))
     name_lbl.setFont(monospace_font(13, bold=True))
     name_lbl.setStyleSheet(f"color: {T['TEXT_PRIMARY']};")
@@ -752,6 +786,7 @@ class JobCardWidget(_CardBase):
 
     top = QHBoxLayout()
     top.setSpacing(8)
+    top.addWidget(_icon_badge("jobs", self._accent))
     name_lbl = QLabel(meta.get("name", ""))
     name_lbl.setFont(monospace_font(13, bold=True))
     name_lbl.setStyleSheet(f"color: {T['TEXT_PRIMARY']};")
@@ -802,6 +837,7 @@ class CronJobCardWidget(_CardBase):
 
     top = QHBoxLayout()
     top.setSpacing(8)
+    top.addWidget(_icon_badge("jobs", self._accent))
     name_lbl = QLabel(meta.get("name", ""))
     name_lbl.setFont(monospace_font(13, bold=True))
     name_lbl.setStyleSheet(f"color: {T['TEXT_PRIMARY']};")
