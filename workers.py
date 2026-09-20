@@ -1134,6 +1134,63 @@ class _TransferWorker(QThread):
                 )
             return
 
+        # ── SFTP / sudo upload ───────────────────────────────────
+        # NOTE: this whole branch went missing when the FTP branch above
+        # was added (commit 210bf0c replaced the body of _upload with only
+        # the FTP code). Every non-FTP upload that reached this worker —
+        # any sudo-user upload, and any password login where scp can't be
+        # used (Windows) — ran zero code, returned normally, and
+        # _TransferWorker.run() then emitted finished_ok: "Done" with
+        # nothing uploaded.
+        total = os.path.getsize(self._local)
+        chunk = 65536
+        done  = 0
+        if self._sftp.sudo_user:
+            self.progress.emit(0, total)
+            self._sftp.put(self._local, self._remote)
+            self.progress.emit(total, total)
+        else:
+            # Same round-trip problem as the download path, mirrored for
+            # writes: set_pipelined(True) stops paramiko from waiting for
+            # each write's server ack before sending the next chunk, so
+            # writes queue up back-to-back instead of stalling on
+            # latency. This is what paramiko's own sftp.put() does
+            # internally, too.
+            # 32KB, NOT 256KB: OpenSSH's sftp-server caps a whole SFTP
+            # message at 256KiB (header included), so a 256KiB WRITE
+            # payload is over the limit and the server just drops the
+            # connection — surfacing as an instant "Socket is closed"
+            # at 0 bytes. 32KB is what OpenSSH's own client uses and
+            # works on every server; pipelining below keeps it fast.
+            REQUEST_SIZE = 32 * 1024
+            chunk = REQUEST_SIZE
+            with open(self._local, "rb") as local_f:
+                with self._sftp._sftp.open(self._remote, "wb") as remote_f:
+                    remote_f.MAX_REQUEST_SIZE = REQUEST_SIZE
+                    remote_f.set_pipelined(True)
+                    while True:
+                        if self._cancelled:
+                            return
+                        buf = local_f.read(chunk)
+                        if not buf:
+                            break
+                        remote_f.write(buf)
+                        done += len(buf)
+                        self.progress.emit(done, total)
+
+        # Never report success on faith: confirm the file is really there
+        # and the right size. (A silent no-op like the one above would have
+        # been caught by this immediately.)
+        try:
+            remote_size = self._sftp.stat(self._remote).st_size
+        except Exception:
+            remote_size = None   # can't verify on this server — don't fail a good upload
+        if remote_size is not None and remote_size != total:
+            raise IOError(
+                "Upload verification failed: remote file is {} bytes, expected {}.".format(
+                    remote_size, total)
+            )
+
 class _PtyProc:
     """Wraps an os.forkpty() child so the read loop below can treat it the
     same way it treats a subprocess.Popen object — .poll() / .wait() /
@@ -1209,30 +1266,81 @@ class ScpTransferWorker(QThread):
 
     _PASSWORD_PROMPT_RE = re.compile(rb"(?i)password:\s*$")
 
+    # Any *other* interactive prompt scp can stop on (key passphrase, a
+    # 2FA "Verification code:", a host-key "(yes/no)?", a second
+    # "password:" after ours was already sent). We can't answer these, and
+    # with no timeout the transfer would sit there forever with no
+    # feedback, so run() aborts on them and reports the prompt text.
+    _OTHER_PROMPT_RE = re.compile(
+        rb"(?i)(passphrase|verification code|one-time|otp|\(yes/no[^)]*\)\??|password)[^\r\n]*[:?]\s*$"
+    )
+    _PROGRESS_LINE_RE = re.compile(r"\d{1,3}%\s+\S+\s+\S+/s")
+
+    @classmethod
+    def _summarize_output(cls, raw, ret):
+        """Turn scp/ssh's raw pty output into a short, human-readable error.
+
+        The progress meter and the echoed password prompt are dropped, so
+        what's left is the real reason: "Permission denied", "REMOTE HOST
+        IDENTIFICATION HAS CHANGED", "No such file or directory", etc.
+        """
+        text = raw.decode(errors="replace")
+        text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+        lines = []
+        for seg in re.split(r"[\r\n]+", text):
+            seg = seg.strip()
+            if not seg or cls._PROGRESS_LINE_RE.search(seg):
+                continue
+            if seg.startswith("Warning: Permanently added"):
+                continue
+            if seg.lower().endswith("password:"):
+                continue
+            lines.append(seg)
+        if lines:
+            return " | ".join(lines[-4:])
+        if ret == 127:
+            return "The 'scp' command could not be started (not found on PATH)."
+        return "scp exited with status {}".format(ret)
+
     @staticmethod
     def pty_available():
         """True when this OS can give scp a real pseudo-terminal
         (``os.forkpty`` — macOS/Linux). Windows has no equivalent."""
         return hasattr(os, "forkpty")
 
+    @staticmethod
+    def effective_auth(pem, password):
+        """Return the (pem, password) pair scp must authenticate with.
+
+        This mirrors ConnectWorker exactly: when a password was typed it
+        wins and the pem is ignored (ConnectWorker connects password-only
+        in that case). The transfer has to use the same credential that
+        actually authenticated the SSH session; otherwise a connection
+        that has both a pem and a password filled in browses fine over
+        paramiko, but scp runs key-only (BatchMode) with a key the server
+        never accepted and fails with an opaque "status 255".
+        """
+        if password:
+            return "", password
+        return (pem or ""), None
+
     @classmethod
     def supports(cls, pem, password):
         """Can this worker finish a transfer with these credentials
         *without ever asking the user for anything*?
 
-        - Key auth: always (scp runs with BatchMode=yes, no prompts).
         - Password auth: only if we have a pty to type the password into.
           Without one (Windows) nothing can answer scp's ``password:``
           prompt, so OpenSSH falls back to prompting on the *local
           console* — which is exactly the "asks for the remote machine's
           password" bug. Callers must use the SFTP path (which reuses the
           already-authenticated paramiko session) in that case.
+        - Key auth: always (scp runs with BatchMode=yes, no prompts).
         """
-        if pem:
-            return True
+        pem, password = cls.effective_auth(pem, password)
         if password:
             return cls.pty_available()
-        return False
+        return bool(pem)
 
     def __init__(self, host, port, user, pem, password, direction, local_path, remote_path, total_size=None):
         # type: (str, int, str, str, str, str, str, str, Optional[int]) -> None
@@ -1240,8 +1348,7 @@ class ScpTransferWorker(QThread):
         self._host      = host
         self._port      = port or 22
         self._user      = user
-        self._pem       = pem
-        self._password  = password or None
+        self._pem, self._password = self.effective_auth(pem, password)
         self._direction = direction        # "upload" | "download"
         self._local     = local_path
         self._remote    = remote_path
@@ -1382,6 +1489,12 @@ class ScpTransferWorker(QThread):
         buf           = b""
         last_pct      = -1
         password_sent = not bool(self._password)
+        # Bounded copy of everything scp/ssh printed. `buf` below is
+        # consumed line by line to drive the progress meter, so by the
+        # time scp exits it no longer holds the actual error text; this
+        # log does, and is what the failure message is built from.
+        log           = bytearray()
+        prompt_abort  = None
         # Drive this off the process's own exit status (poll()), not off
         # read() returning EOF. ssh/scp can leave the pty/pipe's write end
         # referenced by a lingering child process even after the transfer
@@ -1417,6 +1530,9 @@ class ScpTransferWorker(QThread):
                 if chunk:
                     got_data = True
                     buf += chunk
+                    log += chunk
+                    if len(log) > 8192:
+                        del log[:-8192]
 
                     # scp's "ec2-user@1.2.3.4's password: " prompt has no
                     # trailing \r or \n — ssh just sits there waiting for
@@ -1446,6 +1562,15 @@ class ScpTransferWorker(QThread):
                             done = int(self._total * pct / 100) if self._total else pct
                             self.progress.emit(done, self._total)
 
+                    # `buf` is now just the current, unterminated line. The
+                    # password prompt we answer was consumed above, so if
+                    # what's left is a prompt (and not a progress line) it
+                    # is one we can't answer: stop instead of hanging.
+                    if buf and b"%" not in buf and self._OTHER_PROMPT_RE.search(buf):
+                        prompt_abort = buf.decode(errors="replace").strip()
+                        proc.kill()
+                        break
+
             if not got_data and exit_code is not None:
                 break
 
@@ -1459,9 +1584,13 @@ class ScpTransferWorker(QThread):
             return
 
         ret = proc.wait()
+        if prompt_abort:
+            self.finished_err.emit(
+                "scp stopped at a prompt it can't answer: {!r}".format(prompt_abort)
+            )
+            return
         if ret != 0:
-            tail = buf.decode(errors="replace").strip()
-            self.finished_err.emit(tail or "scp exited with status {}".format(ret))
+            self.finished_err.emit(self._summarize_output(bytes(log), ret))
             return
 
         if self._total:

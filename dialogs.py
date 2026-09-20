@@ -194,19 +194,50 @@ class FileTransferDialog(QDialog):
       except Exception:
         total_size = None
 
+    # scp is only a speed optimisation. The SFTP session is already
+    # authenticated, so keep what's needed to fall back to it if scp
+    # can't even get going (auth mismatch, host-key change, scp missing,
+    # a prompt it can't answer) instead of failing a transfer that the
+    # rest of the app proves is perfectly possible.
+    self._sftp_args = (sftp, direction, local_path, remote_path)
+    self._using_scp = use_scp
+    self._progressed = False
+    self._retired_workers = []   # keep finished QThreads referenced until they're really gone
+
     if use_scp:
-      self._worker = ScpTransferWorker(
+      worker = ScpTransferWorker(
         host, port, user, pem, password, direction, local_path, remote_path, total_size
       )
     else:
-      self._worker = _TransferWorker(sftp, direction, local_path, remote_path)
-    self._worker.progress.connect(self._on_progress)
-    self._worker.finished_ok.connect(self._on_success)
-    self._worker.finished_err.connect(self._on_error)
-    self._worker.start()
+      worker = _TransferWorker(sftp, direction, local_path, remote_path)
+    self._start_worker(worker)
     self._timer.start()
 
+  def _start_worker(self, worker):
+    self._worker = worker
+    worker.progress.connect(self._on_progress)
+    worker.finished_ok.connect(self._on_success)
+    worker.finished_err.connect(self._on_worker_error)
+    worker.start()
+
+  def _on_worker_error(self, msg: str):
+    """scp failing *before any bytes moved* falls back to the SFTP path;
+    anything else (SFTP failing, or a failure mid-transfer) is final."""
+    if self._using_scp and not self._progressed:
+      self._using_scp = False
+      first = msg.splitlines()[0] if msg else "unknown error"
+      self.file_lbl.setText(f"scp failed ({first[:120]}) — retrying over SFTP…")
+      self._retired_workers.append(self._worker)   # its thread is still winding down
+      self._t0 = time.monotonic()
+      self._speed_buf = []
+      sftp, direction, local_path, remote_path = self._sftp_args
+      self._start_worker(_TransferWorker(sftp, direction, local_path, remote_path))
+      return
+    self._on_error(msg)
+
   def _on_progress(self, done: int, total: int):
+    if done > 0:
+      self._progressed = True
     elapsed = max(time.monotonic() - self._t0, 0.001)
     speed  = done / elapsed
     if total > 0:
