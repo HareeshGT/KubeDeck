@@ -1054,6 +1054,31 @@ class ScpTransferWorker(QThread):
 
     _PASSWORD_PROMPT_RE = re.compile(rb"(?i)password:\s*$")
 
+    @staticmethod
+    def pty_available():
+        """True when this OS can give scp a real pseudo-terminal
+        (``os.forkpty`` — macOS/Linux). Windows has no equivalent."""
+        return hasattr(os, "forkpty")
+
+    @classmethod
+    def supports(cls, pem, password):
+        """Can this worker finish a transfer with these credentials
+        *without ever asking the user for anything*?
+
+        - Key auth: always (scp runs with BatchMode=yes, no prompts).
+        - Password auth: only if we have a pty to type the password into.
+          Without one (Windows) nothing can answer scp's ``password:``
+          prompt, so OpenSSH falls back to prompting on the *local
+          console* — which is exactly the "asks for the remote machine's
+          password" bug. Callers must use the SFTP path (which reuses the
+          already-authenticated paramiko session) in that case.
+        """
+        if pem:
+            return True
+        if password:
+            return cls.pty_available()
+        return False
+
     def __init__(self, host, port, user, pem, password, direction, local_path, remote_path, total_size=None):
         # type: (str, int, str, str, str, str, str, str, Optional[int]) -> None
         super().__init__()
@@ -1131,6 +1156,16 @@ class ScpTransferWorker(QThread):
             except Exception:
                 self._total = 0
 
+        # Safety net (dialogs.py already routes these to SFTP via
+        # supports()): never launch scp for a password login when there's
+        # no pty to answer its prompt — it would ask on the local console.
+        if not self.supports(self._pem, self._password):
+            self.finished_err.emit(
+                "Password transfers via scp aren't supported on this OS; "
+                "use the SFTP transfer path instead."
+            )
+            return
+
         cmd = self._build_cmd()
 
         # scp's progress meter is gated on more than just "is stdout a tty":
@@ -1171,7 +1206,10 @@ class ScpTransferWorker(QThread):
             # transfer and the exit-detection logic below still work.
             try:
                 proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
+                    cmd, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
+                    # Windows: don't flash a console window from a GUI app.
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
             except FileNotFoundError:
                 self.finished_err.emit(
@@ -1207,6 +1245,10 @@ class ScpTransferWorker(QThread):
                 rlist, _, _ = select.select([read_fd], [], [], 0.2)
             except (OSError, ValueError):
                 rlist = []
+                if pid is None:
+                    # Pipe path on Windows: select() can't poll a pipe, so
+                    # without this the loop would busy-spin a CPU core.
+                    time.sleep(0.2)
 
             got_data = False
             if rlist:

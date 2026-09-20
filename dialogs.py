@@ -170,13 +170,19 @@ class FileTransferDialog(QDialog):
     self._t0 = time.monotonic()
 
     # Use real `scp` on the app's host machine when we can: a plain
-    # (non-sudo) connection, whether key- or password-authenticated —
-    # ScpTransferWorker answers scp's password prompt itself over the
-    # pty it already opens for the progress meter. A sudo-target
-    # transfer still needs the SudoFS two-hop dance (upload to a tmp
-    # path, then `sudo mv` over ssh), which a single scp invocation
-    # can't express, so that keeps using the SFTP path.
-    use_scp = (not hasattr(sftp, "_ftp")) and bool(host) and bool(user) and not sudo_user and (bool(pem) or bool(password))
+    # (non-sudo) connection. Key auth always works. Password auth only
+    # works where ScpTransferWorker can answer scp's password prompt
+    # over a pty (macOS/Linux) — on Windows there is no pty, so scp
+    # would prompt on the local console for the remote password; in
+    # that case (ScpTransferWorker.supports() is False) we use the SFTP
+    # path below, which reuses the already-authenticated SSH session and
+    # never prompts. A sudo-target transfer still needs the SudoFS
+    # two-hop dance (upload to a tmp path, then `sudo mv` over ssh),
+    # which a single scp invocation can't express, so it also uses SFTP.
+    use_scp = (
+      (not hasattr(sftp, "_ftp")) and bool(host) and bool(user) and not sudo_user
+      and ScpTransferWorker.supports(pem, password)
+    )
     total_size = None
     if use_scp:
       try:
