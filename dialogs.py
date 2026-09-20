@@ -1385,122 +1385,120 @@ class ContainerPickerDialog(QDialog):
 class ExecDialog(QDialog):
   def __init__(self, parent, ssh, namespace: str, pod: str, container: str = None, context: str = None):
     super().__init__(parent)
-    self.ssh    = ssh
-    self._pod    = pod
-    self._ns    = namespace
+    self.ssh = ssh
+    self._pod = pod
+    self._ns = namespace
     self._container = container
-    self.context  = context
-    self._cwd    = None
-    self._workers  = []
-
-    # State for the "Analyze with AI" AI feature — the last command run
-    # (not counting `cd`, which has its own distinct failure message
-    # already) plus its exit code and raw stdout/stderr, so a click on
-    # the button doesn't need to re-derive any of that from the
-    # combined text already sitting in self.output.
-    self._last_cmd    = None
+    self.context = context
+    self._workers = []
+    self._stream_worker = None
+    self._last_cmd = None
     self._last_exit_code = None
-    self._last_stdout   = ""
-    self._last_stderr   = ""
-    self._ai_worker    = None
-    self._ai_dialog    = None
+    self._last_stdout = ""
+    self._last_stderr = ""
+    self._ai_worker = None
+    self._ai_dialog = None
 
     self.setWindowTitle(f"Exec — {pod}")
-    self.resize(860, 500)
+    self.resize(900, 560)
     apply_qss_to(self)
 
     layout = QVBoxLayout(self)
     layout.setContentsMargins(12, 12, 12, 12)
     layout.setSpacing(8)
 
-    info = QLabel(f"Running commands inside <b>{pod}</b> (namespace: {namespace})")
+    info = QLabel(f"Interactive shell in <b>{pod}</b> (namespace: {namespace})")
     info.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 12px;")
     layout.addWidget(info)
 
-    self.output = QTextEdit()
-    self.output.setReadOnly(True)
+    self.output = QPlainTextEdit()
+    self.output.setReadOnly(False)
     self.output.setFont(monospace_font(11))
-    self.output.setStyleSheet(f"background: #0d0d1a; color: {T['SUCCESS']}; border: none; padding: 8px;")
+    self.output.setStyleSheet(
+      f"background: #0d0d1a; color: {T['SUCCESS']}; border: none; padding: 8px;"
+    )
+    self.output.setLineWrapMode(QPlainTextEdit.NoWrap)
+    self.output.setUndoRedoEnabled(False)
     layout.addWidget(self.output)
 
-    inp_row = QHBoxLayout()
     self.cmd_inp = QLineEdit()
-    self.cmd_inp.setPlaceholderText("$ command inside pod (cd, $VAR, pipes all work)…")
-    self.cmd_inp.returnPressed.connect(self._run)
-    inp_row.addWidget(self.cmd_inp)
+    self.cmd_inp.setPlaceholderText("Type a command and press Enter…")
+    self.cmd_inp.returnPressed.connect(self._send_command)
+    layout.addWidget(self.cmd_inp)
 
-    run_btn = QPushButton("Run")
+    inp_row = QHBoxLayout()
+    run_btn = QPushButton("Send")
     run_btn.setObjectName("primary")
-    run_btn.clicked.connect(self._run)
+    run_btn.clicked.connect(self._send_command)
     inp_row.addWidget(run_btn)
+
+    interrupt_btn = QPushButton("Ctrl+C")
+    interrupt_btn.clicked.connect(self._interrupt)
+    inp_row.addWidget(interrupt_btn)
 
     self.explain_btn = icon_button(" Analyze with AI")
     self.explain_btn.setToolTip("Ask AI to diagnose the last failed command")
     self.explain_btn.setEnabled(False)
     self.explain_btn.clicked.connect(self._on_explain)
     inp_row.addWidget(self.explain_btn)
+    inp_row.addStretch()
     layout.addLayout(inp_row)
 
     bb = QDialogButtonBox(QDialogButtonBox.Close)
     bb.rejected.connect(self.reject)
     layout.addWidget(bb)
 
-  def _run(self):
-    cmd = self.cmd_inp.text().strip()
-    if not cmd:
-      return
-    c = f"-c {self._container}" if self._container else ""
+    QTimer.singleShot(0, self._start_stream)
 
-    cd_match = re.match(r'^\s*cd\s*(.*?)\s*$', cmd)
-    if cd_match:
-      target = cd_match.group(1) or ''
-      if target in ('', '~'):
-        resolve_cmd = 'echo $HOME'
-      elif target.startswith('/'):
-        resolve_cmd = f"cd '{target}' 2>/dev/null && pwd || echo __FAIL__"
-      else:
-        prefix = f"cd '{self._cwd}' && " if self._cwd else ""
-        resolve_cmd = f"{prefix}cd '{target}' 2>/dev/null && pwd || echo __FAIL__"
-      safe = resolve_cmd.replace("'", "'\\''")
-      full = f"kubectl exec -n {self._ns} {self._pod} {c} -- sh -c '{safe}' 2>&1"
-      append_terminal_html(self.output, f"\n<span style='color:{T['ACCENT2']}'>$ {html_escape(cmd)}</span>")
-      worker = CommandWorker(self.ssh, full)
-      worker.done.connect(self._handle_cd_result)
-      worker.error.connect(lambda e: append_terminal_html(self.output, f"<span style='color:{T['DANGER']}'>[error] {html_escape(e)}</span>"))
-      track_worker(self._workers, worker)
-      worker.start()
-      self.cmd_inp.clear()
+  def _append_stream(self, text: str):
+    if not text:
       return
+    cursor = self.output.textCursor()
+    cursor.movePosition(QTextCursor.End)
+    cursor.insertText(text)
+    self.output.setTextCursor(cursor)
+    self.output.ensureCursorVisible()
 
-    safe_cmd = (f"cd '{self._cwd}' && {cmd}" if self._cwd else cmd).replace("'", "'\\''")
-    full = f"kubectl exec -n {self._ns} {self._pod} {c} -- sh -c '{safe_cmd}' 2>&1"
-    append_terminal_html(self.output, f"\n<span style='color:{T['ACCENT2']}'>$ {html_escape(cmd)}</span>")
-    worker = CommandWorker(self.ssh, full)
-    worker.result.connect(lambda out, err, code, cmd=cmd: self._on_cmd_result(cmd, out, err, code))
-    worker.done.connect(lambda r: append_terminal_text(self.output, r))
-    worker.error.connect(lambda e: append_terminal_html(self.output, f"<span style='color:{T['DANGER']}'>[error] {html_escape(e)}</span>"))
-    track_worker(self._workers, worker)
+  def _start_stream(self):
+    worker = PodExecStreamWorker(
+      self.ssh, self._ns, self._pod, self._container, self.context
+    )
+    worker.chunk.connect(self._append_stream)
+    worker.exited.connect(self._on_stream_exit)
+    worker.error.connect(self._on_stream_error)
+    self._stream_worker = track_worker(self._workers, worker)
     worker.start()
+    self.cmd_inp.setFocus()
+
+  def _send_command(self):
+    cmd = self.cmd_inp.text()
+    if not cmd or self._stream_worker is None:
+      return
+    self._last_cmd = cmd
+    self._last_stdout = ""
+    self._last_stderr = ""
+    self.explain_btn.setEnabled(False)
+    self._stream_worker.send_input(cmd + "\n")
     self.cmd_inp.clear()
 
-  def _on_cmd_result(self, cmd: str, out: str, err: str, exit_code: int):
-    """Remembers the last command's real exit code/stdout/stderr (the
-    `2>&1` baked into `full` above means `err` from CommandWorker
-    itself is usually empty — the actual error text lives in `out` —
-    so the Explain button/prompt fall back to `out` when `err` is
-    blank; see ai_assist._build_command_prompt)."""
-    self._last_cmd    = cmd
-    self._last_stdout  = out
-    self._last_stderr  = err
-    self._last_exit_code = exit_code
-    failed = exit_code != 0 or bool((err or "").strip())
-    self.explain_btn.setEnabled(failed)
+  def _interrupt(self):
+    if self._stream_worker is not None:
+      self._stream_worker.interrupt()
 
-  # ── AI diagnosis of the last failed command ────────────────
+  def _on_stream_exit(self, code: int):
+    self._last_exit_code = code
+    self._append_stream(f"\n[process exited with code {code}]\n")
+    self._stream_worker = None
+
+  def _on_stream_error(self, message: str):
+    append_terminal_html(
+      self.output,
+      f"<span style='color:{T['DANGER']}'>[error] {html_escape(message)}</span>"
+    )
+
   def _on_explain(self):
     if self._ai_worker is not None or self._last_cmd is None:
-      return # already running, or nothing to explain yet
-
+      return
     provider = ai_assist.get_provider()
     api_key = ai_assist.get_api_key(provider)
     if not api_key:
@@ -1510,7 +1508,6 @@ class ExecDialog(QDialog):
         f"Add a {label} API key in Settings → AI to use this feature."
       )
       return
-
     self._ai_dialog = AIExplainDialog(self, f"AI diagnosis — {self._last_cmd}")
     self._ai_dialog.set_source_context(
       f"Command: {self._last_cmd}\n"
@@ -1520,10 +1517,8 @@ class ExecDialog(QDialog):
     )
     self._ai_dialog.set_loading()
     self._ai_dialog.show()
-
     self.explain_btn.setEnabled(False)
     self.explain_btn.setText(" Thinking…")
-
     worker = ai_assist.AICommandExplainWorker(
       provider, api_key, ai_assist.get_model(provider),
       self._last_cmd, self._last_exit_code, self._last_stderr, self._last_stdout,
@@ -1548,18 +1543,11 @@ class ExecDialog(QDialog):
     self.explain_btn.setText(" Analyze with AI")
 
   def closeEvent(self, event):
+    if self._stream_worker is not None:
+      self._stream_worker.stop()
     if self._ai_worker is not None:
       self._ai_worker.quit()
     super().closeEvent(event)
-
-  def _handle_cd_result(self, result: str):
-    result = result.strip()
-    if result and not result.startswith('__FAIL__') and result.startswith('/'):
-      self._cwd = result
-      append_terminal_html(self.output, f"<span style='color:{T['TEXT_DIM']}'>{html_escape(result)}</span>")
-      self.setWindowTitle(f"Exec — {self._pod} [{result}]")
-    else:
-      append_terminal_html(self.output, f"<span style='color:{T['DANGER']}'>cd: no such directory</span>")
 
 
 # ─── File Editor ──────────────────────────────────────────────
