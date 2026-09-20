@@ -1,5 +1,6 @@
 """workers.py — Background QThread workers for SSH commands and file transfers."""
 
+import codecs
 import os
 import re
 import signal
@@ -660,19 +661,39 @@ class CommandWorker(QThread):
 
 
 class PodExecStreamWorker(QThread):
-    """Persistent PTY-backed kubectl exec session with live bidirectional I/O."""
+    """Persistent PTY-backed ``kubectl exec -it`` session with live,
+    bidirectional I/O.
+
+    Unlike CommandWorker (which buffers a whole command's output and only
+    hands it over when the command exits), this keeps ONE interactive shell
+    open inside the pod over an SSH channel that has a pseudo-terminal, and
+    emits ``chunk`` the moment bytes arrive — so a long ``wget``/``apt``/
+    ``pip`` shows its progress live, exactly like a real terminal.
+
+    ``chunk`` carries the raw terminal stream (escape sequences and all);
+    render it with ansi_terminal.AnsiStreamRenderer.
+    """
 
     chunk = pyqtSignal(str)
     exited = pyqtSignal(int)
     error = pyqtSignal(str)
 
-    def __init__(self, ssh, namespace, pod, container=None, context=None):
+    # Same PATH CommandWorker exports before every remote command. A
+    # non-interactive SSH exec doesn't read the login profile, so kubectl
+    # living in ~/bin, /usr/local/bin, etc. would otherwise be "not found"
+    # even though every other feature in the app finds it. $HOME is
+    # expanded by the remote shell, so no separate lookup is needed.
+    _PATH_PREFIX = 'export PATH="$HOME:$HOME/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"; '
+
+    def __init__(self, ssh, namespace, pod, container=None, context=None, cols=120, rows=32):
         super().__init__()
         self.ssh = ssh
         self.namespace = namespace
         self.pod = pod
         self.container = container
         self.context = context
+        self._cols = max(20, int(cols))
+        self._rows = max(5, int(rows))
         self._channel = None
         self._stop = threading.Event()
         self._send_lock = threading.RLock()
@@ -683,14 +704,14 @@ class PodExecStreamWorker(QThread):
         return "'" + str(value).replace("'", "'\\''") + "'"
 
     def _command(self):
-        parts = ["kubectl"]
+        parts = ["exec", "kubectl"]      # `exec`: the shell is replaced, so closing the channel hangs up kubectl itself
         if self.context:
             parts += ["--context", self._quote(self.context)]
         parts += ["exec", "-it", "-n", self._quote(self.namespace)]
         if self.container:
             parts += ["-c", self._quote(self.container)]
         parts += [self._quote(self.pod), "--", "sh"]
-        return " ".join(parts)
+        return self._PATH_PREFIX + " ".join(parts)
 
     def send_input(self, text):
         channel = self._channel
@@ -708,6 +729,17 @@ class PodExecStreamWorker(QThread):
     def interrupt(self):
         return self.send_input("\x03")
 
+    def resize(self, cols, rows):
+        """Tell the remote PTY the widget's new size (like resizing a
+        terminal window) so progress bars and line wrapping fit."""
+        self._cols, self._rows = max(20, int(cols)), max(5, int(rows))
+        channel = self._channel
+        if channel is not None and not self._stop.is_set():
+            try:
+                channel.resize_pty(width=self._cols, height=self._rows)
+            except Exception:
+                pass
+
     def stop(self):
         self._stop.set()
         channel = self._channel
@@ -723,10 +755,16 @@ class PodExecStreamWorker(QThread):
 
     def run(self):
         channel = None
+        # A multibyte UTF-8 character (box-drawing progress bars, accents,
+        # emoji) can straddle two network reads; decoding each read on its
+        # own would turn it into U+FFFD. Incremental decoders carry the
+        # partial bytes over to the next read.
+        out_dec = codecs.getincrementaldecoder("utf-8")("replace")
+        err_dec = codecs.getincrementaldecoder("utf-8")("replace")
         try:
             channel = open_managed_session(self.ssh)
             self._channel = channel
-            channel.get_pty(term="xterm-256color", width=120, height=32)
+            channel.get_pty(term="xterm-256color", width=self._cols, height=self._rows)
             channel.settimeout(0.2)
             channel.exec_command(self._command())
 
@@ -737,7 +775,9 @@ class PodExecStreamWorker(QThread):
                         data = channel.recv(65536)
                         if data:
                             got_data = True
-                            self.chunk.emit(data.decode("utf-8", errors="replace"))
+                            text = out_dec.decode(data)
+                            if text:
+                                self.chunk.emit(text)
                 except Exception:
                     if self._stop.is_set():
                         break
@@ -747,7 +787,9 @@ class PodExecStreamWorker(QThread):
                         data = channel.recv_stderr(65536)
                         if data:
                             got_data = True
-                            self.chunk.emit(data.decode("utf-8", errors="replace"))
+                            text = err_dec.decode(data)
+                            if text:
+                                self.chunk.emit(text)
                     except Exception:
                         pass
 

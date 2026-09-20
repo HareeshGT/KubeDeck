@@ -198,6 +198,17 @@ kubectl exec -it <pod> -- /bin/sh
 
 can be performed without leaving KubeDeck.
 
+Output is **live**: the dialog keeps one persistent shell open in the pod, so a
+long-running `wget`, `curl`, `apt` or `pip` shows its progress as it happens
+(progress bars redraw in place, colours are preserved) instead of appearing only
+after the command finishes. `cd`, environment variables and pipes work because
+it is a real shell. Use the **Ctrl+C** button to interrupt a running command.
+Closing the dialog ends the session in the pod.
+
+> Full-screen programs that address the cursor (`vim`, `nano`, `top`, `htop`,
+> `less`) are not supported in this dialog. Use `top -b -n1`, `cat`, or edit
+> files with KubeDeck's file editor instead.
+
 ---
 
 ## 🔀 Port Forwarding & Tunnels
