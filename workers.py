@@ -659,6 +659,119 @@ class CommandWorker(QThread):
             self.error.emit(str(e))
 
 
+class PodExecStreamWorker(QThread):
+    """Persistent PTY-backed kubectl exec session with live bidirectional I/O."""
+
+    chunk = pyqtSignal(str)
+    exited = pyqtSignal(int)
+    error = pyqtSignal(str)
+
+    def __init__(self, ssh, namespace, pod, container=None, context=None):
+        super().__init__()
+        self.ssh = ssh
+        self.namespace = namespace
+        self.pod = pod
+        self.container = container
+        self.context = context
+        self._channel = None
+        self._stop = threading.Event()
+        self._send_lock = threading.RLock()
+        self.finished.connect(self.deleteLater)
+
+    @staticmethod
+    def _quote(value):
+        return "'" + str(value).replace("'", "'\\''") + "'"
+
+    def _command(self):
+        parts = ["kubectl"]
+        if self.context:
+            parts += ["--context", self._quote(self.context)]
+        parts += ["exec", "-it", "-n", self._quote(self.namespace)]
+        if self.container:
+            parts += ["-c", self._quote(self.container)]
+        parts += [self._quote(self.pod), "--", "sh"]
+        return " ".join(parts)
+
+    def send_input(self, text):
+        channel = self._channel
+        if channel is None or self._stop.is_set():
+            return False
+        try:
+            data = text.encode("utf-8", errors="replace")
+            with self._send_lock:
+                channel.sendall(data)
+            return True
+        except Exception as e:
+            self.error.emit(str(e))
+            return False
+
+    def interrupt(self):
+        return self.send_input("\x03")
+
+    def stop(self):
+        self._stop.set()
+        channel = self._channel
+        if channel is not None:
+            try:
+                channel.shutdown_write()
+            except Exception:
+                pass
+            try:
+                channel.close()
+            except Exception:
+                pass
+
+    def run(self):
+        channel = None
+        try:
+            channel = open_managed_session(self.ssh)
+            self._channel = channel
+            channel.get_pty(term="xterm-256color", width=120, height=32)
+            channel.settimeout(0.2)
+            channel.exec_command(self._command())
+
+            while not self._stop.is_set():
+                got_data = False
+                try:
+                    if channel.recv_ready():
+                        data = channel.recv(65536)
+                        if data:
+                            got_data = True
+                            self.chunk.emit(data.decode("utf-8", errors="replace"))
+                except Exception:
+                    if self._stop.is_set():
+                        break
+
+                if channel.recv_stderr_ready():
+                    try:
+                        data = channel.recv_stderr(65536)
+                        if data:
+                            got_data = True
+                            self.chunk.emit(data.decode("utf-8", errors="replace"))
+                    except Exception:
+                        pass
+
+                if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                    break
+
+                if not got_data:
+                    self.msleep(20)
+
+            if not self._stop.is_set():
+                try:
+                    code = channel.recv_exit_status()
+                except Exception:
+                    code = -1
+                self.exited.emit(code)
+        except Exception as e:
+            if not self._stop.is_set():
+                self.error.emit(str(e))
+        finally:
+            self._channel = None
+            if channel is not None:
+                close_managed_session(channel)
+
+
 class FileStreamReadWorker(QThread):
     """Reads a remote file in 64KB chunks on a background QThread.
 
