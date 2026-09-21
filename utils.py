@@ -77,6 +77,19 @@ FILE_ICONS = {
     "link": "🔗", "exec": "⚙️", "unknown": "📎", "key": "🔑",
 }
 
+# Explicit media extensions keep audio/video classification reliable even
+# when the host's mimetypes database is incomplete (common on minimal Linux
+# installs and some Windows Python distributions).
+AUDIO_EXTS = {
+    ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus",
+    ".wma", ".aiff", ".aif", ".alac", ".amr", ".mid", ".midi", ".mka",
+}
+
+VIDEO_EXTS = {
+    ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".wmv", ".webm", ".mpeg",
+    ".mpg", ".m2ts", ".ts", ".3gp", ".ogv",
+}
+
 CODE_EXTS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".html", ".css",
     ".sh", ".bash", ".yaml", ".yml", ".json", ".toml",
@@ -98,6 +111,10 @@ def classify(name: str, is_dir: bool, mode: int) -> str:
         return "text"
     if ext in CODE_EXTS:
         return "code"
+    if ext in AUDIO_EXTS:
+        return "audio"
+    if ext in VIDEO_EXTS:
+        return "video"
     mime, _ = mimetypes.guess_type(name)
     if mime:
         if mime.startswith("image"):   return "image"

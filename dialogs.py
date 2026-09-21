@@ -2424,11 +2424,34 @@ class MediaPlayerDialog(QDialog):
       self._video_widget = QVideoWidget()
       b_lay.addWidget(self._video_widget, 1)
     else:
+      # Audio gets the same full transport/streaming pipeline as video,
+      # but uses a proper themed audio surface instead of an empty video
+      # widget. The controls below remain identical: play/pause, stop,
+      # +/-10s, seek, mute and volume.
+      audio_wrap = QWidget()
+      audio_lay = QVBoxLayout(audio_wrap)
+      audio_lay.setContentsMargins(20, 20, 20, 20)
+      audio_lay.setSpacing(10)
+
       icon_lbl = QLabel()
-      icon_lbl.setPixmap(icon_pixmap("audio" if kind == "audio" else "warning", size=20))
+      icon_lbl.setPixmap(icon_pixmap(
+        "audio" if kind == "audio" else "warning",
+        color=T['ACCENT'],
+        size=64,
+      ))
       icon_lbl.setAlignment(Qt.AlignCenter)
-      icon_lbl.setFont(QFont("Segoe UI Emoji", 64))
-      b_lay.addWidget(icon_lbl, 1)
+      audio_lay.addWidget(icon_lbl, 1)
+
+      if kind == "audio":
+        type_lbl = QLabel("AUDIO")
+        type_lbl.setAlignment(Qt.AlignCenter)
+        type_lbl.setStyleSheet(
+          "color: {dim}; font-size: 11px; font-weight: 700; letter-spacing: 2px;"
+          .format(dim=T['TEXT_DIM'])
+        )
+        audio_lay.addWidget(type_lbl)
+
+      b_lay.addWidget(audio_wrap, 1)
     lay.addWidget(body, 1)
 
     # ── Status / buffering progress ─────────────────────
