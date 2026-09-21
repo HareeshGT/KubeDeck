@@ -29,6 +29,15 @@ _SSH_GUARD_ATTR = "_kdb_channel_guard"
 _SSH_POOL_ATTR = "_kdb_connection_pool"
 
 
+def _configure_host_key_policy(ssh):
+    """Require SSH host keys to be known before connecting."""
+    import paramiko
+    ssh.load_system_host_keys()
+    known_hosts = os.path.expanduser("~/.ssh/known_hosts")
+    if os.path.isfile(known_hosts):
+        ssh.load_host_keys(known_hosts)
+    ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+
 def _configure_transport(ssh):
     """Apply the same transport tuning used by the primary connection."""
     try:
@@ -82,7 +91,7 @@ class SSHConnectionPool:
         ssh = paramiko.SSHClient()
         # Keep the same host-key behavior as the existing primary connection
         # so introducing the pool does not change connection semantics.
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        _configure_host_key_policy(ssh)
         kw = dict(
             hostname=self.host,
             port=self.port,
@@ -382,7 +391,7 @@ class ConnectWorker(QThread):
         import paramiko
         try:
             ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            _configure_host_key_policy(ssh)
             kw = dict(hostname=self.host, port=self.port, username=self.user,
                       timeout=10, banner_timeout=10, auth_timeout=10)
             if self.password:
