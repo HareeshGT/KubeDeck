@@ -169,7 +169,7 @@ class SudoFS:
         self._sftp.put(local_path, tmp)
         self._run_or_raise(
             "sudo mv {tmp} {dst} && sudo chown {user} {dst}".format(
-                tmp=self._sq(tmp), dst=self._sq(remote_path), user=self.sudo_user)
+                tmp=self._sq(tmp), dst=self._sq(remote_path), user=self._sq(self.sudo_user))
         )
 
     # ── Directory operations ──────────────────────────────────
