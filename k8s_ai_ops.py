@@ -1316,7 +1316,8 @@ def build_kubectl_command(action: dict) -> str:
       get_one = (
         f"{base} get {resource}/{name} -o jsonpath=\"{{.data['$k']}}\" "
         f"--allow-missing-template-keys=false 2>/dev/null"
-      )      decode_stage = (
+      )
+      decode_stage = (
         'v=$(printf "%s" "$v" | base64 --decode); '
         if resource == "secret" else ""
       )
