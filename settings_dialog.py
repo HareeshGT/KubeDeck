@@ -179,7 +179,7 @@ class SettingsDialog(QDialog):
         self._lock = security.get_lock_settings()
         self._pending_pin = None
         self._webapp_username = str(settings.get("webapp_username", ""))
-        self._webapp_password = str(settings.get("webapp_password", ""))
+        self._webapp_enabled = bool(settings.get("webapp_enabled", False))
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 20, 20, 16)
@@ -423,15 +423,14 @@ class SettingsDialog(QDialog):
         v.setSpacing(10)
         v.setContentsMargins(4, 14, 4, 4)
 
+        self.webapp_enable_chk = QCheckBox("Enable the local web dashboard")
+        self.webapp_enable_chk.setChecked(self._webapp_enabled)
+        v.addWidget(self.webapp_enable_chk)
+
         desc = QLabel(
-            "Credentials used by the KubeDeck mobile web dashboard. The web "
-            "dashboard runs automatically with KubeDeck and reuses the desktop "
-            "app's existing SSH connection — SSH host/user/key settings are not "
-            "stored here."
-        )
-        desc.setWordWrap(True)
-        desc.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px;")
-        v.addWidget(desc)
+            "Optional local web dashboard. It is disabled by default and binds "
+            "only to 127.0.0.1 when enabled. It reuses the current SSH connection."
+        )        v.addWidget(desc)
         v.addSpacing(6)
 
         v.addWidget(QLabel("Web App username"))
@@ -441,9 +440,9 @@ class SettingsDialog(QDialog):
 
         v.addWidget(QLabel("Web App password"))
         row = QHBoxLayout()
-        self.web_password_edit = QLineEdit(self._webapp_password)
+        self.web_password_edit = QLineEdit()
         self.web_password_edit.setEchoMode(QLineEdit.Password)
-        self.web_password_edit.setPlaceholderText("Choose a strong password")
+        self.web_password_edit.setPlaceholderText("Leave blank to keep the stored password")
         row.addWidget(self.web_password_edit, 1)
 
         self.show_web_password_btn = QPushButton("Show")
@@ -509,10 +508,30 @@ class SettingsDialog(QDialog):
             self._ai_keys,
             self._ai_models,
         )
-        save_settings(
-            webapp_username=self.web_username_edit.text().strip(),
-            webapp_password=self.web_password_edit.text(),
-        )
+        webapp_extra = {
+            "webapp_enabled": self.webapp_enable_chk.isChecked(),
+            "webapp_username": self.web_username_edit.text().strip(),
+        }
+        new_web_password = self.web_password_edit.text()
+        if new_web_password:
+            from webapp.server import hash_web_password
+            salt, digest = hash_web_password(new_web_password)
+            webapp_extra.update({
+                "webapp_password_salt": salt,
+                "webapp_password_hash": digest,
+                "webapp_password": "",
+            })
+        save_settings(**webapp_extra)
+
+        try:
+            from webapp import app as webapp_app
+            main_window = self.parent()
+            if self.webapp_enable_chk.isChecked():
+                webapp_app.start_server(lambda: getattr(main_window, "ssh", None))
+            else:
+                webapp_app.stop_server()
+        except Exception:
+            pass
         self.accept()
 
     def hidden_k8s_tabs(self):
