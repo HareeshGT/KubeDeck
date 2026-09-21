@@ -2473,45 +2473,56 @@ class MediaPlayerDialog(QDialog):
     seek_row.addWidget(self._dur_lbl)
     c.addLayout(seek_row)
 
+    # Transport controls — keep the action group compact and visually
+    # consistent. SVG icons avoid platform-dependent emoji rendering
+    # (which made the old controls look misaligned on macOS).
     btn_row = QHBoxLayout()
-    btn_row.setSpacing(6)
+    btn_row.setContentsMargins(0, 0, 0, 0)
+    btn_row.setSpacing(8)
 
-    def _mkbtn(text, tooltip, width=36):
-      b = QPushButton(text)
-      b.setFixedSize(width, 32)
+    def _mkbtn(tooltip, icon_name=None, width=38, primary=False):
+      b = QPushButton()
+      b.setFixedSize(width, 36)
       b.setToolTip(tooltip)
+      b.setCursor(Qt.PointingHandCursor)
+      if primary:
+        b.setObjectName("primary")
+      if icon_name:
+        set_icon(b, icon_name, color=T['TEXT_PRIMARY'], size=17)
       return b
 
-    self._back_btn = _mkbtn(" ⏮ ", "Back 10s")
+    self._back_btn = _mkbtn("Back 10 seconds", "back")
     self._back_btn.clicked.connect(lambda: self._skip(-10000))
     btn_row.addWidget(self._back_btn)
 
-    self._play_btn = _mkbtn(" ▶ ", "Play / Pause", 46)
-    self._play_btn.setObjectName("primary")
+    self._play_btn = _mkbtn("Play / Pause", "play", width=44, primary=True)
     self._play_btn.clicked.connect(self._toggle_play)
     btn_row.addWidget(self._play_btn)
 
-    self._fwd_btn = _mkbtn(" ⏭ ", "Forward 10s")
+    self._fwd_btn = _mkbtn("Forward 10 seconds", "forward")
     self._fwd_btn.clicked.connect(lambda: self._skip(10000))
     btn_row.addWidget(self._fwd_btn)
 
-    self._stop_btn = _mkbtn(" ⏹ ", "Stop")
+    self._stop_btn = _mkbtn("Stop", "stop")
     self._stop_btn.clicked.connect(self._stop)
     btn_row.addWidget(self._stop_btn)
 
-    btn_row.addSpacing(14)
+    # Separate playback and volume groups with a little breathing room.
+    btn_row.addSpacing(10)
 
-    self._mute_btn = _mkbtn(" 🔇 ", "Mute")
+    self._mute_btn = _mkbtn("Mute", "volume_high")
     self._mute_btn.clicked.connect(self._toggle_mute)
     btn_row.addWidget(self._mute_btn)
 
     self._vol_slider = QSlider(Qt.Horizontal)
-    self._vol_slider.setFixedWidth(90)
+    self._vol_slider.setFixedWidth(100)
+    self._vol_slider.setFixedHeight(20)
     self._vol_slider.setRange(0, 100)
     self._vol_slider.setValue(80)
+    self._vol_slider.setToolTip("Volume")
     btn_row.addWidget(self._vol_slider)
 
-    btn_row.addStretch()
+    btn_row.addStretch(1)
     c.addLayout(btn_row)
     lay.addWidget(controls)
 
@@ -2647,7 +2658,12 @@ class MediaPlayerDialog(QDialog):
     self._dur_lbl.setText(self._fmt_time(dur))
 
   def _on_state_changed(self, state):
-    self._play_btn.setText("⏸" if state == QMediaPlayer.PlayingState else "▶")
+    if state == QMediaPlayer.PlayingState:
+      set_icon(self._play_btn, "pause", color=T['TEXT_PRIMARY'], size=17)
+      self._play_btn.setToolTip("Pause")
+    else:
+      set_icon(self._play_btn, "play", color=T['TEXT_PRIMARY'], size=17)
+      self._play_btn.setToolTip("Play")
 
   def _on_player_error(self, _err):
     if not self._player:
