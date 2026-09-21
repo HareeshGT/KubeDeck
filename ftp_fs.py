@@ -1,7 +1,8 @@
-"""FTP/FTPS remote filesystem adapter used by the file manager."""
+"""ftp_fs.py is a FTP/FTPS remote filesystem adapter used by the file manager."""
 import io
 import os
 import posixpath
+import socket
 import stat as _stat
 import threading
 import time
@@ -50,6 +51,38 @@ class _FTPWriteFile:
         self._buf.close()
 
 
+class _FTPStreamReader:
+    """File-like reader over one FTP data connection (read/close only).
+
+    It owns a dedicated control connection so the shared FTPFS control
+    channel used by the file manager is never disturbed by media playback.
+    Closing it just drops both sockets, which is how a player seek (or
+    closing the player) aborts a transfer without waiting on the server.
+    """
+    def __init__(self, ftp, data_conn):
+        self._ftp = ftp
+        self._conn = data_conn
+        self._closed = False
+
+    def read(self, n):
+        if self._closed:
+            return b""
+        try:
+            return self._conn.recv(n)
+        except (OSError, socket.timeout):
+            return b""
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        for closer in (self._conn.close, self._ftp.close):
+            try:
+                closer()
+            except Exception:
+                pass
+
+
 class FTPFS:
     """Filesystem-shaped wrapper around ftplib.FTP / FTP_TLS.
 
@@ -79,7 +112,7 @@ class FTPFS:
         self._connect()
         self._initial_path = self.normalize(initial_path or "/")
 
-    def _connect(self):
+    def _new_connection(self):
         cls = FTP_TLS if self.tls else FTP
         ftp = cls()
         ftp.connect(self.host, self.port, timeout=self.timeout)
@@ -87,7 +120,10 @@ class FTPFS:
         if self.tls:
             ftp.prot_p()
         ftp.set_pasv(self.passive)
-        self._ftp = ftp
+        return ftp
+
+    def _connect(self):
+        self._ftp = self._new_connection()
         self.connected_at = time.time()
 
     def close(self):
@@ -194,6 +230,55 @@ class FTPFS:
         out = io.BytesIO()
         self._ftp.retrbinary("RETR " + self.normalize(path), out.write)
         return out.getvalue()
+
+    # ── Streaming (used by the media player; nothing touches local disk) ──
+    def stream_probe(self, path):
+        """Return (size, supports_rest) for ``path`` using a throw-away
+        connection, so the shared control channel is left alone.
+
+        ``supports_rest`` says whether the server accepts REST (restart at
+        a byte offset), i.e. whether seeking inside the stream will work.
+        """
+        path = self.normalize(path)
+        ftp = self._new_connection()
+        try:
+            ftp.voidcmd("TYPE I")
+            try:
+                size = int(ftp.size(path) or 0)
+            except Exception:
+                size = 0
+            try:
+                ftp.sendcmd("REST 1")
+                supports_rest = True
+            except Exception:
+                supports_rest = False
+            return size, supports_rest
+        finally:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    def open_stream(self, path, offset=0):
+        """Open ``path`` for sequential reading starting at byte ``offset``.
+
+        Each call uses its own control+data connection (FTP can't run a
+        second transfer on a busy control channel). Returns an object with
+        ``read(n)`` and ``close()``.
+        """
+        path = self.normalize(path)
+        ftp = self._new_connection()
+        try:
+            ftp.voidcmd("TYPE I")
+            conn = ftp.transfercmd("RETR " + path, rest=int(offset) if offset else None)
+            conn.settimeout(60)
+        except Exception:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+            raise
+        return _FTPStreamReader(ftp, conn)
 
     def _record_transfer(self, direction, amount):
         with self._stats_lock:

@@ -40,28 +40,6 @@ def _rgba(hex_color: str, alpha: float) -> str:
   r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
   return f"rgba({r}, {g}, {b}, {alpha})"
 
-# PyAV is optional and only used for duration probing (to drive the
-# progress bar) ahead of a local-file transcode — it is never required for
-# playback itself, so its absence must never block the player.
-try:
-  import av as _av
-  _PYAV_AVAILABLE = True
-except Exception:
-  _av = None
-  _PYAV_AVAILABLE = False
-
-# FFmpeg (via imageio-ffmpeg, which ships a platform binary through pip) is
-# what actually performs every remote-media transcode, for both SSH and
-# FTP. This is checked once at import time so MediaPlayerDialog can show an
-# accurate, immediate message instead of the worker failing mid-playback.
-try:
-  import imageio_ffmpeg as _imageio_ffmpeg
-  _imageio_ffmpeg.get_ffmpeg_exe()
-  _FFMPEG_AVAILABLE = True
-except Exception:
-  _imageio_ffmpeg = None
-  _FFMPEG_AVAILABLE = False
-
 # QtMultimedia is an optional Qt component — most PyQt5 installs on macOS
 # and Linux ship it, but guard the import so a system missing the
 # multimedia plugin doesn't break the whole app, just the media player.
@@ -2378,606 +2356,24 @@ class FileEditorDialog(QDialog):
     return dlg
 
 
-class _RemoteRemuxWorker(QThread):
-  """Download a remote media file over SSH/SFTP or FTP/FTPS, then fully
-  decode and transcode it to a broadly compatible H.264/AAC MP4.
-
-  This path is intentionally identical for SSH and FTP so the built-in
-  player sees the same local, known-good MP4 regardless of transport.
-  """
-
-  progress = pyqtSignal(int, str)
-  ready = pyqtSignal(str)
-  error = pyqtSignal(str)
-
-  def __init__(self, remote_fs, ssh, remote_path, kind):
-    super().__init__()
-    self._remote_fs = remote_fs
-    self._ssh = ssh
-    self._remote = remote_path
-    self._kind = kind
-    self._cancelled = False
-    self._succeeded = False
-    self._input_path = None
-    self._output_path = None
-    self.finished.connect(self.deleteLater)
-
-  def cancel(self):
-    self._cancelled = True
-
-  def run(self):
-    import os
-    import tempfile
-    import subprocess
-    import sys
-    import time
-
-    try:
-      # Note: PyAV is only used below (in _transcode) for optional
-      # duration probing to drive the progress bar — the actual
-      # decode/encode is done natively by FFmpeg via imageio-ffmpeg.
-      # A missing PyAV install must not block playback; only a
-      # missing FFmpeg binary should (raised by _ffmpeg_binary()
-      # when a transcode command actually needs it).
-      fd_out, self._output_path = tempfile.mkstemp(
-        prefix="deckhand_media_", suffix=".mp4"
-      )
-      os.close(fd_out)
-
-      total = 0
-      try:
-        total = int(self._remote_fs.stat(self._remote).st_size)
-      except Exception:
-        pass
-
-      # A privileged/sudo SFTP path cannot be safely streamed through the
-      # existing abstraction, so retain the old local-download fallback.
-      if getattr(self._remote_fs, "sudo_user", None):
-        fd_in, self._input_path = tempfile.mkstemp(
-          prefix="deckhand_media_", suffix=".source"
-        )
-        os.close(fd_in)
-        self.progress.emit(0, "Downloading remote media…")
-        self._remote_fs.get(self._remote, self._input_path)
-        if self._cancelled:
-          return
-        self.progress.emit(65, "Converting to H.264/AAC…")
-        self._transcode()
-      elif self._source_needs_file(total):
-        # MP4/MOV with 'moov' at the end (or an FTP mov-family file):
-        # FFmpeg can't read that from a pipe — it must seek back to the
-        # samples after reading the index — so land it in a temp file
-        # first, exactly like the sudo path above.
-        if not self._download_source(total) or self._cancelled:
-          return
-        self.progress.emit(65, "Converting to H.264/AAC…")
-        self._transcode()
-      else:
-        # Pipe-safe source (fast-start MP4, mkv, webm, mp3, ...): stream
-        # the remote file directly into FFmpeg. Download and
-        # decode/encode happen at the same time instead of waiting for a
-        # full temporary source download first.
-        self.progress.emit(1, "Starting native FFmpeg conversion…")
-        self._transcode_remote(total)
-
-      if self._cancelled:
-        return
-
-      self.progress.emit(100, "Playback ready")
-      self._succeeded = True
-      self.ready.emit(self._output_path)
-
-    except Exception as exc:
-      if not self._cancelled:
-        self.error.emit(str(exc))
-    finally:
-      # The downloaded source file (sudo path only) is scratch —
-      # it's never needed again once _transcode() has run, whether
-      # that succeeded, failed, or was cancelled, so it's removed
-      # unconditionally here instead of leaking on every successful
-      # (non-cancelled) sudo-mode playback.
-      if self._input_path:
-        try:
-          os.remove(self._input_path)
-        except OSError:
-          pass
-      # The output MP4 is only kept when it's about to be handed to
-      # the player (ready.emit above). On cancel *or* on a failed
-      # conversion it's a partial/unusable file and would otherwise
-      # leak in the temp dir forever.
-      if not self._succeeded and self._output_path:
-        try:
-          os.remove(self._output_path)
-        except OSError:
-          pass
-
-  def _ffmpeg_binary(self):
-    try:
-      import imageio_ffmpeg
-      return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception as exc:
-      raise RuntimeError(
-        "FFmpeg runtime is not installed. Add imageio-ffmpeg to req.txt "
-        "and run: pip install imageio-ffmpeg"
-      ) from exc
-
-  def _ffmpeg_cmd(self, ffmpeg_bin, hw=True, input_path="pipe:0", loglevel="error"):
-    """Build one FFmpeg command line. Shared by both the non-sudo
-    streaming path (input_path="pipe:0", remote bytes piped straight
-    into stdin) and the sudo path (input_path=a local temp file
-    already fully downloaded) so the two never drift out of sync on
-    encoder settings — they used to be two hand-maintained copies of
-    nearly the same command, which is exactly how they'd quietly end
-    up encoding at different quality/behavior for no real reason.
-
-    Keeps output broadly compatible with Qt's player while using a
-    fast encoder. Fragmented MP4 is not used here because
-    QMediaPlayer's local file backend may try to seek before the file
-    is finalized.
-    """
-    import sys
-    cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", loglevel, "-y"]
-    if hw and sys.platform == "darwin":
-      cmd += ["-hwaccel", "videotoolbox"]
-    cmd += [
-      "-i", input_path,
-      "-map", "0:v:0?",
-      "-map", "0:a:0?",
-      "-sn", "-dn", "-map_metadata", "-1",
-    ]
-    if hw and sys.platform == "darwin":
-      cmd += [
-        "-c:v", "h264_videotoolbox",
-        "-allow_sw", "1",
-        "-b:v", "6M",
-        "-maxrate", "6M",
-        "-bufsize", "12M",
-      ]
-    else:
-      cmd += [
-        "-threads", "0",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-tune", "zerolatency",
-        "-crf", "28",
-      ]
-    cmd += [
-      "-pix_fmt", "yuv420p",
-      "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
-      "-movflags", "+faststart",
-      self._output_path,
-    ]
-    return cmd
-
-  def _read_remote(self, sink, total):
-    """Feed the remote file's bytes, in order, to sink(data). Shared by
-    the pipe-into-FFmpeg path and the download-to-temp-file path so the
-    FTP/SFTP transport code exists exactly once."""
-    if hasattr(self._remote_fs, "_ftp"):
-      from ftplib import FTP, FTP_TLS
-      ftp_cls = FTP_TLS if getattr(self._remote_fs, "tls", False) else FTP
-      ftp = ftp_cls()
-      try:
-        ftp.connect(
-          self._remote_fs.host,
-          self._remote_fs.port,
-          timeout=getattr(self._remote_fs, "timeout", 15),
-        )
-        ftp.login(self._remote_fs.user, self._remote_fs.password)
-        if getattr(self._remote_fs, "tls", False):
-          ftp.prot_p()
-        ftp.set_pasv(getattr(self._remote_fs, "passive", True))
-        remote = self._remote_fs.normalize(self._remote)
-        ftp.retrbinary("RETR " + remote, sink,
-                blocksize=1024 * 1024)
-      finally:
-        try:
-          ftp.quit()
-        except Exception:
-          try:
-            ftp.close()
-          except Exception:
-            pass
-    else:
-      # Open a dedicated SFTP channel for this download rather
-      # than reusing self._remote_fs's shared connection — the
-      # same one the main-thread file browser keeps issuing
-      # requests on. Concurrent use of one SFTP/raw channel
-      # from two threads is exactly the class of bug already
-      # called out elsewhere in this app (see the "Garbage
-      # packet received" note in terminal_widget.py); this
-      # runs for potentially a long time, so it's worth a
-      # fresh channel the way MediaStreamServer already does.
-      dedicated_sftp = None
-      try:
-        dedicated_sftp = self._ssh.open_sftp()
-      except Exception:
-        dedicated_sftp = None
-      raw = dedicated_sftp or getattr(self._remote_fs, "_sftp", self._remote_fs)
-      try:
-        with raw.open(self._remote, "rb") as in_f:
-          try:
-            in_f.MAX_REQUEST_SIZE = 1024 * 1024
-            in_f.prefetch(total or None)
-          except Exception:
-            pass
-          while True:
-            if self._cancelled:
-              raise InterruptedError
-            data = in_f.read(1024 * 1024)
-            if not data:
-              break
-            sink(data)
-      finally:
-        if dedicated_sftp is not None:
-          try:
-            dedicated_sftp.close()
-          except Exception:
-            pass
-
-  # Top-level atoms that may legitimately open an MP4/MOV (ISO-BMFF) file.
-  _BMFF_ATOMS = (b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide", b"pnot", b"junk", b"uuid")
-  _MOV_FAMILY_EXTS = (".mp4", ".m4v", ".mov", ".m4a", ".3gp", ".3g2", ".qt")
-
-  @classmethod
-  def _bmff_needs_seekable_input(cls, f, size):
-    """Decide whether FFmpeg must be given a *seekable* source (a real
-    file) instead of a pipe, by walking the top-level MP4/MOV atoms.
-
-    An MP4 keeps its sample index in the 'moov' atom. When 'moov' comes
-    first ("fast-start") FFmpeg can read the index and then the data in
-    order, which works fine on a pipe. When 'mdat' (the media data) comes
-    first and 'moov' sits at the END — which is how most recorders,
-    exporters and plain `ffmpeg -i in out.mp4` write files — FFmpeg has
-    to read the index at the end and then jump back to the samples. A
-    pipe can't seek back, so it fails with "stream N, offset 0x30:
-    partial file" / "Invalid data found when processing input".
-
-    Returns True  -> needs a local file (mdat first, or can't tell),
-            False -> safe to pipe (moov first, or not an MP4/MOV at all).
-    """
-    import struct
-    off = 0
-    first = True
-    for _ in range(64):
-      f.seek(off)
-      hdr = f.read(8)
-      if len(hdr) < 8:
-        return not first          # ran out of file mid-walk: play it safe
-      sz, typ = struct.unpack(">I4s", hdr)
-      if first:
-        if typ not in cls._BMFF_ATOMS:
-          return False            # mkv / webm / ts / mp3 ...: pipe-friendly
-        first = False
-      if typ == b"moov":
-        return False
-      if typ == b"mdat":
-        return True
-      if sz == 1:
-        ext = f.read(8)
-        if len(ext) < 8:
-          return True
-        sz = struct.unpack(">Q", ext)[0]
-      elif sz == 0:
-        return True
-      if sz < 8:
-        return True
-      off += sz
-      if size and off >= size:
-        return True
-    return True
-
-  def _source_needs_file(self, total):
-    """True when this remote file has to be downloaded to a temp file
-    before FFmpeg can read it (see _bmff_needs_seekable_input)."""
-    if getattr(self._remote_fs, "sudo_user", None):
-      return True
-    if not self._remote.lower().endswith(self._MOV_FAMILY_EXTS):
-      return False
-    if hasattr(self._remote_fs, "_ftp"):
-      return True                 # can't cheaply seek over FTP; be safe
-    sftp = None
-    try:
-      sftp = self._ssh.open_sftp()
-      with sftp.open(self._remote, "rb") as f:
-        return self._bmff_needs_seekable_input(f, total)
-    except Exception:
-      return True
-    finally:
-      if sftp is not None:
-        try:
-          sftp.close()
-        except Exception:
-          pass
-
-  def _download_source(self, total):
-    """Download the remote file to a temp file (progress 1..64%), leaving
-    the path in self._input_path for _transcode()."""
-    import os
-    import tempfile
-    import time
-    fd_in, self._input_path = tempfile.mkstemp(
-      prefix="deckhand_media_", suffix=".source"
-    )
-    os.close(fd_in)
-    self.progress.emit(1, "Downloading remote media…")
-    done = 0
-    last_emit = 0.0
-    with open(self._input_path, "wb") as out:
-      def sink(data):
-        nonlocal done, last_emit
-        if self._cancelled:
-          raise InterruptedError
-        out.write(data)
-        done += len(data)
-        now = time.monotonic()
-        if total and now - last_emit >= 0.20:
-          self.progress.emit(
-            1 + int(63 * min(1.0, done / total)),
-            "Downloading remote media… {}%".format(min(100, int(done * 100 / total))))
-          last_emit = now
-      try:
-        self._read_remote(sink, total)
-      except InterruptedError:
-        return False
-    return True
-
-  def _transcode_remote(self, total):
-    import os
-    import subprocess
-    import sys
-    import threading
-    import time
-
-    ffmpeg_bin = self._ffmpeg_binary()
-    commands = []
-    if sys.platform == "darwin":
-      commands.append(self._ffmpeg_cmd(ffmpeg_bin, hw=True))
-    commands.append(self._ffmpeg_cmd(ffmpeg_bin, hw=False))
-
-    last_error = ""
-    for attempt, cmd in enumerate(commands):
-      if self._cancelled:
-        return
-      try:
-        if os.path.exists(self._output_path):
-          os.remove(self._output_path)
-      except OSError:
-        pass
-
-      self.progress.emit(2, "Downloading + converting…")
-      proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        bufsize=0,
-      )
-      stderr_data = bytearray()
-
-      def drain_stderr():
-        try:
-          while True:
-            chunk = proc.stderr.read(4096)
-            if not chunk:
-              break
-            stderr_data.extend(chunk)
-            if len(stderr_data) > 16000:
-              del stderr_data[:-16000]
-        except Exception:
-          pass
-
-      err_thread = threading.Thread(target=drain_stderr, daemon=True)
-      err_thread.start()
-      done = 0
-      last_emit = 0.0
-
-      def write_chunk(data):
-        nonlocal done, last_emit
-        if self._cancelled:
-          raise InterruptedError
-        proc.stdin.write(data)
-        done += len(data)
-        now = time.monotonic()
-        if total and now - last_emit >= 0.20:
-          # This is transport progress, while FFmpeg is encoding
-          # concurrently. It reaches 95 only when the remote bytes
-          # have all been fed, then FFmpeg finalizes the MP4.
-          pct = 2 + int((done / total) * 93)
-          self.progress.emit(min(95, pct),
-                    "Downloading + converting… {}%".format(
-                      min(100, int(done * 100 / total))))
-          last_emit = now
-
-      try:
-        self._read_remote(write_chunk, total)
-      except InterruptedError:
-        try:
-          proc.stdin.close()
-        except Exception:
-          pass
-        try:
-          proc.kill()
-        except Exception:
-          pass
-        return
-      except Exception as exc:
-        last_error = str(exc)
-        try:
-          proc.stdin.close()
-        except Exception:
-          pass
-        try:
-          proc.kill()
-        except Exception:
-          pass
-        proc.wait()
-        if attempt + 1 < len(commands):
-          continue
-        raise
-      finally:
-        try:
-          proc.stdin.close()
-        except Exception:
-          pass
-
-      rc = proc.wait()
-      err_thread.join(timeout=1.0)
-      if rc == 0 and os.path.exists(self._output_path) and os.path.getsize(self._output_path) > 0:
-        self.progress.emit(99, "Finalizing playback…")
-        return
-
-      last_error = bytes(stderr_data).decode("utf-8", "replace").strip()
-      if not last_error:
-        last_error = "FFmpeg exited with status {}".format(rc)
-      if attempt + 1 < len(commands):
-        continue
-      raise RuntimeError(last_error)
-
-  @staticmethod
-  def _first_stream(container, stream_type):
-    for stream in container.streams:
-      if stream.type == stream_type:
-        return stream
-    return None
-
-  def _transcode(self):
-    """Native FFmpeg transcode: much faster than decoding/encoding frames in Python.
-
-    imageio-ffmpeg supplies a platform FFmpeg binary through pip, so no
-    separate system FFmpeg/VLC installation is required. On macOS we first
-    try VideoToolbox hardware HEVC decode + H.264 encode; if that is not
-    available we fall back to software H.264 with an ultrafast preset.
-
-    Video and audio are transcoded in a single FFmpeg process, avoiding the
-    previous implementation's separate video pass + second demux/decode
-    audio pass.
-    """
-    import os
-    import re
-    import subprocess
-    import time
-
-    try:
-      ffmpeg_bin = self._ffmpeg_binary()
-
-      duration_sec = 0.0
-      try:
-        import av
-        with av.open(self._input_path) as probe:
-          if probe.duration:
-            duration_sec = float(probe.duration) / av.time_base
-      except Exception:
-        pass
-
-      # Built via the same _ffmpeg_cmd() helper the streaming (non-sudo)
-      # path uses, just pointed at a local file instead of "pipe:0" —
-      # so the sudo and non-sudo playback paths always encode with
-      # identical settings instead of two hand-maintained command
-      # lists silently drifting apart (loglevel is kept at "warning"
-      # here so the time=/speed= progress lines below have something
-      # to parse). First choice on macOS is Apple's hardware path for
-      # both decode and encode; the fallback still runs natively in
-      # FFmpeg (not Python).
-      commands = []
-      if sys.platform == "darwin":
-        commands.append(self._ffmpeg_cmd(
-          ffmpeg_bin, hw=True, input_path=self._input_path, loglevel="warning"
-        ))
-      commands.append(self._ffmpeg_cmd(
-        ffmpeg_bin, hw=False, input_path=self._input_path, loglevel="warning"
-      ))
-
-      last_error = ""
-      for attempt, cmd in enumerate(commands):
-        if self._cancelled:
-          return
-        try:
-          if os.path.exists(self._output_path):
-            os.remove(self._output_path)
-        except OSError:
-          pass
-
-        self.progress.emit(66, "Converting to H.264/AAC…")
-        proc = subprocess.Popen(
-          cmd,
-          stdout=subprocess.DEVNULL,
-          stderr=subprocess.PIPE,
-          text=True,
-          bufsize=1,
-          universal_newlines=True,
-        )
-
-        last_pct = 66
-        stderr_tail = []
-        t0 = time.monotonic()
-        while True:
-          if self._cancelled:
-            try:
-              proc.terminate()
-              proc.wait(timeout=1.0)
-            except Exception:
-              try:
-                proc.kill()
-              except Exception:
-                pass
-            return
-
-          line = proc.stderr.readline()
-          if line:
-            stderr_tail.append(line.rstrip())
-            stderr_tail = stderr_tail[-20:]
-            # FFmpeg warning lines are not progress, but keep an eye
-            # out for time=00:xx:xx so the UI advances continuously.
-            m = re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
-            if m and duration_sec > 0:
-              cur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-              pct = 66 + int(max(0.0, min(1.0, cur / duration_sec)) * 33)
-              if pct != last_pct:
-                last_pct = pct
-                elapsed = max(time.monotonic() - t0, 0.001)
-                speed_note = ""
-                # imageio-ffmpeg's stderr can include speed=x.xx.
-                sm = re.search(r"speed=\s*([0-9.]+)x", line)
-                if sm:
-                  speed_note = " • {}x".format(sm.group(1))
-                self.progress.emit(pct, "Converting… {}%{}".format(
-                  max(0, int((pct - 66) * 100 / 33)), speed_note))
-            continue
-
-          if proc.poll() is not None:
-            break
-          time.sleep(0.03)
-
-        rc = proc.wait()
-        if rc == 0 and os.path.exists(self._output_path) and os.path.getsize(self._output_path) > 0:
-          self.progress.emit(99, "Finalizing playback…")
-          return
-
-        last_error = "\n".join(stderr_tail).strip() or "FFmpeg exited with status {}".format(rc)
-        # If VideoToolbox failed, retry immediately with the software path.
-        if attempt + 1 < len(commands):
-          continue
-        raise RuntimeError(last_error)
-    finally:
-      # ffmpeg created the converted file in _output_path. The caller will
-      # remove it when the player dialog closes.
-      pass
-
-
 # ─── Media player dialog ───────────────────────────────────────
 class MediaPlayerDialog(QDialog):
   """Plays a remote video/audio file (mp4, mov, mp3, wav, ...) with
   standard media-player transport controls (play/pause, stop, skip
   +/-10s, seek bar, volume/mute).
 
-  Nothing is downloaded to local disk. A tiny loopback-only HTTP server
-  (MediaStreamServer, in workers.py) is started on a background thread;
-  it translates each HTTP request QMediaPlayer makes into SFTP reads (or
-  a streamed "sudo cat" if a sudo user is active and plain SFTP can't
-  reach the file) on demand, straight from the SSH connection. Playback
-  starts as soon as the server is up — QMediaPlayer pulls bytes as it
+  Nothing is downloaded to local disk and nothing is converted. A tiny
+  loopback-only HTTP server (MediaStreamServer, in workers.py) is started
+  on a background thread; it translates each HTTP request QMediaPlayer
+  makes into remote reads on demand — SFTP byte-range reads over SSH, a
+  ranged "sudo tail/cat" when a sudo user is active, or an FTP/FTPS
+  "REST + RETR" on a dedicated connection — so seeking works and playback
+  starts as soon as the server is up. QMediaPlayer pulls bytes as it
   plays, the same way it would stream from any web server.
+
+  Because the file is played as-is, the codecs it needs are whatever the
+  operating system's media backend supports (AVFoundation on macOS,
+  DirectShow/WMF on Windows, GStreamer on Linux).
   """
 
   def __init__(self, parent, sftp, ssh, remote_path: str, kind: str, sudo_user=None):
@@ -3119,15 +2515,7 @@ class MediaPlayerDialog(QDialog):
     c.addLayout(btn_row)
     lay.addWidget(controls)
 
-    self._is_ftp_media = hasattr(self._sftp, "_ftp")
-    # Use one consistent playback pipeline for both SSH/SFTP and FTP/FTPS.
-    # Every remote audio/video file is downloaded, decoded and transcoded
-    # to H.264/AAC MP4 before it is handed to QMediaPlayer.
-    self._needs_remote_remux = True
     self._player = None
-    self._remote_remux_worker = None
-    self._remote_temp_input = None
-    self._remote_temp_output = None
 
     if _MULTIMEDIA_AVAILABLE:
       self._player = QMediaPlayer(self)
@@ -3149,70 +2537,13 @@ class MediaPlayerDialog(QDialog):
       self._status_lbl.setStyleSheet(
         "color: {}; font-size: 12px; padding: 6px 12px;".format(T['WARNING']))
       self._dl_bar.hide()
-    elif self._needs_remote_remux and not _FFMPEG_AVAILABLE:
-      self._status_lbl.setText(
-        "Media conversion needs the 'imageio-ffmpeg' Python package. "
-        "Install it with: pip install imageio-ffmpeg"
-      )
-      self._status_lbl.setStyleSheet(
-        "color: {}; font-size: 12px; padding: 6px 12px;".format(T['WARNING']))
-      self._dl_bar.hide()
 
     self._set_controls_enabled(False)
 
-    # _needs_remote_remux is always True (see comment above) — every
-    # file, SSH or FTP, goes through the FFmpeg conversion pipeline so
-    # the player always sees a known-good local H.264/AAC MP4. There's
-    # deliberately no fallback to the old direct-stream path here: for
-    # FTP connections self._ssh is None, so _start_stream() would just
-    # fail outright rather than actually play anything.
-    if _MULTIMEDIA_AVAILABLE and self._needs_remote_remux and _FFMPEG_AVAILABLE:
-      self._start_remote_remux()
-
-  # ── FTP/FTPS media path: PyAV + bundled FFmpeg ─────────────
-  def _start_remote_remux(self):
-    self._status_lbl.setText("Downloading remote media…")
-    self._dl_bar.show()
-    self._dl_bar.setRange(0, 100)
-    self._dl_bar.setValue(0)
-    self._remote_remux_worker = _RemoteRemuxWorker(
-      self._sftp, self._ssh, self._remote, self._kind
-    )
-    self._remote_remux_worker.progress.connect(self._on_remote_remux_progress)
-    self._remote_remux_worker.ready.connect(self._on_remote_remux_ready)
-    self._remote_remux_worker.error.connect(self._on_remote_remux_error)
-    self._remote_remux_worker.finished.connect(self._on_remote_remux_finished)
-    self._remote_remux_worker.start()
-
-  def _on_remote_remux_progress(self, percent, text):
-    try:
-      self._dl_bar.setValue(max(0, min(100, int(percent))))
-      self._status_lbl.setText(text)
-    except RuntimeError:
-      pass
-
-  def _on_remote_remux_ready(self, output_path):
-    try:
-      self._remote_temp_output = output_path
-      self._dl_bar.hide()
-      self._status_lbl.setText("Ready — playing")
-      self._set_controls_enabled(True)
-      self._player.setMedia(QMediaContent(QUrl.fromLocalFile(output_path)))
-      self._player.play()
-    except RuntimeError:
-      pass
-
-  def _on_remote_remux_error(self, msg):
-    try:
-      self._dl_bar.hide()
-      self._status_lbl.setText("Media preparation failed: {}".format(msg))
-      self._status_lbl.setStyleSheet(
-        "color: {}; font-size: 12px; padding: 6px 12px;".format(T['DANGER']))
-    except RuntimeError:
-      pass
-
-  def _on_remote_remux_finished(self):
-    self._remote_remux_worker = None
+    # Every file — SSH/SFTP (with or without sudo) or FTP/FTPS — is
+    # streamed straight from the remote through the loopback server.
+    if _MULTIMEDIA_AVAILABLE:
+      self._start_stream()
 
   # ── background stream startup ─────────────────────────────
   def _start_stream(self):
@@ -3233,7 +2564,10 @@ class MediaPlayerDialog(QDialog):
       if self._stream_server.supports_range:
         self._status_lbl.setText("Streaming")
       else:
-        self._status_lbl.setText("Streaming (seek limited under sudo)")
+        self._status_lbl.setText("Streaming (seeking unavailable for this source)")
+      # The indeterminate "connecting" bar is done; buffering updates
+      # from the player will bring it back (with a real percentage).
+      self._dl_bar.hide()
       self._set_controls_enabled(True)
       if self._player:
         self._player.setMedia(QMediaContent(QUrl(url)))
@@ -3319,8 +2653,14 @@ class MediaPlayerDialog(QDialog):
     if not self._player:
       return
     msg = self._player.errorString()
+    if _err == QMediaPlayer.FormatError:
+      msg = ("{} — this file's format/codec isn't supported by your system's "
+             "media backend. Files are streamed as-is (not converted), so "
+             "download it to play it in an external player.").format(
+               msg or "Unsupported format")
     if msg:
       self._status_lbl.setText("Playback error: {}".format(msg))
+      self._status_lbl.setWordWrap(True)
       self._status_lbl.setStyleSheet(
         "color: {}; font-size: 12px; padding: 6px 12px;".format(T['DANGER']))
       self._status_lbl.show()
@@ -3334,22 +2674,6 @@ class MediaPlayerDialog(QDialog):
 
   # ── cleanup ──────────────────────────────────────────────
   def closeEvent(self, event):
-    if self._remote_remux_worker:
-      try:
-        self._remote_remux_worker.cancel()
-      except Exception:
-        pass
-      self._remote_remux_worker = None
-
-    # Remove temporary FTP media files created by the PyAV path.
-    import os as _os
-    for _path in (self._remote_temp_input, self._remote_temp_output):
-      if _path:
-        try:
-          _os.remove(_path)
-        except OSError:
-          pass
-
     # Disconnect the player's own signals first so nothing it fires
     # while winding down (position/duration/buffer/error updates)
     # can land on a dialog that's mid-close.

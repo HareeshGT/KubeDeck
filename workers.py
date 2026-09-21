@@ -1603,10 +1603,12 @@ class ScpTransferWorker(QThread):
 # against — that's how it drives seeking, buffering, and progressive
 # playback. Since the only channel back to the box is SSH/SFTP, this spins
 # up a tiny HTTP server bound to 127.0.0.1 that translates each incoming
-# request into SFTP reads (or, if a sudo user is active and plain SFTP
-# can't reach the file, a streamed "sudo cat") on demand. Nothing is ever
-# written to local disk — every response streams bytes straight from the
-# remote connection to the player as they're requested.
+# request into remote reads on demand: SFTP reads over SSH, a ranged
+# "sudo tail/cat" when a sudo user is active and plain SFTP can't reach the
+# file, or REST+RETR on a dedicated FTP/FTPS connection. Nothing is ever
+# written to local disk and nothing is transcoded — every response streams
+# bytes straight from the remote connection to the player as they're
+# requested.
 class _ChannelReader:
     """Minimal file-like wrapper around a raw paramiko Channel, for the
     sudo-cat streaming fallback (sequential-only, no seek)."""
@@ -1637,6 +1639,65 @@ class _ChannelReader:
         self._channel = None
 
 
+class _SFTPStreamReader:
+    """Sequential reader over one file opened on its *own* SFTP channel.
+
+    paramiko's SFTPClient is not safe for several threads reading at once
+    (interleaved packet reads surface as "Garbage packet received"), and a
+    player routinely has more than one request in flight (a probe, the real
+    read, a seek). So every HTTP request gets a dedicated SFTP channel on
+    the shared SSH transport instead of sharing a single client.
+
+    Reads are pipelined with paramiko's prefetch to hide network latency,
+    but only one WINDOW at a time and never past the end of the requested
+    range. That keeps the number of queued requests small (a whole-file
+    prefetch queues one per 32 KiB — tens of thousands for a big video —
+    on every seek) and makes abandoning a reader cheap.
+
+    Paramiko's default 32 KiB request size is deliberate: servers such as
+    OpenSSH's sftp-server cap reads below larger sizes, which silently
+    breaks prefetch pipelining and makes playback crawl.
+    """
+
+    WINDOW = 16 * 1024 * 1024
+
+    def __init__(self, ssh, remote_path, start, stop):
+        """Read bytes [start, stop) of ``remote_path``."""
+        self._client = ssh.open_sftp()
+        self._f = None
+        self._pos = start
+        self._stop = stop
+        self._window_end = start      # nothing prefetched yet
+        try:
+            self._f = self._client.open(remote_path, "rb")
+        except Exception:
+            self.close()
+            raise
+
+    def read(self, n):
+        if self._pos >= self._stop:
+            return b""
+        if self._pos >= self._window_end:
+            self._window_end = min(self._pos + self.WINDOW, self._stop)
+            self._f.seek(self._pos)
+            try:
+                self._f.prefetch(self._window_end)
+            except Exception:
+                pass    # falls back to plain (slower) synchronous reads
+        data = self._f.read(min(n, self._window_end - self._pos))
+        self._pos += len(data)
+        return data
+
+    def close(self):
+        for closer in (getattr(self._f, "close", None), self._client.close):
+            if closer is None:
+                continue
+            try:
+                closer()
+            except Exception:
+                pass
+
+
 class _RangeHTTPRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1654,16 +1715,41 @@ class _RangeHTTPRequestHandler(BaseHTTPRequestHandler):
         ranged = False
         rng = self.headers.get("Range")
         if rng and self.server.supports_range and size:
-            m = re.match(r"bytes=(\d*)-(\d*)", rng)
+            m = re.match(r"\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)", rng)
             if m and (m.group(1) or m.group(2)):
                 if m.group(1):
                     start = int(m.group(1))
-                if m.group(2):
-                    end = int(m.group(2))
+                    end   = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+                else:
+                    # suffix range "bytes=-N": the last N bytes
+                    start = max(size - int(m.group(2)), 0)
+                    end   = size - 1
+                if start >= size or start > end:
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */{}".format(size))
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    return
                 ranged = True
-        self._send_headers(start, end, ranged)
-        if self.command != "HEAD":
-            self._stream_range(start, end)
+        # Open the remote reader *before* committing to a 200/206 so a
+        # failure to reach the file is reported as an error instead of a
+        # silently truncated body.
+        try:
+            reader = self.server.open_reader(start, end)
+        except Exception:
+            self.send_error(502, "Remote read failed")
+            return
+        self.server.track_reader(reader)
+        try:
+            self._send_headers(start, end, ranged)
+            self._stream_range(reader, start, end)
+        finally:
+            self.server.untrack_reader(reader)
+            try:
+                reader.close()
+            except Exception:
+                pass
 
     def _send_headers(self, start, end, ranged):
         size   = self.server.file_size
@@ -1680,11 +1766,7 @@ class _RangeHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
 
-    def _stream_range(self, start, end):
-        try:
-            reader = self.server.open_reader(start)
-        except Exception:
-            return
+    def _stream_range(self, reader, start, end):
         size      = self.server.file_size
         remaining = (end - start + 1) if size else None
         chunk     = 65536
@@ -1697,85 +1779,111 @@ class _RangeHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(buf)
                 if remaining is not None:
                     remaining -= len(buf)
-        except (BrokenPipeError, ConnectionResetError, OSError):
+        except Exception:
+            # Player went away (seek / close) or the remote read failed
+            # mid-stream: either way this response is over.
             pass
-        finally:
-            try:
-                reader.close()
-            except Exception:
-                pass
 
 
 class _MediaStreamHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._readers = set()
+        self._readers_lock = threading.Lock()
+
+    def track_reader(self, reader):
+        with self._readers_lock:
+            self._readers.add(reader)
+
+    def untrack_reader(self, reader):
+        with self._readers_lock:
+            self._readers.discard(reader)
+
+    def close_all_readers(self):
+        """Abort every in-flight remote read (used when the player closes)."""
+        with self._readers_lock:
+            readers = list(self._readers)
+            self._readers.clear()
+        for r in readers:
+            try:
+                r.close()
+            except Exception:
+                pass
+
 
 class MediaStreamServer:
     """Serves exactly one remote file over a loopback-only local HTTP
     server so QMediaPlayer can stream it directly — with real Range-based
-    seeking when plain SFTP access is available — instead of the app
-    downloading the whole file to local disk first.
+    seeking — instead of the app downloading (or converting) the file on
+    local disk first.
 
-    - No sudo user (or sudo user but the login account can still read the
-      file directly): opens a dedicated SFTP channel and serves true
-      byte-range reads straight from it, so seeking works.
-    - Sudo user active and the file isn't reachable over plain SFTP: falls
-      back to a single sequential ``sudo -u <user> cat`` stream over a raw
-      channel. Still zero local disk usage, but no seeking mid-stream.
+    - SSH/SFTP, no sudo (or the login account can read the file): opens a
+      dedicated SFTP channel and serves byte-range reads straight from it,
+      with a bounded read-ahead window.
+    - SSH with a sudo user active and the file not reachable over plain
+      SFTP: streams ``sudo -u <user> cat`` (or ``tail -c +N`` to start at
+      an offset, so seeking works) over a raw channel.
+    - FTP/FTPS: each request opens its own connection and uses
+      ``REST <offset>`` + ``RETR``; seeking works if the server supports
+      REST.
     """
 
     def __init__(self, ssh, sftp, remote_path, sudo_user=None):
         self._ssh        = ssh
-        self._sftp       = sftp     # SudoFS instance
+        self._sftp       = sftp     # SudoFS or FTPFS instance
         self._remote      = remote_path
         self._sudo_user   = sudo_user
         self._httpd       = None
         self._thread      = None
-        self._raw_sftp    = None
         self.url            = None
         self.supports_range = False
 
     def start(self) -> str:
         content_type = mimetypes.guess_type(self._remote)[0] or "application/octet-stream"
 
+        is_ftp = hasattr(self._sftp, "_ftp")
         size, supports_range = 0, False
-        if not self._sudo_user:
+        if not is_ftp and not self._sudo_user:
             try:
-                raw = self._ssh.open_sftp()
-                size = raw.stat(self._remote).st_size
-                self._raw_sftp = raw
+                probe = self._ssh.open_sftp()
+                try:
+                    size = probe.stat(self._remote).st_size
+                finally:
+                    probe.close()
                 supports_range = True
             except Exception:
-                self._raw_sftp = None
+                size = 0
                 supports_range = False
 
-        if supports_range:
-            raw_sftp = self._raw_sftp
-            file_size = size
+        if is_ftp:
+            fs = self._sftp
+            remote = self._remote
+            size, supports_range = fs.stream_probe(remote)
 
-            def open_reader(start):
-                f = raw_sftp.open(self._remote, "rb")
-                f.MAX_REQUEST_SIZE = 256 * 1024
-                if start:
-                    f.seek(start)
-                # prefetch() queues concurrent read-ahead requests from
-                # the current position onward, so playback (and seeking,
-                # which opens a fresh reader at the new offset) streams
-                # smoothly instead of stalling on a round trip per chunk.
-                try:
-                    f.prefetch(file_size)
-                except Exception:
-                    pass
-                return f
+            def open_reader(start, end):
+                return fs.open_stream(remote, start)
+        elif supports_range:
+            ssh = self._ssh
+            remote = self._remote
+
+            def open_reader(start, end):
+                return _SFTPStreamReader(ssh, remote, start, end + 1)
         else:
             prefix = getattr(self._sftp, "_sudo_prefix", "")
             sq     = getattr(self._sftp, "_sq", lambda p: "'" + p.replace("'", "'\\''") + "'")
-            cmd    = "{}cat {} 2>/dev/null".format(prefix, sq(self._remote))
+            target = sq(self._remote)
             ssh    = self._ssh
 
-            def open_reader(_start):
+            def open_reader(start, end):
                 channel = open_managed_session(ssh)
+                if start:
+                    # tail -c +N begins output at byte N (1-based)
+                    cmd = "{}tail -c +{} {} 2>/dev/null".format(prefix, int(start) + 1, target)
+                else:
+                    cmd = "{}cat {} 2>/dev/null".format(prefix, target)
                 channel.exec_command(cmd)
                 return _ChannelReader(channel)
 
@@ -1783,6 +1891,8 @@ class MediaStreamServer:
                 size = self._sftp.stat(self._remote).st_size
             except Exception:
                 size = 0
+            # A known size is all it takes to honour byte ranges here.
+            supports_range = size > 0
 
         httpd = _MediaStreamHTTPServer(("127.0.0.1", 0), _RangeHTTPRequestHandler)
         httpd.file_size      = size
@@ -1807,13 +1917,8 @@ class MediaStreamServer:
                 self._httpd.server_close()
             except Exception:
                 pass
+            self._httpd.close_all_readers()
             self._httpd = None
-        if self._raw_sftp is not None:
-            try:
-                self._raw_sftp.close()
-            except Exception:
-                pass
-            self._raw_sftp = None
 
 
 class _StreamServerStartWorker(QThread):

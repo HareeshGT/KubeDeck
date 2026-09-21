@@ -99,7 +99,7 @@ You can:
 - Search files
 - Edit files
 - Execute files
-- Open remote media
+- Stream remote video/audio directly over SSH/SFTP or FTP/FTPS (no download, no conversion)
 - Work with privileged directories
 
 ---
