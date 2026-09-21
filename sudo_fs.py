@@ -67,10 +67,10 @@ class SudoFS:
         # type: (str) -> str
         if not self.sudo_user or path in ("", "~"):
             if self.sudo_user and path in ("", "~"):
-                out, _ = self._run("sudo -u {} sh -c 'echo $HOME'".format(self.sudo_user))
+                code, out, _ = self._run("sudo -u {} sh -c 'echo $HOME'".format(self._sq(self.sudo_user)))
                 return out.strip() or "/home/{}".format(self.sudo_user)
             return self._sftp.normalize(path or ".")
-        out, _ = self._run(
+        code, out, _ = self._run(
             "{prefix}realpath {p} 2>/dev/null "
             "|| echo {p}".format(prefix=self._sudo_prefix, p=self._sq(path))
         )
@@ -82,10 +82,10 @@ class SudoFS:
         if not self.sudo_user:
             return self._sftp.listdir_attr(path)
 
-        out, err = self._run("{prefix}ls -la {p} 2>&1".format(
+        code, out, err = self._run("{prefix}ls -la {p}".format(
             prefix=self._sudo_prefix, p=self._sq(path)))
-        if err and not out:
-            raise PermissionError(err.strip())
+        if code != 0:
+            raise PermissionError((err or out or "directory listing failed").strip())
 
         entries = []
         for line in out.splitlines():
@@ -123,10 +123,10 @@ class SudoFS:
         if not self.sudo_user:
             return self._sftp.stat(path)
 
-        out, err = self._run("{prefix}stat -c '%f %s' {p} 2>&1".format(
+        code, out, err = self._run("{prefix}stat -c '%f %s' {p}".format(
             prefix=self._sudo_prefix, p=self._sq(path)))
-        if err.strip() and not out.strip():
-            raise FileNotFoundError(err.strip())
+        if code != 0:
+            raise FileNotFoundError((err or out or "stat failed").strip())
         parts = out.strip().split()
         if len(parts) < 2:
             raise FileNotFoundError("stat failed for {}".format(path))
@@ -145,7 +145,7 @@ class SudoFS:
         if not self.sudo_user:
             return self._sftp.open(path, mode)
         import io
-        out, _ = self._run("{prefix}cat {p} 2>/dev/null".format(
+        code, out, _ = self._run("{prefix}cat {p} 2>/dev/null".format(
             prefix=self._sudo_prefix, p=self._sq(path)))
         return io.BytesIO(out.encode("utf-8", errors="replace"))
 
@@ -154,10 +154,10 @@ class SudoFS:
         # type: (str, str) -> None
         if not self.sudo_user:
             return self._sftp.get(remote_path, local_path)
-        out, err = self._run("{prefix}cat {p} 2>&1".format(
+        code, out, err = self._run("{prefix}cat {p}".format(
             prefix=self._sudo_prefix, p=self._sq(remote_path)))
-        if err and not out:
-            raise PermissionError(err.strip())
+        if code != 0:
+            raise PermissionError((err or out or "download failed").strip())
         with open(local_path, "wb") as f:
             f.write(out.encode("utf-8", errors="replace"))
 
