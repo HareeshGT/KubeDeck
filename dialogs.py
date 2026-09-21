@@ -6,6 +6,9 @@ import codecs
 import io
 import os
 import re
+import shutil
+import sys
+import tempfile
 import shlex
 import time
 import threading
@@ -26,7 +29,7 @@ from PyQt5.QtGui import QFont, QColor, QTextCursor, QTextCharFormat, QTextBlockF
 from ui_icons import set_icon, apply_text_icon, icon_button, icon_pixmap
 from themes import T, apply_qss_to
 from utils import load_recent_instances, size_fmt, append_terminal_html, append_terminal_text, html_escape, monospace_font
-from workers import CommandWorker, PodExecStreamWorker, _TransferWorker, ScpTransferWorker, track_worker, FileStreamReadWorker, MediaStreamServer, _StreamServerStartWorker, managed_exec_command, open_managed_session, close_managed_session
+from workers import CommandWorker, PodExecStreamWorker, _TransferWorker, ScpTransferWorker, track_worker, FileStreamReadWorker, MediaStreamServer, _StreamServerStartWorker, AudioTranscodeWorker, managed_exec_command, open_managed_session, close_managed_session
 from editor_widgets import CodeEditor, make_highlighter, LANG_LABEL
 import ai_assist
 from ansi_terminal import AnsiStreamRenderer, plain_text
@@ -2385,6 +2388,9 @@ class MediaPlayerDialog(QDialog):
     self._sudo_user  = sudo_user
     self._stream_server = None
     self._start_worker = None
+    self._transcode_worker = None
+    self._temp_media_path = None
+    self._fallback_attempted = False
     self._seeking   = False
 
     fname = os.path.basename(remote_path)
@@ -2688,9 +2694,94 @@ class MediaPlayerDialog(QDialog):
       set_icon(self._play_btn, "play", color=T['TEXT_PRIMARY'], size=17)
       self._play_btn.setToolTip("Play")
 
+  def _find_ffmpeg(self):
+    candidates = [
+      shutil.which("ffmpeg"),
+      os.path.join(getattr(sys, "_MEIPASS", ""), "ffmpeg"),
+      os.path.join(os.path.dirname(sys.executable), "ffmpeg"),
+      os.path.join(os.path.dirname(sys.executable), "bin", "ffmpeg"),
+    ]
+    for path in candidates:
+      if path and os.path.isfile(path) and os.access(path, os.X_OK):
+        return path
+    return None
+
+  def _start_audio_fallback(self):
+    if self._fallback_attempted or self._kind != "audio" or not self._stream_server:
+      return
+    self._fallback_attempted = True
+
+    ffmpeg = self._find_ffmpeg()
+    if not ffmpeg:
+      self._on_stream_error(
+        "This audio codec isn't supported by QtMultimedia. "
+        "Install ffmpeg and reopen the file (macOS: brew install ffmpeg)."
+      )
+      return
+
+    try:
+      fd, path = tempfile.mkstemp(prefix="kubedeck-audio-", suffix=".wav")
+      os.close(fd)
+      self._temp_media_path = path
+      self._status_lbl.setText("Converting audio for playback...")
+      self._status_lbl.setStyleSheet(
+        "color: {}; font-size: 12px; padding: 6px 12px;".format(T['WARNING'])
+      )
+      self._dl_bar.show()
+      self._dl_bar.setRange(0, 0)
+      self._set_controls_enabled(False)
+
+      worker = AudioTranscodeWorker(self._stream_server.url, path, ffmpeg)
+      worker.ready.connect(self._on_audio_fallback_ready)
+      worker.error.connect(self._on_audio_fallback_error)
+      worker.finished.connect(lambda w=worker: self._clear_transcode_worker(w))
+      self._transcode_worker = worker
+      worker.start()
+    except Exception as e:
+      self._on_audio_fallback_error(str(e))
+
+  def _on_audio_fallback_ready(self, path):
+    try:
+      if not self._player:
+        return
+      self._dl_bar.hide()
+      self._status_lbl.setText("Playing (decoded for compatibility)")
+      self._set_controls_enabled(True)
+      self._player.setMedia(QMediaContent(QUrl.fromLocalFile(path)))
+      self._player.play()
+    except RuntimeError:
+      pass
+
+  def _on_audio_fallback_error(self, msg):
+    try:
+      self._dl_bar.hide()
+      self._status_lbl.setText("Audio playback failed: {}".format(msg))
+      self._status_lbl.setStyleSheet(
+        "color: {}; font-size: 12px; padding: 6px 12px;".format(T['DANGER'])
+      )
+      self._set_controls_enabled(False)
+    except RuntimeError:
+      pass
+
+  def _clear_transcode_worker(self, worker):
+    if self._transcode_worker is worker:
+      self._transcode_worker = None
+
   def _on_player_error(self, _err):
     if not self._player:
       return
+    if self._kind == "audio" and not self._fallback_attempted:
+      self._start_audio_fallback()
+      return
+    try:
+      msg = self._player.errorString() or "Unsupported or unreadable media"
+      self._status_lbl.setText("Playback error: {}".format(msg))
+      self._status_lbl.setStyleSheet(
+        "color: {}; font-size: 12px; padding: 6px 12px;".format(T['DANGER'])
+      )
+      self._set_controls_enabled(False)
+    except RuntimeError:
+      pass
     msg = self._player.errorString()
     if _err == QMediaPlayer.FormatError:
       msg = ("{} — this file's format/codec isn't supported by your system's "
@@ -2769,11 +2860,25 @@ class MediaPlayerDialog(QDialog):
       except RuntimeError:
         pass
 
+    if self._transcode_worker is not None:
+      try:
+        self._transcode_worker.stop()
+      except Exception:
+        pass
+      self._transcode_worker = None
+
     if self._stream_server:
       try:
         self._stream_server.stop()
       except Exception:
         pass
+
+    if self._temp_media_path:
+      try:
+        os.unlink(self._temp_media_path)
+      except OSError:
+        pass
+      self._temp_media_path = None
 
     event.accept()
 

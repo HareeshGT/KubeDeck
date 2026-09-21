@@ -5,6 +5,9 @@ import os
 import re
 import signal
 import mimetypes
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1919,6 +1922,66 @@ class MediaStreamServer:
                 pass
             self._httpd.close_all_readers()
             self._httpd = None
+
+
+class AudioTranscodeWorker(QThread):
+    """Fallback decoder for audio codecs unavailable to QtMultimedia.
+
+    ffmpeg reads the existing loopback media stream and produces a temporary
+    PCM WAV that QtMultimedia can decode reliably.
+    """
+
+    ready = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, source_url: str, output_path: str, ffmpeg_path: str):
+        super().__init__()
+        self._source_url = source_url
+        self._output_path = output_path
+        self._ffmpeg_path = ffmpeg_path
+        self._process = None
+        self.finished.connect(self.deleteLater)
+
+    def run(self):
+        try:
+            self._process = subprocess.Popen(
+                [
+                    self._ffmpeg_path, "-hide_banner", "-loglevel", "error",
+                    "-y", "-i", self._source_url, "-vn",
+                    "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2",
+                    self._output_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            _, stderr = self._process.communicate()
+            if self._process.returncode != 0:
+                raise RuntimeError(
+                    stderr.decode("utf-8", "replace").strip()
+                    or "ffmpeg failed to decode the audio"
+                )
+            if not os.path.isfile(self._output_path) or os.path.getsize(self._output_path) == 0:
+                raise RuntimeError("ffmpeg produced an empty audio file")
+            self.ready.emit(self._output_path)
+        except Exception as e:
+            try:
+                if os.path.exists(self._output_path):
+                    os.unlink(self._output_path)
+            except OSError:
+                pass
+            self.error.emit(str(e))
+
+    def stop(self):
+        proc = self._process
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
 
 class _StreamServerStartWorker(QThread):
