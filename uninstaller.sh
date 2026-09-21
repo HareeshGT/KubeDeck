@@ -123,6 +123,8 @@ echo "Removing KubeDeck user data..."
 
 if [[ "$OS" == "Darwin" ]]; then
 
+    remove_path "$HOME/.vm_visualizer" \
+        "KubeDeck legacy user data"
     remove_path "$HOME/Library/Application Support/KubeDeck" \
         "KubeDeck Application Support"
 
@@ -327,10 +329,8 @@ if [ "$REMOVE_DEPS" = true ]; then
 
             if command -v sudo >/dev/null 2>&1; then
                 sudo apt-get remove -y "${PACKAGES[@]}" || true
-                sudo apt-get autoremove -y || true
             else
                 apt-get remove -y "${PACKAGES[@]}" || true
-                apt-get autoremove -y || true
             fi
 
             echo "  ✓ apt audio dependencies removed"
