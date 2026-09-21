@@ -2697,7 +2697,10 @@ class MediaPlayerDialog(QDialog):
   def _find_ffmpeg(self):
     candidates = [
       shutil.which("ffmpeg"),
+      "/opt/homebrew/bin/ffmpeg",
+      "/usr/local/bin/ffmpeg",
       os.path.join(getattr(sys, "_MEIPASS", ""), "ffmpeg"),
+      os.path.join(getattr(sys, "_MEIPASS", ""), "bin", "ffmpeg"),
       os.path.join(os.path.dirname(sys.executable), "ffmpeg"),
       os.path.join(os.path.dirname(sys.executable), "bin", "ffmpeg"),
     ]
@@ -2782,19 +2785,6 @@ class MediaPlayerDialog(QDialog):
       self._set_controls_enabled(False)
     except RuntimeError:
       pass
-    msg = self._player.errorString()
-    if _err == QMediaPlayer.FormatError:
-      msg = ("{} — this file's format/codec isn't supported by your system's "
-             "media backend. Files are streamed as-is (not converted), so "
-             "download it to play it in an external player.").format(
-               msg or "Unsupported format")
-    if msg:
-      self._status_lbl.setText("Playback error: {}".format(msg))
-      self._status_lbl.setWordWrap(True)
-      self._status_lbl.setStyleSheet(
-        "color: {}; font-size: 12px; padding: 6px 12px;".format(T['DANGER']))
-      self._status_lbl.show()
-
   @staticmethod
   def _fmt_time(ms: int) -> str:
     s = ms // 1000
