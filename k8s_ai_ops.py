@@ -1327,7 +1327,7 @@ def build_kubectl_command(action: dict) -> str:
       # base64's exit code, not kubectl's).
       key_list = " ".join(shlex.quote(k) for k in keys)
       get_one = (
-        f'{base} get {resource}/{name} -o jsonpath="{{.data.$k}}" '
+        f'{base} get {resource}/{name} -o jsonpath="{{.data['$k']}}" '
         f"--allow-missing-template-keys=false 2>/dev/null"
       )
       decode_stage = (
