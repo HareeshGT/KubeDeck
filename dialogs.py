@@ -2791,6 +2791,16 @@ class MediaPlayerDialog(QDialog):
     except RuntimeError:
       pass
 
+  @staticmethod
+  def _fmt_time(ms: int) -> str:
+    """Format Qt media milliseconds as H:MM:SS or M:SS."""
+    total_seconds = max(0, int(ms)) // 1000
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+      return "{}:{:02d}:{:02d}".format(hours, minutes, seconds)
+    return "{}:{:02d}".format(minutes, seconds)
+
   def _on_seek_start(self):
     self._seeking = True
 
