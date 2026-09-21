@@ -402,7 +402,7 @@ else
  kubectl top nodes --no-headers 2>/dev/null
 
  echo __PODS__
- kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}|{.metadata.name}|{.status.phase}|{.spec.nodeName}|{range .status.containerStatuses[*]}{.restartCount}{","}{end}|{range .status.containerStatuses[*]}{.ready}{","}{end}|{.status.reason}|{.status.message}|{.status.podIP}|{.status.hostIP}|{.status.qosClass}|{.metadata.creationTimestamp}|{range .metadata.ownerReferences[0]}{.kind}{"/"}{.name}{end}|{range .status.containerStatuses[*]}{.name}={.state.waiting.reason},{.state.waiting.message}{";"}{end}{"\n"}{end}' 2>/dev/null
+ kubectl get pods --all-namespaces -o json
 
  echo __PODTOP__
  kubectl top pods --all-namespaces --no-headers 2>/dev/null
@@ -2566,30 +2566,49 @@ class DashboardTab(QWidget):
     # collected under a synthetic "(unscheduled)" key instead of being
     # dropped, so they're still visible somewhere.
     pods_by_node = {}
-    for line in sec.get("PODS", []):
-      if "|" not in line:
-        continue
-      bits = line.split("|")
-      bits += [""] * (15 - len(bits))
-      (ns, pname, phase, node, restarts_csv, ready_csv, reason, message,
-       pod_ip, host_ip, qos, created, owner, waiting) = bits[:14]
-      ns, pname, phase, node = ns.strip(), pname.strip(), phase.strip(), node.strip()
+    pod_json = "\n".join(sec.get("PODS", [])).strip()
+    try:
+      pod_data = json.loads(pod_json) if pod_json else {"items": []}
+    except json.JSONDecodeError:
+      pod_data = {"items": []}
+
+    for item in pod_data.get("items", []):
+      meta = item.get("metadata") or {}
+      status = item.get("status") or {}
+      spec = item.get("spec") or {}
+      containers = status.get("containerStatuses") or []
+      ready_count = sum(1 for x in containers if x.get("ready"))
+      restarts = sum(int(x.get("restartCount", 0) or 0) for x in containers)
+      waiting_parts = []
+      for container in containers:
+        waiting = (container.get("state") or {}).get("waiting") or {}
+        reason = waiting.get("reason")
+        message = waiting.get("message")
+        if reason or message:
+          waiting_parts.append("{}={}".format(reason or "Waiting", message or ""))
+      owners = meta.get("ownerReferences") or []
+      owner = ""
+      if owners:
+        owner = "{}/{}".format(owners[0].get("kind", ""), owners[0].get("name", "")).strip("/")
+      ns = str(meta.get("namespace") or "")
+      pname = str(meta.get("name") or "")
       if not pname:
         continue
-      restarts = sum(int(x) for x in restarts_csv.split(",") if x.strip().isdigit())
-      ready_flags = [x for x in ready_csv.split(",") if x.strip()]
-      ready_count = sum(1 for x in ready_flags if x.strip() == "true")
-      waiting = ";".join(x.strip() for x in waiting.split(";") if x.strip())
+      node = str(spec.get("nodeName") or "")
       pods_by_node.setdefault(node or "(unscheduled)", []).append({
-        "namespace": ns, "name": pname, "phase": phase or "Unknown",
+        "namespace": ns, "name": pname,
+        "phase": str(status.get("phase") or "Unknown"),
         "restarts": restarts,
-        "ready": f"{ready_count}/{len(ready_flags)}" if ready_flags else "-",
-        "reason": reason.strip(), "message": message.strip(),
-        "pod_ip": pod_ip.strip(), "host_ip": host_ip.strip(),
-        "qos": qos.strip(), "created": created.strip(),
-        "owner": owner.strip(), "waiting": waiting,
+        "ready": f"{ready_count}/{len(containers)}" if containers else "-",
+        "reason": str(status.get("reason") or ""),
+        "message": str(status.get("message") or ""),
+        "pod_ip": str(status.get("podIP") or ""),
+        "host_ip": str(status.get("hostIP") or ""),
+        "qos": str(status.get("qosClass") or ""),
+        "created": str(meta.get("creationTimestamp") or ""),
+        "owner": owner,
+        "waiting": ";".join(waiting_parts),
       })
-
     # Per-pod CPU/memory usage from `kubectl top pods`, keyed by
     # (namespace, name). Missing entirely (no metrics-server) just
     # means every pod row shows "n/a" instead of a bar — same
