@@ -7,6 +7,7 @@ to produce it.
 """
 
 import hashlib
+import hmac
 import os
 
 from PyQt5.QtCore import QObject, QEvent, QTimer, pyqtSignal
@@ -32,7 +33,7 @@ def verify_pin(pin: str, salt_hex: str, expected_hash: str) -> bool:
     if not salt_hex or not expected_hash or not pin:
         return False
     try:
-        return hash_pin(pin, salt_hex) == expected_hash
+        return hmac.compare_digest(hash_pin(pin, salt_hex), expected_hash)
     except Exception:
         return False
 
