@@ -58,7 +58,8 @@ _AUTH_USER: ContextVar[str] = ContextVar("kubedeck_web_auth_user", default="-")
 _MAC_CACHE: dict[str, tuple[float, str]] = {}
 _MAC_CACHE_LOCK = threading.RLock()
 _MAC_CACHE_TTL = 300.0
-_MAC_RE = re.compile(r"(?i)\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b|\b[0-9a-f]{2}(?:-[0-9a-f]{2}){5}\b")_K8S_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+_MAC_RE = re.compile(r"(?i)\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b|\b[0-9a-f]{2}(?:-[0-9a-f]{2}){5}\b")
+_K8S_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 
 def _validate_k8s_name(value: str, field: str) -> str:
     value = str(value or "").strip().lower()
