@@ -58,7 +58,14 @@ _AUTH_USER: ContextVar[str] = ContextVar("kubedeck_web_auth_user", default="-")
 _MAC_CACHE: dict[str, tuple[float, str]] = {}
 _MAC_CACHE_LOCK = threading.RLock()
 _MAC_CACHE_TTL = 300.0
-_MAC_RE = re.compile(r"(?i)\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b|\b[0-9a-f]{2}(?:-[0-9a-f]{2}){5}\b")
+_MAC_RE = re.compile(r"(?i)\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b|\b[0-9a-f]{2}(?:-[0-9a-f]{2}){5}\b")_K8S_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+
+def _validate_k8s_name(value: str, field: str) -> str:
+    value = str(value or "").strip().lower()
+    if not value or len(value) > 253 or not _K8S_NAME_RE.fullmatch(value):
+        raise HTTPException(400, f"Invalid Kubernetes {field}")
+    return value
+
 
 
 def configure_runtime(ssh_provider: Callable[[], Optional[paramiko.SSHClient]]) -> None:
@@ -617,10 +624,14 @@ def logs(
     tail: int = 200,
     _: None = Depends(require_login),
 ) -> dict:
+    namespace = _validate_k8s_name(namespace, "namespace")
+    pod = _validate_k8s_name(pod, "pod")
+    if container:
+        container = _validate_k8s_name(container, "container")
     tail = max(1, min(tail, 2000))
     container_flag = f"-c {shlex.quote(container)} " if container else ""
     out = _kubectl(
-        f"logs {shlex.quote(pod)} -n {shlex.quote(namespace)} "
+        f"logs -- {shlex.quote(pod)} -n {shlex.quote(namespace)} "
         f"{container_flag}--tail={tail} 2>&1",
         timeout=20,
     )
@@ -637,6 +648,8 @@ def restart(
     name: str,
     _: None = Depends(require_login),
 ) -> dict:
+    namespace = _validate_k8s_name(namespace, "namespace")
+    name = _validate_k8s_name(name, "deployment")
     out = _kubectl(
         f"rollout restart deployment/{shlex.quote(name)} "
         f"-n {shlex.quote(namespace)} 2>&1"
@@ -651,6 +664,8 @@ def scale(
     body: ScaleRequest,
     _: None = Depends(require_login),
 ) -> dict:
+    namespace = _validate_k8s_name(namespace, "namespace")
+    name = _validate_k8s_name(name, "deployment")
     if body.replicas < 0 or body.replicas > 100:
         raise HTTPException(400, "replicas must be between 0 and 100")
     out = _kubectl(
@@ -666,8 +681,10 @@ def delete(
     name: str,
     _: None = Depends(require_login),
 ) -> dict:
+    namespace = _validate_k8s_name(namespace, "namespace")
+    name = _validate_k8s_name(name, "pod")
     out = _kubectl(
-        f"delete pod {shlex.quote(name)} "
+        f"delete pod -- {shlex.quote(name)} "
         f"-n {shlex.quote(namespace)} 2>&1"
     )
     return {"ok": True, "output": out.strip()}
