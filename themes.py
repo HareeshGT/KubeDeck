@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 
 # ─── Theme palette definitions ────────────────────────────────
 THEMES = {
@@ -89,48 +90,53 @@ SETTINGS_BACKUP_FILE = SETTINGS_FILE + ".bak"
 os.makedirs(APP_DIR, exist_ok=True)
 
 CURRENT_THEME = "Obsidian Purple"
+_SETTINGS_LOCK = threading.RLock()
 
 
 def save_settings(**extra):
-    """Persist settings atomically and keep a last-known-good backup."""
-    os.makedirs(APP_DIR, exist_ok=True)
-    data = load_settings()
-    data["theme"] = CURRENT_THEME
-    data.update(extra)
+    """Persist settings atomically under a process-local lock."""
+    with _SETTINGS_LOCK:
+        os.makedirs(APP_DIR, exist_ok=True)
+        data = load_settings()
+        data["theme"] = CURRENT_THEME
+        data.update(extra)
 
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=".settings-", suffix=".tmp", dir=APP_DIR, text=True
-    )
-    try:
-        os.chmod(tmp_path, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            fd = None
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                shutil.copy2(SETTINGS_FILE, SETTINGS_BACKUP_FILE)
-                os.chmod(SETTINGS_BACKUP_FILE, 0o600)
-            except OSError:
-                pass
-
-        os.replace(tmp_path, SETTINGS_FILE)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".settings-", suffix=".tmp", dir=APP_DIR, text=True
+        )
         try:
-            os.chmod(SETTINGS_FILE, 0o600)
-        except OSError:
-            pass
-    finally:
-        if fd is not None:
-            try: os.close(fd)
+            os.chmod(tmp_path, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = None
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.exists(SETTINGS_FILE):
+                try:
+                    shutil.copy2(SETTINGS_FILE, SETTINGS_BACKUP_FILE)
+                    os.chmod(SETTINGS_BACKUP_FILE, 0o600)
+                except OSError:
+                    pass
+            os.replace(tmp_path, SETTINGS_FILE)
+            try: os.chmod(SETTINGS_FILE, 0o600)
             except OSError: pass
-        try:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        except OSError:
-            pass
+        finally:
+            if fd is not None:
+                try: os.close(fd)
+                except OSError: pass
+            try:
+                if os.path.exists(tmp_path): os.unlink(tmp_path)
+            except OSError: pass
 
+def load_settings():
+    with _SETTINGS_LOCK:
+        try:
+            return _read_settings_file(SETTINGS_FILE)
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            try: return _read_settings_file(SETTINGS_BACKUP_FILE)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError): return {}
 
 def _read_settings_file(path):
     with open(path, encoding="utf-8") as f:
