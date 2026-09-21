@@ -2443,10 +2443,20 @@ class _RemoteRemuxWorker(QThread):
           return
         self.progress.emit(65, "Converting to H.264/AAC…")
         self._transcode()
+      elif self._source_needs_file(total):
+        # MP4/MOV with 'moov' at the end (or an FTP mov-family file):
+        # FFmpeg can't read that from a pipe — it must seek back to the
+        # samples after reading the index — so land it in a temp file
+        # first, exactly like the sudo path above.
+        if not self._download_source(total) or self._cancelled:
+          return
+        self.progress.emit(65, "Converting to H.264/AAC…")
+        self._transcode()
       else:
-        # IMPORTANT: stream the remote file directly into FFmpeg.
-        # Download and decode/encode now happen at the same time instead
-        # of waiting for a full temporary source download first.
+        # Pipe-safe source (fast-start MP4, mkv, webm, mp3, ...): stream
+        # the remote file directly into FFmpeg. Download and
+        # decode/encode happen at the same time instead of waiting for a
+        # full temporary source download first.
         self.progress.emit(1, "Starting native FFmpeg conversion…")
         self._transcode_remote(total)
 
@@ -2539,6 +2549,179 @@ class _RemoteRemuxWorker(QThread):
     ]
     return cmd
 
+  def _read_remote(self, sink, total):
+    """Feed the remote file's bytes, in order, to sink(data). Shared by
+    the pipe-into-FFmpeg path and the download-to-temp-file path so the
+    FTP/SFTP transport code exists exactly once."""
+    if hasattr(self._remote_fs, "_ftp"):
+      from ftplib import FTP, FTP_TLS
+      ftp_cls = FTP_TLS if getattr(self._remote_fs, "tls", False) else FTP
+      ftp = ftp_cls()
+      try:
+        ftp.connect(
+          self._remote_fs.host,
+          self._remote_fs.port,
+          timeout=getattr(self._remote_fs, "timeout", 15),
+        )
+        ftp.login(self._remote_fs.user, self._remote_fs.password)
+        if getattr(self._remote_fs, "tls", False):
+          ftp.prot_p()
+        ftp.set_pasv(getattr(self._remote_fs, "passive", True))
+        remote = self._remote_fs.normalize(self._remote)
+        ftp.retrbinary("RETR " + remote, sink,
+                blocksize=1024 * 1024)
+      finally:
+        try:
+          ftp.quit()
+        except Exception:
+          try:
+            ftp.close()
+          except Exception:
+            pass
+    else:
+      # Open a dedicated SFTP channel for this download rather
+      # than reusing self._remote_fs's shared connection — the
+      # same one the main-thread file browser keeps issuing
+      # requests on. Concurrent use of one SFTP/raw channel
+      # from two threads is exactly the class of bug already
+      # called out elsewhere in this app (see the "Garbage
+      # packet received" note in terminal_widget.py); this
+      # runs for potentially a long time, so it's worth a
+      # fresh channel the way MediaStreamServer already does.
+      dedicated_sftp = None
+      try:
+        dedicated_sftp = self._ssh.open_sftp()
+      except Exception:
+        dedicated_sftp = None
+      raw = dedicated_sftp or getattr(self._remote_fs, "_sftp", self._remote_fs)
+      try:
+        with raw.open(self._remote, "rb") as in_f:
+          try:
+            in_f.MAX_REQUEST_SIZE = 1024 * 1024
+            in_f.prefetch(total or None)
+          except Exception:
+            pass
+          while True:
+            if self._cancelled:
+              raise InterruptedError
+            data = in_f.read(1024 * 1024)
+            if not data:
+              break
+            sink(data)
+      finally:
+        if dedicated_sftp is not None:
+          try:
+            dedicated_sftp.close()
+          except Exception:
+            pass
+
+  # Top-level atoms that may legitimately open an MP4/MOV (ISO-BMFF) file.
+  _BMFF_ATOMS = (b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide", b"pnot", b"junk", b"uuid")
+  _MOV_FAMILY_EXTS = (".mp4", ".m4v", ".mov", ".m4a", ".3gp", ".3g2", ".qt")
+
+  @classmethod
+  def _bmff_needs_seekable_input(cls, f, size):
+    """Decide whether FFmpeg must be given a *seekable* source (a real
+    file) instead of a pipe, by walking the top-level MP4/MOV atoms.
+
+    An MP4 keeps its sample index in the 'moov' atom. When 'moov' comes
+    first ("fast-start") FFmpeg can read the index and then the data in
+    order, which works fine on a pipe. When 'mdat' (the media data) comes
+    first and 'moov' sits at the END — which is how most recorders,
+    exporters and plain `ffmpeg -i in out.mp4` write files — FFmpeg has
+    to read the index at the end and then jump back to the samples. A
+    pipe can't seek back, so it fails with "stream N, offset 0x30:
+    partial file" / "Invalid data found when processing input".
+
+    Returns True  -> needs a local file (mdat first, or can't tell),
+            False -> safe to pipe (moov first, or not an MP4/MOV at all).
+    """
+    import struct
+    off = 0
+    first = True
+    for _ in range(64):
+      f.seek(off)
+      hdr = f.read(8)
+      if len(hdr) < 8:
+        return not first          # ran out of file mid-walk: play it safe
+      sz, typ = struct.unpack(">I4s", hdr)
+      if first:
+        if typ not in cls._BMFF_ATOMS:
+          return False            # mkv / webm / ts / mp3 ...: pipe-friendly
+        first = False
+      if typ == b"moov":
+        return False
+      if typ == b"mdat":
+        return True
+      if sz == 1:
+        ext = f.read(8)
+        if len(ext) < 8:
+          return True
+        sz = struct.unpack(">Q", ext)[0]
+      elif sz == 0:
+        return True
+      if sz < 8:
+        return True
+      off += sz
+      if size and off >= size:
+        return True
+    return True
+
+  def _source_needs_file(self, total):
+    """True when this remote file has to be downloaded to a temp file
+    before FFmpeg can read it (see _bmff_needs_seekable_input)."""
+    if getattr(self._remote_fs, "sudo_user", None):
+      return True
+    if not self._remote.lower().endswith(self._MOV_FAMILY_EXTS):
+      return False
+    if hasattr(self._remote_fs, "_ftp"):
+      return True                 # can't cheaply seek over FTP; be safe
+    sftp = None
+    try:
+      sftp = self._ssh.open_sftp()
+      with sftp.open(self._remote, "rb") as f:
+        return self._bmff_needs_seekable_input(f, total)
+    except Exception:
+      return True
+    finally:
+      if sftp is not None:
+        try:
+          sftp.close()
+        except Exception:
+          pass
+
+  def _download_source(self, total):
+    """Download the remote file to a temp file (progress 1..64%), leaving
+    the path in self._input_path for _transcode()."""
+    import os
+    import tempfile
+    import time
+    fd_in, self._input_path = tempfile.mkstemp(
+      prefix="deckhand_media_", suffix=".source"
+    )
+    os.close(fd_in)
+    self.progress.emit(1, "Downloading remote media…")
+    done = 0
+    last_emit = 0.0
+    with open(self._input_path, "wb") as out:
+      def sink(data):
+        nonlocal done, last_emit
+        if self._cancelled:
+          raise InterruptedError
+        out.write(data)
+        done += len(data)
+        now = time.monotonic()
+        if total and now - last_emit >= 0.20:
+          self.progress.emit(
+            1 + int(63 * min(1.0, done / total)),
+            "Downloading remote media… {}%".format(min(100, int(done * 100 / total))))
+          last_emit = now
+      try:
+        self._read_remote(sink, total)
+      except InterruptedError:
+        return False
+    return True
+
   def _transcode_remote(self, total):
     import os
     import subprocess
@@ -2607,67 +2790,7 @@ class _RemoteRemuxWorker(QThread):
           last_emit = now
 
       try:
-        if hasattr(self._remote_fs, "_ftp"):
-          from ftplib import FTP, FTP_TLS
-          ftp_cls = FTP_TLS if getattr(self._remote_fs, "tls", False) else FTP
-          ftp = ftp_cls()
-          try:
-            ftp.connect(
-              self._remote_fs.host,
-              self._remote_fs.port,
-              timeout=getattr(self._remote_fs, "timeout", 15),
-            )
-            ftp.login(self._remote_fs.user, self._remote_fs.password)
-            if getattr(self._remote_fs, "tls", False):
-              ftp.prot_p()
-            ftp.set_pasv(getattr(self._remote_fs, "passive", True))
-            remote = self._remote_fs.normalize(self._remote)
-            ftp.retrbinary("RETR " + remote, write_chunk,
-                    blocksize=1024 * 1024)
-          finally:
-            try:
-              ftp.quit()
-            except Exception:
-              try:
-                ftp.close()
-              except Exception:
-                pass
-        else:
-          # Open a dedicated SFTP channel for this download rather
-          # than reusing self._remote_fs's shared connection — the
-          # same one the main-thread file browser keeps issuing
-          # requests on. Concurrent use of one SFTP/raw channel
-          # from two threads is exactly the class of bug already
-          # called out elsewhere in this app (see the "Garbage
-          # packet received" note in terminal_widget.py); this
-          # runs for potentially a long time, so it's worth a
-          # fresh channel the way MediaStreamServer already does.
-          dedicated_sftp = None
-          try:
-            dedicated_sftp = self._ssh.open_sftp()
-          except Exception:
-            dedicated_sftp = None
-          raw = dedicated_sftp or getattr(self._remote_fs, "_sftp", self._remote_fs)
-          try:
-            with raw.open(self._remote, "rb") as in_f:
-              try:
-                in_f.MAX_REQUEST_SIZE = 1024 * 1024
-                in_f.prefetch(total or None)
-              except Exception:
-                pass
-              while True:
-                if self._cancelled:
-                  raise InterruptedError
-                data = in_f.read(1024 * 1024)
-                if not data:
-                  break
-                write_chunk(data)
-          finally:
-            if dedicated_sftp is not None:
-              try:
-                dedicated_sftp.close()
-              except Exception:
-                pass
+        self._read_remote(write_chunk, total)
       except InterruptedError:
         try:
           proc.stdin.close()
@@ -2963,26 +3086,26 @@ class MediaPlayerDialog(QDialog):
       b.setToolTip(tooltip)
       return b
 
-    self._back_btn = _mkbtn("⏮", "Back 10s")
+    self._back_btn = _mkbtn(" ⏮ ", "Back 10s")
     self._back_btn.clicked.connect(lambda: self._skip(-10000))
     btn_row.addWidget(self._back_btn)
 
-    self._play_btn = _mkbtn("▶", "Play / Pause", 46)
+    self._play_btn = _mkbtn(" ▶ ", "Play / Pause", 46)
     self._play_btn.setObjectName("primary")
     self._play_btn.clicked.connect(self._toggle_play)
     btn_row.addWidget(self._play_btn)
 
-    self._fwd_btn = _mkbtn("⏭", "Forward 10s")
+    self._fwd_btn = _mkbtn(" ⏭ ", "Forward 10s")
     self._fwd_btn.clicked.connect(lambda: self._skip(10000))
     btn_row.addWidget(self._fwd_btn)
 
-    self._stop_btn = _mkbtn("⏹", "Stop")
+    self._stop_btn = _mkbtn(" ⏹ ", "Stop")
     self._stop_btn.clicked.connect(self._stop)
     btn_row.addWidget(self._stop_btn)
 
     btn_row.addSpacing(14)
 
-    self._mute_btn = _mkbtn("", "Mute")
+    self._mute_btn = _mkbtn(" 🔇 ", "Mute")
     self._mute_btn.clicked.connect(self._toggle_mute)
     btn_row.addWidget(self._mute_btn)
 

@@ -297,7 +297,11 @@ fi
 echo __KERNEL__
 uname -r 2>&1
 echo __UPTIME__
-(uptime -p 2>/dev/null || uptime) 2>&1
+if [ "$UNAME_S" = "Darwin" ]; then
+ uptime 2>&1 | sed -E 's/,[[:space:]]+[0-9]+ users?,.*$//'
+else
+ (uptime -p 2>/dev/null || uptime) 2>&1
+fi
 echo __LOAD__
 if [ "$UNAME_S" = "Darwin" ]; then
  sysctl -n vm.loadavg 2>/dev/null | tr -d '{}'
@@ -321,23 +325,55 @@ if [ "$UNAME_S" = "Darwin" ]; then
  PGSZ=$(sysctl -n hw.pagesize 2>/dev/null)
  TOTB=$(sysctl -n hw.memsize 2>/dev/null)
  VMS=$(vm_stat 2>/dev/null)
- ACT=$(echo "$VMS" | awk '/Pages active/{gsub(/\./,"",$3); print $3}')
- WIR=$(echo "$VMS" | awk '/Pages wired down/{gsub(/\./,"",$4); print $4}')
- CMP=$(echo "$VMS" | awk '/Pages occupied by compressor/{gsub(/\./,"",$5); print $5}')
- awk -v pg="$PGSZ" -v tot="$TOTB" -v act="${ACT:-0}" -v wir="${WIR:-0}" -v cmp="${CMP:-0}" \
-  'BEGIN { totmb = tot/1024/1024; usedmb = (act+wir+cmp)*pg/1024/1024; if (usedmb>totmb) usedmb=totmb; printf "Mem: %d %d %d 0 0 %d\n", totmb, usedmb, totmb-usedmb, totmb-usedmb }'
+ # Activity Monitor's "Memory Used" = App Memory + Wired + Compressed,
+ # where App Memory = anonymous (internal) pages minus purgeable ones.
+ # "Pages active" is NOT that: it includes file-backed cache, so using it
+ # over-reports (a mostly-idle 8 GB Mac read ~77% here).
+ ANON=$(echo "$VMS" | awk '/^Anonymous pages/{gsub(/\./,"",$3); print $3}')
+ PURG=$(echo "$VMS" | awk '/^Pages purgeable/{gsub(/\./,"",$3); print $3}')
+ ACT=$(echo "$VMS" | awk '/^Pages active/{gsub(/\./,"",$3); print $3}')
+ WIR=$(echo "$VMS" | awk '/^Pages wired down/{gsub(/\./,"",$4); print $4}')
+ CMP=$(echo "$VMS" | awk '/^Pages occupied by compressor/{gsub(/\./,"",$5); print $5}')
+ awk -v pg="$PGSZ" -v tot="$TOTB" -v anon="${ANON:-}" -v purg="${PURG:-0}" -v act="${ACT:-0}" -v wir="${WIR:-0}" -v cmp="${CMP:-0}" \
+  'BEGIN { totmb = tot/1024/1024; app = (anon != "") ? anon - purg : act; if (app < 0) app = 0; usedmb = (app+wir+cmp)*pg/1024/1024; if (usedmb>totmb) usedmb=totmb; printf "Mem: %d %d %d 0 0 %d\n", totmb, usedmb, totmb-usedmb, totmb-usedmb }'
 else
  free -m 2>/dev/null | grep -i '^mem'
 fi
 echo __DISK__
 if [ "$UNAME_S" = "Darwin" ]; then
- df -hP 2>/dev/null | awk 'NR>1 && $1 !~ /^(devfs|map)/'
+ # On macOS `df -hP` silently drops -h (POSIX mode prints raw 512-byte
+ # blocks), so ask for 1K blocks and humanize them here. APFS helper
+ # volumes (VM, Preboot, Update, xarts, ...) live in the same container and
+ # only add noise, so just the system volume, Data and real mounts show.
+ df -kP 2>/dev/null | awk '
+  function hum(kb,  v, i, U) { split("K M G T P", U, " "); v = kb + 0; i = 1
+   while (v >= 1024 && i < 5) { v /= 1024; i++ }
+   return (v >= 10 || i == 1) ? sprintf("%d%s", v + 0.5, U[i]) : sprintf("%.1f%s", v, U[i]) }
+  NR > 1 && $1 ~ /^\/dev\// {
+   m = $6; for (i = 7; i <= NF; i++) m = m " " $i
+   if (m ~ /^\/System\/Volumes\// && m != "/System/Volumes/Data") next
+   printf "%s %s %s %s %s %s\n", $1, hum($2), hum($3), hum($4), $5, m }'
 else
  df -hP -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null | tail -n +2
 fi
+if [ "$UNAME_S" = "Darwin" ]; then
+ echo __STORAGE__
+ # Every APFS volume in a container reports the container's full size and
+ # free space, so summing rows counts one disk many times over. Count each
+ # distinct (size, avail) pair once; used = size - avail (what Finder shows).
+ df -kP 2>/dev/null | awk '
+  NR > 1 && $1 ~ /^\/dev\// {
+   m = $6; for (i = 7; i <= NF; i++) m = m " " $i
+   if (m ~ /^\/System\/Volumes\// && m != "/System/Volumes/Data") next
+   k = $2 ":" $4
+   if (!(k in s)) { s[k] = 1; t += $2; u += ($2 - $4) } }
+  END { if (t > 0) printf "%.0f %.0f\n", t * 1024, u * 1024 }'
+fi
 echo __CPUPCT__
 if [ "$UNAME_S" = "Darwin" ]; then
- top -l 1 -n 0 2>/dev/null | grep "CPU usage"
+ # First `top` sample is not measured over an interval, so it is skewed;
+ # take two samples one second apart and use the last "CPU usage" line.
+ top -l 2 -n 0 -s 1 2>/dev/null | grep "CPU usage" | tail -1
 else
  (vmstat 1 2 2>/dev/null | tail -1) || true
 fi
@@ -2397,6 +2433,18 @@ class DashboardTab(QWidget):
       if size_b is not None and used_b is not None:
         total_bytes += size_b
         used_bytes += used_b
+
+    # macOS: the shell emits one "total_bytes used_bytes" line with each
+    # APFS container counted once (rows in the table share one container,
+    # so summing them would multiply the real size).
+    stor_lines = [l for l in sec.get("STORAGE", []) if l.strip()]
+    if stor_lines:
+      try:
+        st_total, st_used = (float(x) for x in stor_lines[0].split()[:2])
+        if st_total > 0:
+          total_bytes, used_bytes = st_total, max(0.0, min(st_used, st_total))
+      except ValueError:
+        pass
 
     if total_bytes > 0:
       storage_pct = min(100.0, used_bytes / total_bytes * 100.0)
