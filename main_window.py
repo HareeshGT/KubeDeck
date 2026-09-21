@@ -1682,8 +1682,17 @@ class EC2FileManager(QMainWindow):
       entries = self.sftp.listdir_attr(self.current_path)
       metas  = []
       for entry in entries:
-        is_dir = stat.S_ISDIR(entry.st_mode or 0)
-        kind  = classify(entry.filename, is_dir, entry.st_mode or 0)
+        mode = entry.st_mode or 0
+        is_dir = stat.S_ISDIR(mode)
+        # Follow directory symlinks so entries such as /bin and deploy/current
+        # navigate as directories instead of opening Save File.
+        if stat.S_ISLNK(mode):
+          try:
+            target_path = self.current_path.rstrip("/") + "/" + entry.filename
+            is_dir = stat.S_ISDIR(self.sftp.stat(target_path).st_mode or 0)
+          except Exception:
+            is_dir = False
+        kind  = classify(entry.filename, is_dir, mode)
         size  = entry.st_size or 0
         mode  = oct(entry.st_mode)[-3:] if entry.st_mode else "---"
         metas.append({"name": entry.filename, "kind": kind, "size": size,
