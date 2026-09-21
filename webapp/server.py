@@ -251,6 +251,7 @@ def _log_client_identity(request: Request, username: str) -> None:
     )
 
 
+
 def _exec(
     ssh: paramiko.SSHClient,
     command: str,
@@ -258,70 +259,90 @@ def _exec(
 ) -> tuple[int, str, str]:
     request_id = _REQUEST_ID.get()
     started = perf_counter()
+
+    def run_channel(stdout, stderr):
+        channel = stdout.channel
+        timed_out = threading.Event()
+
+        def abort_channel():
+            timed_out.set()
+            try:
+                channel.close()
+            except Exception:
+                pass
+
+        timer = threading.Timer(max(0.1, float(timeout)), abort_channel)
+        timer.daemon = True
+        timer.start()
+        try:
+            try:
+                channel.settimeout(max(0.1, float(timeout)))
+            except Exception:
+                pass
+            code = channel.recv_exit_status()
+            out = stdout.read().decode("utf-8", errors="replace")
+            err = stderr.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            if timed_out.is_set():
+                raise TimeoutError(
+                    "kubectl command timed out after {} seconds".format(timeout)
+                ) from exc
+            raise
+        finally:
+            timer.cancel()
+
+        if timed_out.is_set():
+            raise TimeoutError(
+                "kubectl command timed out after {} seconds".format(timeout)
+            )
+        return code, out, err
+
     logger.info(
         "[req=%s] KUBECTL START user=%r: %s",
-        request_id,
-        _AUTH_USER.get(),
-        command,
+        request_id, _AUTH_USER.get(), command
     )
-
     try:
         if managed_exec_command is None:
             stdin, stdout, stderr = ssh.exec_command(command, timeout=timeout)
-            code = stdout.channel.recv_exit_status()
-            out = stdout.read().decode("utf-8", errors="replace")
-            err = stderr.read().decode("utf-8", errors="replace")
-            for stream in (stdin, stdout, stderr):
-                try:
-                    stream.close()
-                except Exception:
-                    pass
+            try:
+                code, out, err = run_channel(stdout, stderr)
+            finally:
+                for stream in (stdin, stdout, stderr):
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
         else:
             with managed_exec_command(
-                ssh,
-                command,
-                channel_timeout=timeout,
+                ssh, command, channel_timeout=timeout
             ) as (_stdin, stdout, stderr):
-                try:
-                    stdout.channel.settimeout(timeout)
-                except Exception:
-                    pass
-                code = stdout.channel.recv_exit_status()
-                out = stdout.read().decode("utf-8", errors="replace")
-                err = stderr.read().decode("utf-8", errors="replace")
+                code, out, err = run_channel(stdout, stderr)
     except Exception:
         logger.exception(
             "[req=%s] KUBECTL EXCEPTION user=%r: %s (%.1f ms)",
-            request_id,
-            _AUTH_USER.get(),
-            command,
-            (perf_counter() - started) * 1000,
+            request_id, _AUTH_USER.get(), command,
+            (perf_counter() - started) * 1000
         )
         raise
 
     duration_ms = (perf_counter() - started) * 1000
     logger.info(
         "[req=%s] KUBECTL END user=%r: exit=%s duration=%.1f ms stdout=%d bytes stderr=%d bytes",
-        request_id,
-        _AUTH_USER.get(),
-        code,
-        duration_ms,
-        len(out),
-        len(err),
+        request_id, _AUTH_USER.get(), code, duration_ms, len(out), len(err)
     )
     if err.strip():
         logger.info(
             "[req=%s] KUBECTL STDERR user=%r: %s",
-            request_id,
-            _AUTH_USER.get(),
-            err.strip()[:4000],
+            request_id, _AUTH_USER.get(), err.strip()[:4000]
         )
-
     return code, out, err
 
 
 def _kubectl(args: str, timeout: int = 30, json_output: bool = False):
-    code, out, err = _exec(_ssh(), f"kubectl {args}", timeout)
+    try:
+        code, out, err = _exec(_ssh(), f"kubectl {args}", timeout)
+    except TimeoutError as exc:
+        raise HTTPException(504, str(exc))
     if code != 0:
         logger.warning(
             "[req=%s] kubectl failed user=%r (%s): %s",

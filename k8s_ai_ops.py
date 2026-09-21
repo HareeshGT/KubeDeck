@@ -1297,6 +1297,7 @@ def build_kubectl_command(action: dict) -> str:
   if operation == "restart":
     return f"{base} rollout restart {resource}/{name}"
   if operation == "delete":
+    # Destructive operations use the exact validated resource name.
     return f"{base} delete {resource} -- {shlex.quote(name)}"
   if operation == "get":
     keys = action.get("keys")
@@ -1346,7 +1347,7 @@ def build_kubectl_command(action: dict) -> str:
         f"awk -v prefix={prefix} 'index($2, prefix) == 1'"
       )
     if key and resource in KEY_VALUE_RESOURCES:
-      jsonpath = shlex.quote(f"{{.data.{key}}}")
+      jsonpath = shlex.quote("{.data['" + key + "']}")
       # --allow-missing-template-keys=false makes kubectl itself fail
       # (non-zero exit, "no entry for key" on stderr) when the key
       # doesn't exist, instead of the default behaviour of silently

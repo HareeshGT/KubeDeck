@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
   QApplication, QShortcut, QGraphicsOpacityEffect, QGraphicsDropShadowEffect,
 )
 from PyQt5.QtCore import (
-  Qt, QSize, QPropertyAnimation, QEasingCurve, QRect, QPoint,
+  Qt, QSize, QPropertyAnimation, QEasingCurve, QRect, QPoint, QTimer,
   QParallelAnimationGroup, QEvent,
 )
 from PyQt5.QtGui import QFont, QColor, QPalette, QKeySequence
@@ -29,7 +29,7 @@ from themes import T, THEMES, apply_theme_vars, build_qss, apply_qss_to, save_se
 from utils import classify, icon_for, size_fmt, add_recent_instance, monospace_font
 from sudo_fs import SudoFS
 from ftp_fs import FTPFS
-from workers import CommandWorker, ConnectWorker, FTPConnectionWorker, ConnectionHealthWorker, FileStreamReadWorker, track_worker, managed_exec_command, close_ssh_connection_pool
+from workers import CommandWorker, ConnectWorker, FTPConnectionWorker, ConnectionHealthWorker, FileStreamReadWorker, DirectoryListWorker, track_worker, managed_exec_command, close_ssh_connection_pool
 from dialogs import ConnectDialog, FileTransferDialog, FileEditorDialog, FileExecDialog, SearchDialog, ConnectingDialog, MediaPlayerDialog, AIExplainDialog
 import ai_assist
 from sidebar import Sidebar
@@ -682,6 +682,10 @@ class EC2FileManager(QMainWindow):
     self.sftp     = None
     self._health_worker = None
     self._preview_worker = None # FileStreamReadWorker backing _fetch_preview
+    self._directory_worker = None
+    self._directory_refresh_pending = None
+    self._directory_generation = 0
+    self._row_population_generation = 0
     self.current_path = "/"
     self.history    = []
     self.future    = []
@@ -1595,18 +1599,7 @@ class EC2FileManager(QMainWindow):
       worker = self._health_worker
       self._health_worker = None
       worker.stop()
-      # stop() only signals the loop to exit — run() is still
-      # unwinding on the worker's own OS thread when this line
-      # executes. Dropping our only reference to the QThread
-      # object without waiting for it to actually finish lets
-      # PyQt garbage-collect (and thus destroy) a QThread whose
-      # thread is still alive, which is a fatal
-      # "QThread: Destroyed while thread is still running" crash,
-      # not a catchable Python exception. wait() blocks briefly
-      # (the loop's own wait() unblocks near-instantly once
-      # _stop is set) until the thread has truly exited before we
-      # let the object go.
-      worker.wait(3000)
+      # Stop the heartbeat asynchronously; never block the UI during disconnect.
     try:
       if self.sftp: self.sftp.close()
       if self.ssh: self.ssh.close()
@@ -1669,50 +1662,122 @@ class EC2FileManager(QMainWindow):
   def _navigate_addr(self):
     self._nav_to(self.addr_bar.text().strip())
 
+
   # ── Directory refresh ─────────────────────────────────────
   def _refresh(self, push_history=True):
     if not self.sftp:
       return
+
+    if self._directory_worker is not None and self._directory_worker.isRunning():
+      self._directory_generation += 1
+      self._directory_worker.stop()
+      self._directory_refresh_pending = (self.current_path, push_history)
+      return
+
+    self._directory_refresh_pending = None
+    self._directory_generation += 1
+    self._row_population_generation += 1
+    generation = self._directory_generation
+    path = self.current_path
+
     self.progress.show()
+    self.file_list.setEnabled(False)
     self.file_list.clear()
     self._items = []
     self.preview.clear()
     self.search_bar.clear()
-    try:
-      entries = self.sftp.listdir_attr(self.current_path)
-      metas  = []
-      for entry in entries:
-        mode = entry.st_mode or 0
-        is_dir = stat.S_ISDIR(mode)
-        # Follow directory symlinks so entries such as /bin and deploy/current
-        # navigate as directories instead of opening Save File.
-        if stat.S_ISLNK(mode):
-          try:
-            target_path = self.current_path.rstrip("/") + "/" + entry.filename
-            is_dir = stat.S_ISDIR(self.sftp.stat(target_path).st_mode or 0)
-          except Exception:
-            is_dir = False
-        kind  = classify(entry.filename, is_dir, mode)
-        size  = entry.st_size or 0
-        mode  = oct(entry.st_mode)[-3:] if entry.st_mode else "---"
-        metas.append({"name": entry.filename, "kind": kind, "size": size,
-                "mode": mode, "is_dir": is_dir})
-      self._items = self._sort_items(metas)
-      for meta in self._items:
-        self._add_row(meta)
-    except Exception as e:
-      msg = str(e)
-      if self._sudo_user:
-        msg += "\n\n(Running as sudo user '{}')".format(self._sudo_user)
-      QMessageBox.critical(self, "Error", msg)
-    finally:
-      self.progress.hide()
 
+    worker = DirectoryListWorker(self.sftp, path)
+    self._directory_worker = worker
+    track_worker(self._workers, worker)
+    worker.result.connect(
+      lambda metas, result_path, w=worker, g=generation:
+        self._on_directory_loaded(metas, result_path, w, g)
+    )
+    worker.error.connect(
+      lambda error, w=worker, g=generation:
+        self._on_directory_error(error, w, g)
+    )
+    worker.finished.connect(
+      lambda w=worker: self._on_directory_worker_finished(w)
+    )
+    worker.start()
+
+  def _on_directory_loaded(self, metas, path, worker, generation):
+    if generation != self._directory_generation:
+      return
+    if worker is not self._directory_worker:
+      return
+    if self.sftp is None or path != self.current_path:
+      return
+
+    items = []
+    for meta in metas:
+      mode_value = meta.get("mode", 0) or 0
+      name = meta.get("name", "")
+      is_dir = bool(meta.get("is_dir"))
+      items.append({
+        "name": name,
+        "kind": classify(name, is_dir, mode_value),
+        "size": meta.get("size", 0) or 0,
+        "mode": oct(mode_value)[-3:] if mode_value else "---",
+        "is_dir": is_dir,
+      })
+
+    self._items = self._sort_items(items)
+    self._row_population_generation += 1
+    population_generation = self._row_population_generation
+    self._populate_rows_chunk(0, path, population_generation)
+
+  def _populate_rows_chunk(self, start, path, generation):
+    if generation != self._row_population_generation:
+      return
+    if self.sftp is None or path != self.current_path:
+      return
+
+    batch_size = 100
+    end = min(start + batch_size, len(self._items))
+    for meta in self._items[start:end]:
+      self._add_row(meta)
+
+    if end < len(self._items):
+      QTimer.singleShot(
+        0, lambda e=end, p=path, g=generation:
+          self._populate_rows_chunk(e, p, g)
+      )
+      return
+
+    self.file_list.setEnabled(True)
+    self.progress.hide()
     self.addr_bar.setText(self.current_path)
     self.setWindowTitle("KubeDeck — {}".format(self.current_path))
     n = len(self._items)
-    self.status.showMessage("{} item{} in {}".format(
-      n, "s" if n != 1 else "", self.current_path))
+    self.status.showMessage(
+      "{} item{} in {}".format(n, "s" if n != 1 else "", self.current_path)
+    )
+
+  def _on_directory_error(self, error, worker, generation):
+    if generation != self._directory_generation or worker is not self._directory_worker:
+      return
+    if self.sftp is None:
+      return
+    msg = str(error)
+    if self._sudo_user:
+      msg += "\n\n(Running as sudo user '{}')".format(self._sudo_user)
+    self.file_list.setEnabled(True)
+    self.progress.hide()
+    QMessageBox.critical(self, "Error", msg)
+
+  def _on_directory_worker_finished(self, worker):
+    if worker is not self._directory_worker:
+      return
+    self._directory_worker = None
+    pending = self._directory_refresh_pending
+    self._directory_refresh_pending = None
+    if pending and self.sftp is not None:
+      path, push_history = pending
+      if path == self.current_path:
+        self._refresh(push_history=push_history)
 
   # ── List population helpers ───────────────────────────────
   def _sort_items(self, items):
