@@ -4135,9 +4135,14 @@ class KubernetesTab(QWidget):
         f'pid=$(lsof -ti:{port} 2>/dev/null); [ -n "$pid" ] && kill -9 $pid'
       )
       cmds.append(
-        f"nohup kubectl {self._context_flag()} -n {ns} port-forward svc/{name} {port}:{container_port} > /dev/null 2>&1 &"
+        "nohup kubectl {} -n {} port-forward svc/{} {}:{} > /dev/null 2>&1 &".format(
+          self._context_flag(),
+          shlex.quote(ns),
+          shlex.quote(name),
+          int(port),
+          int(container_port),
+        )
       )
-
     # ';' not '&&' — the kill script may exit nonzero if nothing was listening
     inner = " ; ".join(cmds)
     # exec_command() opens a non-login shell, which skips /etc/profile —
