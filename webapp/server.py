@@ -124,13 +124,22 @@ def verify_web_password(password: str, salt: str, expected: str) -> bool:
 
 def _credentials() -> tuple[str, str, str, str]:
     settings = load_settings() or {}
-    return (
-        str(settings.get("webapp_username", "")).strip(),
-        str(settings.get("webapp_password_hash", "")),
-        str(settings.get("webapp_password_salt", "")),
-        str(settings.get("webapp_password", "")),
-    )
-
+    username = str(settings.get("webapp_username", "")).strip()
+    password_hash = str(settings.get("webapp_password_hash", ""))
+    password_salt = str(settings.get("webapp_password_salt", ""))
+    legacy_password = str(settings.get("webapp_password", ""))
+    if legacy_password and not (password_hash and password_salt):
+        try:
+            password_salt, password_hash = hash_web_password(legacy_password)
+            save_settings(
+                webapp_password_salt=password_salt,
+                webapp_password_hash=password_hash,
+                webapp_password="",
+            )
+            legacy_password = ""
+        except Exception:
+            logger.exception("Failed to migrate legacy web password")
+    return username, password_hash, password_salt, legacy_password
 
 def _auth_block_seconds(client_ip: str) -> int:
     now = perf_counter()
