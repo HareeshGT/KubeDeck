@@ -270,8 +270,12 @@ def _exec(
             with managed_exec_command(
                 ssh,
                 command,
-                channel_timeout=10,
+                channel_timeout=timeout,
             ) as (_stdin, stdout, stderr):
+                try:
+                    stdout.channel.settimeout(timeout)
+                except Exception:
+                    pass
                 code = stdout.channel.recv_exit_status()
                 out = stdout.read().decode("utf-8", errors="replace")
                 err = stderr.read().decode("utf-8", errors="replace")
