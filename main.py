@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import QApplication, QStyleFactory
 from PyQt5.QtGui import QColor, QPalette
 from PyQt5.QtCore import Qt, QPropertyAnimation, QEasingCurve
 
-from themes import T, build_qss
+from themes import T, build_qss, load_settings
 from file_stream_lifecycle import install as _install_file_stream_lifecycle
 from main_window import EC2FileManager
 from splash import SplashScreen
@@ -68,7 +68,8 @@ def main() -> int:
     def _begin_zoom():
         window = EC2FileManager()
         window_ref["window"] = window
-        webapp_app.start_server(lambda: getattr(window, "ssh", None))
+        if load_settings().get("webapp_enabled", False):
+            webapp_app.start_server(lambda: getattr(window, "ssh", None))
 
         window.setWindowOpacity(0.0)
         window.showFullScreen()
