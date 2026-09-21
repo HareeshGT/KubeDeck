@@ -40,31 +40,28 @@ class SudoFS:
     def set_sudo_user(self, username):
         # type: (Optional[str]) -> None
         self.sudo_user    = username
-        self._sudo_prefix = "sudo -u {} ".format(username) if username else ""
+        self._sudo_prefix = "sudo -u {} ".format(self._sq(username)) if username else ""
 
     # ── Internal helpers ──────────────────────────────────────
     def _run(self, cmd):
-        # type: (str) -> Tuple[str, str]
-        _, out, err = self._ssh.exec_command(cmd)
-        return out.read().decode(errors="replace"), err.read().decode(errors="replace")
-
+        # type: (str) -> Tuple[int, str, str]
+        stdin, out, err = self._ssh.exec_command(cmd)
+        try:
+            code = out.channel.recv_exit_status()
+            return code, out.read().decode(errors="replace"), err.read().decode(errors="replace")
+        finally:
+            for stream in (stdin, out, err):
+                try: stream.close()
+                except Exception: pass
     def _sq(self, path):
         # type: (str) -> str
         """Single-quote a path safely for shell injection."""
         return "'" + path.replace("'", "'\\''") + "'"
 
     def _run_or_raise(self, cmd):
-        # type: (str) -> None
-        """Run *cmd* and raise PermissionError if it wrote to stderr.
-
-        Shared by mkdir/rmdir/remove/rename/put, which previously each
-        repeated their own copy of this same "run, then check err.strip()"
-        check.
-        """
-        _, err = self._run(cmd)
-        if err.strip():
-            raise PermissionError(err.strip())
-
+        code, out, err = self._run(cmd)
+        if code != 0:
+            raise PermissionError((err or out or "remote operation failed").strip())
     # ── Path resolution ───────────────────────────────────────
     def normalize(self, path):
         # type: (str) -> str
