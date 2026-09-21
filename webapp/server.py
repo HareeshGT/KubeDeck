@@ -7,6 +7,7 @@ own; commands use KubeDeck's managed SSH session helper from workers.py.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import logging
@@ -30,7 +31,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
-from themes import load_settings
+from themes import load_settings, save_settings
 try:
     from workers import managed_exec_command
 except ImportError:  # pragma: no cover
@@ -40,6 +41,7 @@ APP_DIR = Path(__file__).resolve().parent
 STATE_DIR = Path(os.path.expanduser("~")) / ".vm_visualizer"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = STATE_DIR / "logs/webapp.log"
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger("kubedeck.webapp")
 if not logger.handlers:
@@ -84,12 +86,66 @@ def _ssh() -> paramiko.SSHClient:
     return client
 
 
-def _credentials() -> tuple[str, str]:
+_WEB_PASSWORD_ITERATIONS = 200_000
+_AUTH_FAIL_LOCK = threading.RLock()
+_AUTH_FAILURES: dict[str, list[float]] = {}
+_AUTH_MAX_FAILURES = 5
+_AUTH_WINDOW_SECONDS = 300.0
+_AUTH_LOCKOUT_SECONDS = 60.0
+
+
+def hash_web_password(password: str) -> tuple[str, str]:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), bytes.fromhex(salt),
+        _WEB_PASSWORD_ITERATIONS,
+    ).hex()
+    return salt, digest
+
+
+def verify_web_password(password: str, salt: str, expected: str) -> bool:
+    try:
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt),
+            _WEB_PASSWORD_ITERATIONS,
+        ).hex()
+        return secrets.compare_digest(digest, expected)
+    except (TypeError, ValueError):
+        return False
+
+
+def _credentials() -> tuple[str, str, str, str]:
     settings = load_settings() or {}
     return (
         str(settings.get("webapp_username", "")).strip(),
+        str(settings.get("webapp_password_hash", "")),
+        str(settings.get("webapp_password_salt", "")),
         str(settings.get("webapp_password", "")),
     )
+
+
+def _auth_block_seconds(client_ip: str) -> int:
+    now = perf_counter()
+    with _AUTH_FAIL_LOCK:
+        failures = [t for t in _AUTH_FAILURES.get(client_ip, []) if now - t < _AUTH_WINDOW_SECONDS]
+        _AUTH_FAILURES[client_ip] = failures
+        if len(failures) < _AUTH_MAX_FAILURES:
+            return 0
+        remaining = _AUTH_LOCKOUT_SECONDS - (now - failures[-_AUTH_MAX_FAILURES])
+        return max(1, int(remaining)) if remaining > 0 else 0
+
+
+def _record_auth_failure(client_ip: str) -> None:
+    now = perf_counter()
+    with _AUTH_FAIL_LOCK:
+        failures = [t for t in _AUTH_FAILURES.get(client_ip, []) if now - t < _AUTH_WINDOW_SECONDS]
+        failures.append(now)
+        _AUTH_FAILURES[client_ip] = failures[-_AUTH_MAX_FAILURES:]
+
+
+def _clear_auth_failures(client_ip: str) -> None:
+    with _AUTH_FAIL_LOCK:
+        _AUTH_FAILURES.pop(client_ip, None)
 
 
 def _client_ip(request: Request) -> str:
@@ -274,33 +330,55 @@ def require_login(
     request: Request,
     credentials: HTTPBasicCredentials = Depends(security),
 ) -> None:
-    username, password = _credentials()
-    if not username or not password:
+    username, password_hash, password_salt, legacy_password = _credentials()
+    if not username or not (password_hash and password_salt or legacy_password):
+        raise HTTPException(503, "Web App login is not configured in KubeDeck Settings")
+
+    client_ip = _client_ip(request)
+    retry_after = _auth_block_seconds(client_ip)
+    if retry_after:
         raise HTTPException(
-            503,
-            "Web App login is not configured in KubeDeck Settings",
+            429, "Too many login attempts; try again later.",
+            headers={"Retry-After": str(retry_after)},
         )
 
-    if not (
+    valid = (
         secrets.compare_digest(credentials.username, username)
-        and secrets.compare_digest(credentials.password, password)
-    ):
+        and (
+            verify_web_password(credentials.password, password_salt, password_hash)
+            if password_hash and password_salt
+            else secrets.compare_digest(credentials.password, legacy_password)
+        )
+    )
+
+    if not valid:
+        _record_auth_failure(client_ip)
         logger.warning(
             "[req=%s] Rejected web login username=%r client_ip=%s user_agent=%r",
-            _REQUEST_ID.get(),
-            credentials.username,
-            _client_ip(request),
+            _REQUEST_ID.get(), credentials.username, client_ip,
             _safe_user_agent(request),
         )
-        raise HTTPException(
-            401,
-            "Invalid credentials",
-            headers={"WWW-Authenticate": "Basic"},
-        )
+        retry_after = _auth_block_seconds(client_ip)
+        headers = {"WWW-Authenticate": "Basic"}
+        if retry_after:
+            headers["Retry-After"] = str(retry_after)
+            raise HTTPException(429, "Too many login attempts; try again later.", headers=headers)
+        raise HTTPException(401, "Invalid credentials", headers=headers)
 
-    # Keep the username in this request's context for kubectl tracing. Do not
-    # reset this ContextVar from middleware: Starlette/FastAPI may execute the
-    # dependency in a different context from BaseHTTPMiddleware.
+    _clear_auth_failures(client_ip)
+
+    # Migrate legacy plaintext passwords after a successful login.
+    if legacy_password and not (password_hash and password_salt):
+        try:
+            salt, digest = hash_web_password(legacy_password)
+            save_settings(
+                webapp_password_salt=salt,
+                webapp_password_hash=digest,
+                webapp_password="",
+            )
+        except Exception:
+            logger.exception("Failed to migrate legacy web password to a hash")
+
     _AUTH_USER.set(username)
     request.state.auth_user = username
     _log_client_identity(request, username)
@@ -664,7 +742,7 @@ def start_server(
     port: Optional[int] = None,
 ) -> bool:
     global _server, _server_thread, _server_port
-    host = (host or os.environ.get("WEBAPP_HOST", "0.0.0.0")).strip() or "0.0.0.0"
+    host = (host or "127.0.0.1").strip() or "127.0.0.1"
     try:
         preferred_port = int(port or os.environ.get("WEBAPP_PORT", "8000"))
     except ValueError:
