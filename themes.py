@@ -2,6 +2,8 @@
 
 import json
 import os
+import shutil
+import tempfile
 
 # ─── Theme palette definitions ────────────────────────────────
 THEMES = {
@@ -83,31 +85,70 @@ T = {}
 
 APP_DIR       = os.path.join(os.path.expanduser("~"), ".vm_visualizer")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
+SETTINGS_BACKUP_FILE = SETTINGS_FILE + ".bak"
 os.makedirs(APP_DIR, exist_ok=True)
 
 CURRENT_THEME = "Obsidian Purple"
 
 
 def save_settings(**extra):
-    """Persist app-wide settings to disk. Merges any extra key/value pairs
-    (e.g. a custom tunnel-services CSV path) on top of whatever is already
-    saved, and always includes the current theme — so a caller that only
-    cares about one setting (e.g. KubernetesTab saving a CSV path) doesn't
-    clobber a setting written by another part of the app (e.g. the theme
-    picker), and vice versa."""
+    """Persist settings atomically and keep a last-known-good backup."""
+    os.makedirs(APP_DIR, exist_ok=True)
     data = load_settings()
     data["theme"] = CURRENT_THEME
     data.update(extra)
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".settings-", suffix=".tmp", dir=APP_DIR, text=True
+    )
+    try:
+        os.chmod(tmp_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = None
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                shutil.copy2(SETTINGS_FILE, SETTINGS_BACKUP_FILE)
+                os.chmod(SETTINGS_BACKUP_FILE, 0o600)
+            except OSError:
+                pass
+
+        os.replace(tmp_path, SETTINGS_FILE)
+        try:
+            os.chmod(SETTINGS_FILE, 0o600)
+        except OSError:
+            pass
+    finally:
+        if fd is not None:
+            try: os.close(fd)
+            except OSError: pass
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _read_settings_file(path):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
 
 
 def load_settings():
+    """Load settings, recovering from the last atomic backup if needed."""
     try:
-        with open(SETTINGS_FILE) as f:
-            return json.load(f)
-    except Exception:
+        return _read_settings_file(SETTINGS_FILE)
+    except FileNotFoundError:
         return {}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        try:
+            return _read_settings_file(SETTINGS_BACKUP_FILE)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return {}
 
 
 def apply_theme_vars(theme_name: str):
