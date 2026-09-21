@@ -431,7 +431,8 @@ class SettingsDialog(QDialog):
         desc = QLabel(
             "Optional local web dashboard. It is disabled by default and binds "
             "only to 127.0.0.1 when enabled. It reuses the current SSH connection."
-        )        v.addWidget(desc)
+        )
+        v.addWidget(desc)
         v.addSpacing(6)
 
         v.addWidget(QLabel("Web App username"))
