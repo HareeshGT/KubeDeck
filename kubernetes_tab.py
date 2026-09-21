@@ -261,7 +261,8 @@ class KubernetesTab(QWidget):
     self._style_context_group()
     cb.addWidget(self.context_group)
     self.context_refresh_btn = self._toolbar_btn("↻", tooltip="Refresh Kubernetes contexts")
-    self.context_refresh_btn.setFixedWidth(34)
+    self.context_refresh_btn.setFixedWidth(30)
+    self.context_refresh_btn.setStyleSheet("padding: 0;")
     self.context_refresh_btn.clicked.connect(self._load_contexts)
     cb.addWidget(self.context_refresh_btn)
 
@@ -304,7 +305,8 @@ class KubernetesTab(QWidget):
     # picker rather than buried in a menu, since switching is already
     # the picker's job.
     self.ns_new_btn = self._toolbar_btn("＋", tooltip="Create namespace…")
-    self.ns_new_btn.setFixedWidth(34)
+    self.ns_new_btn.setFixedWidth(30)
+    self.ns_new_btn.setStyleSheet("padding: 0;")
     self.ns_new_btn.clicked.connect(self._create_namespace)
     cb.addWidget(self.ns_new_btn)
 
