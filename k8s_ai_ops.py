@@ -2439,7 +2439,7 @@ class K8sAIOpsWidget(QWidget):
     if needs_confirmation:
       if action["action"] == "delete":
         title = "Confirm Kubernetes Delete"
-      if action["action"] == "restart":
+      elif action["action"] == "restart":
         title = "Confirm Kubernetes Restart"
       else:
         title = "Confirm Kubernetes Scale — Protected Namespace"
@@ -2452,7 +2452,7 @@ class K8sAIOpsWidget(QWidget):
           f'\n\n "{namespace}" matches a protected namespace '
           "pattern configured in Settings."
         )
-      elif action["action"] == "restart":
+      if action["action"] == "restart":
         extra_note += "\n\nThis restarts every pod in the workload."
 
       answer = QMessageBox.question(
@@ -2474,6 +2474,8 @@ class K8sAIOpsWidget(QWidget):
         return
 
       confirmed = True
+
+    action["_confirmed"] = confirmed
 
     if action["action"] == "scale":
       # Capture the replica count before changing it. This makes later
@@ -2736,10 +2738,8 @@ class K8sAIOpsWidget(QWidget):
       action = getattr(self._operation_worker, "_k8s_action", None)
       command = getattr(self._operation_worker, "_k8s_command", "")
       if action:
+        action["_confirmed"] = bool(getattr(self._operation_worker, "_k8s_confirmed", False))
         self._remember_operation(action, command, "failed", str(error))
-        _append_audit(action, command, "failed", str(error),
-               getattr(self._operation_worker, "_k8s_confirmed", False),
-               _risk_level(action, action.get("context", ""), is_protected_namespace(action.get("namespace", ""))))
     self._speak(_spoken_done_phrase(action, success=False) if action else "Operation failed.")
 
   def _on_operation_finished(self):
@@ -2767,12 +2767,15 @@ class K8sAIOpsWidget(QWidget):
       if action.get("previous_replicas") is not None:
         row["previous_replicas"] = action.get("previous_replicas")
 
-    if output:
-      row["output"] = output[-1000:]
+    persisted_output = output or ""
+    if action.get("action") == "get" and action.get("resource") == "secret":
+      persisted_output = "[REDACTED: secret values omitted from history/audit]"
+    if persisted_output:
+      row["output"] = persisted_output[-1000:]
 
     _append_audit(
-      action, command, status, output,
-      confirmed=(status == "success"),
+      action, command, status, persisted_output,
+      confirmed=bool(action.get("_confirmed", False)),
       risk=_risk_level(action, action.get("context", ""), is_protected_namespace(action.get("namespace", ""))),
     )
     self._history.append(row)
