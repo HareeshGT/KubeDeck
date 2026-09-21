@@ -496,6 +496,7 @@ class AppLockDialog(QDialog):
 
     lay.addWidget(hint)
 
+    self._failed_attempts = 0
     self.pin_field.setFocus()
     # No fade-in / windowOpacity animation on this dialog on purpose.
     # It's a frameless, WA_TranslucentBackground, always-on-top modal
@@ -528,30 +529,37 @@ class AppLockDialog(QDialog):
   # -------------------------------------------------------------
 
   def _try_unlock(self):
-    if not self.form_view.isVisible():
-      # Success animation already running (or a stray double-click/
-      # double Enter) — ignore further attempts.
+    if not self.form_view.isVisible() or not self.pin_field.edit.isEnabled():
       return
-
     settings = get_lock_settings()
     pin = self.pin_field.text()
-
     if not pin:
       self.error_lbl.setText("Enter your PIN.")
       self._shake_card()
       return
-
     if verify_pin(pin, settings["salt"], settings["pin_hash"]):
       self.error_lbl.setText("")
+      self._failed_attempts = 0
       self._show_success()
       return
-
-    # Wrong PIN — stay on the lock screen, surface the error clearly,
-    # and let the user try again. Nothing here closes the dialog.
+    self._failed_attempts += 1
     self.error_lbl.setText("Incorrect PIN. Please try again.")
     self.pin_field.clear()
+    if self._failed_attempts >= 5:
+      self.pin_field.edit.setEnabled(False)
+      self.error_lbl.setText("Too many incorrect attempts. Try again in 30 seconds.")
+      QTimer.singleShot(30 * 1000, self._end_pin_lockout)
+      return
     self.pin_field.setFocus()
     self._shake_card()
+
+  def _end_pin_lockout(self):
+    if not self.form_view.isVisible():
+      return
+    self._failed_attempts = 0
+    self.pin_field.edit.setEnabled(True)
+    self.pin_field.setFocus()
+    self.error_lbl.setText("")
 
   def _show_success(self):
     """Swap the PIN form for a ring-then-checkmark success view, then
@@ -662,7 +670,7 @@ class SetPinDialog(QDialog):
       lbl.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 11.5px; font-weight: 600; background: transparent; border: none;")
       return lbl
 
-    lay.addWidget(field_label("NEW PIN · 4+ CHARACTERS"))
+    lay.addWidget(field_label("NEW PIN · 6+ CHARACTERS"))
     lay.addSpacing(6)
     self.pin1_field = _PillField("●", "New PIN", card)
     lay.addWidget(self.pin1_field)
@@ -738,8 +746,8 @@ class SetPinDialog(QDialog):
 
   def _on_ok(self):
     p1, p2 = self.pin1_field.text(), self.pin2_field.text()
-    if len(p1) < 4:
-      self.error_lbl.setText("PIN must be at least 4 characters.")
+    if len(p1) < 6:
+      self.error_lbl.setText("PIN must be at least 6 characters.")
       return
     if p1 != p2:
       self.error_lbl.setText("PINs don't match.")
