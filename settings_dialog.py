@@ -180,6 +180,7 @@ class SettingsDialog(QDialog):
         self._pending_pin = None
         self._webapp_username = str(settings.get("webapp_username", ""))
         self._webapp_enabled = bool(settings.get("webapp_enabled", False))
+        self._webapp_legacy_password = str(settings.get("webapp_password", ""))
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 20, 20, 16)
@@ -513,6 +514,8 @@ class SettingsDialog(QDialog):
             "webapp_username": self.web_username_edit.text().strip(),
         }
         new_web_password = self.web_password_edit.text()
+        if not new_web_password and self._webapp_legacy_password:
+            new_web_password = self._webapp_legacy_password
         if new_web_password:
             from webapp.server import hash_web_password
             salt, digest = hash_web_password(new_web_password)
