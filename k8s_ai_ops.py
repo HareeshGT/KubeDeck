@@ -1297,20 +1297,7 @@ def build_kubectl_command(action: dict) -> str:
   if operation == "restart":
     return f"{base} rollout restart {resource}/{name}"
   if operation == "delete":
-    if resource == "pod":
-      prefix = shlex.quote(name)
-      if namespace:
-        return (
-          f"for pod in $({base} get pods --no-headers | "
-          f"awk -v prefix={prefix} 'index($1, prefix) == 1 {{print $1}}'); do "
-          f"{base} delete pod/$pod; done"
-        )
-      return (
-        f"{base} get pods -A --no-headers | "
-        f"awk -v prefix={prefix} 'index($2, prefix) == 1 {{print $1, $2}}' | "
-        f"while read ns pod; do kubectl {context_flag}-n \"$ns\" delete pod/\"$pod\"; done"
-      )
-    return f"{base} delete {resource}/{name}"
+    return f"{base} delete {resource} -- {shlex.quote(name)}"
   if operation == "get":
     keys = action.get("keys")
     if keys and resource in KEY_VALUE_RESOURCES:
@@ -2442,7 +2429,9 @@ class K8sAIOpsWidget(QWidget):
     # every time, but scaling prod/mcp should.
     risk = _risk_level(action, kube_context, protected)
     needs_confirmation = action["action"] in {"delete", "restart"}
-    if action["action"] == "scale" and protected:
+    prod_context = any(x in kube_context.lower() for x in ("prod", "production"))
+    confirmed = False
+    if action["action"] == "scale" and (protected or prod_context):
       needs_confirmation = True
     if risk in {"high", "critical"}:
       needs_confirmation = True
@@ -2450,21 +2439,21 @@ class K8sAIOpsWidget(QWidget):
     if needs_confirmation:
       if action["action"] == "delete":
         title = "Confirm Kubernetes Delete"
-      elif action["action"] == "restart":
+      if action["action"] == "restart":
         title = "Confirm Kubernetes Restart"
       else:
         title = "Confirm Kubernetes Scale — Protected Namespace"
 
       extra_note = ""
       if any(x in kube_context.lower() for x in ("prod", "production")):
-        extra_note += "\n\n Selected context looks like a production cluster."
-      if protected and action["action"] != "delete":
-        extra_note = (
+        extra_note += "\n\nSelected context looks like a production cluster."
+      if protected:
+        extra_note += (
           f'\n\n "{namespace}" matches a protected namespace '
           "pattern configured in Settings."
         )
       elif action["action"] == "restart":
-        extra_note = "\n\nThis restarts every pod in the workload."
+        extra_note += "\n\nThis restarts every pod in the workload."
 
       answer = QMessageBox.question(
         self,
@@ -2483,6 +2472,8 @@ class K8sAIOpsWidget(QWidget):
         self._speak("Operation cancelled.")
         self._set_busy(False)
         return
+
+      confirmed = True
 
     if action["action"] == "scale":
       # Capture the replica count before changing it. This makes later
@@ -2616,7 +2607,7 @@ class K8sAIOpsWidget(QWidget):
     worker = CommandWorker(self.ssh, command + " 2>&1")
     worker._k8s_action = action
     worker._k8s_command = command
-    worker._k8s_confirmed = True
+    worker._k8s_confirmed = bool(action.get("_confirmed", False))
     self._operation_worker = worker
     worker.result.connect(
       lambda output, err, exit_code, a=action, c=command:
