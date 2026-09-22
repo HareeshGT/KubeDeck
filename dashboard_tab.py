@@ -355,6 +355,17 @@ if [ "$UNAME_S" = "Darwin" ]; then
    printf "%s %s %s %s %s %s\n", $1, hum($2), hum($3), hum($4), $5, m }'
 else
  df -hP -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null | tail -n +2
+ echo __STORAGE__
+ df -P -k -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null | awk '
+  NR > 1 && $1 !~ /^$/ {
+    fs = $1
+    if (!(fs in seen)) {
+      seen[fs] = 1
+      total += $2
+      used += $3
+    }
+  }
+  END { if (total > 0) printf "%.0f %.0f\n", total * 1024, used * 1024 }'
 fi
 if [ "$UNAME_S" = "Darwin" ]; then
  echo __STORAGE__
@@ -400,6 +411,9 @@ else
 
  echo __TOP__
  kubectl top nodes --no-headers 2>/dev/null
+
+ echo __NAMESPACES__
+ kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null
 
  echo __PODS__
  kubectl get pods --all-namespaces -o json
@@ -573,7 +587,7 @@ class Sparkline(QWidget):
   and gained a new point on the right."
   """
 
-  MAX_POINTS = 10 # 6s cadence * 10 = last 60 seconds
+  MAX_POINTS = 20 # 3s dashboard cadence * 20 = ~60 seconds
 
   def __init__(self, color: str = None, parent=None):
     super().__init__(parent)
@@ -1251,9 +1265,12 @@ class NodeCard(QFrame):
 
     self.pods_lbl.setText(f" {pod_count} pod(s)")
     self.pressure_lbl.setText(pressure_text or "")
+    if (pressure_text or "").strip().lower() == "unknown":
+      pressure_color = T["WARNING"]
+    else:
+      pressure_color = T["SUCCESS"] if pressure_ok else T["DANGER"]
     self.pressure_lbl.setStyleSheet(
-      f"color: {T['SUCCESS'] if pressure_ok else T['DANGER']}; "
-      f"font-size: 12px; font-weight: 600;"
+      f"color: {pressure_color}; font-size: 12px; font-weight: 600;"
     )
 
   def update_pod_count(self, pod_count: int):
@@ -2434,9 +2451,9 @@ class DashboardTab(QWidget):
         total_bytes += size_b
         used_bytes += used_b
 
-    # macOS: the shell emits one "total_bytes used_bytes" line with each
-    # APFS container counted once (rows in the table share one container,
-    # so summing them would multiply the real size).
+    # The shell may emit one exact "total_bytes used_bytes" line. On Linux
+    # this is deduplicated by filesystem/device; on macOS APFS volumes are
+    # deduplicated using the shared size/availability pair.
     stor_lines = [l for l in sec.get("STORAGE", []) if l.strip()]
     if stor_lines:
       try:
@@ -2460,7 +2477,7 @@ class DashboardTab(QWidget):
         f"Total: {size_fmt(total_bytes)}\n"
         f"Used: {size_fmt(used_bytes)}\n"
         f"Available: {size_fmt(avail_bytes)}\n"
-        f"Across {self.disk_tree.topLevelItemCount()} mount(s)"
+        f"From {self.disk_tree.topLevelItemCount()} listed mount(s)"
       )
     else:
       self.storage_ring["ring"].setValue(0)
@@ -2577,8 +2594,12 @@ class DashboardTab(QWidget):
       status = item.get("status") or {}
       spec = item.get("spec") or {}
       containers = status.get("containerStatuses") or []
+      init_containers = status.get("initContainerStatuses") or []
       ready_count = sum(1 for x in containers if x.get("ready"))
-      restarts = sum(int(x.get("restartCount", 0) or 0) for x in containers)
+      restarts = sum(
+        int(x.get("restartCount", 0) or 0)
+        for x in (init_containers + containers)
+      )
       waiting_parts = []
       for container in containers:
         waiting = (container.get("state") or {}).get("waiting") or {}
@@ -2639,9 +2660,14 @@ class DashboardTab(QWidget):
         replicas, ready, available = ds_desired, ds_ready, ds_available
         updated, unavailable, desired = ds_updated, ds_unavailable, ds_desired
       elif kind == "StatefulSet":
-        # Preserve the original dashboard mapping exactly.
-        available = current
-        unavailable = ready
+        # StatefulSet has no native availableReplicas/unavailableReplicas
+        # fields. Use readyReplicas as the displayed available count and
+        # derive unavailable from the desired replica count.
+        available = ready
+        try:
+          unavailable = str(max(int(desired or 0) - int(ready or 0), 0))
+        except ValueError:
+          unavailable = "0"
       workloads.append({
         "kind": kind, "namespace": ns, "name": name,
         "created": created.strip(), "replicas": replicas.strip() or "0",
@@ -2717,15 +2743,26 @@ class DashboardTab(QWidget):
     total_pods = len(all_pods)
     running_pods = sum(1 for p in all_pods if p["phase"].lower() == "running")
     pending_pods = sum(1 for p in all_pods if p["phase"].lower() == "pending")
-    failed_pods = sum(1 for p in all_pods if p["phase"].lower() in ("failed", "unknown"))
-    namespaces = len({p["namespace"] for p in all_pods if p["namespace"]})
+    failed_pods = sum(1 for p in all_pods if p["phase"].lower() == "failed")
+    namespace_lines = [x.strip() for x in sec.get("NAMESPACES", []) if x.strip()]
+    if namespace_lines:
+      namespaces = len(set(namespace_lines))
+    else:
+      # Fallback only when namespace listing was denied/unavailable.
+      namespaces = len({p["namespace"] for p in all_pods if p["namespace"]})
     pressure_nodes = 0
     for node_name in cond:
       c = cond.get(node_name, {})
       if any(c.get(k) == "True" for k in ("mem", "disk", "pid")):
         pressure_nodes += 1
     ready_nodes = sum(1 for line in node_lines if len(line.split()) >= 2 and line.split()[1].lower().split(",", 1)[0] == "ready")
-    metrics_available = bool(top)
+    node_names = [line.split()[0] for line in node_lines if line.split()]
+    if not top:
+      metrics_state = "Unavailable"
+    elif all(name in top for name in node_names):
+      metrics_state = "Available"
+    else:
+      metrics_state = "Partial"
     self._k8s_summary["nodes"].setText(f"{ready_nodes}/{len(node_lines)}")
     self._k8s_summary["pods"].setText(str(total_pods))
     self._k8s_summary["running"].setText(str(running_pods))
@@ -2733,9 +2770,10 @@ class DashboardTab(QWidget):
     self._k8s_summary["failed"].setText(str(failed_pods))
     self._k8s_summary["namespaces"].setText(str(namespaces))
     self._k8s_summary["pressure"].setText(str(pressure_nodes))
-    self._k8s_summary["metrics"].setText("Available" if metrics_available else "Unavailable")
+    self._k8s_summary["metrics"].setText(metrics_state)
+    metrics_color = T["SUCCESS"] if metrics_state == "Available" else T["WARNING"]
     self._k8s_summary["metrics"].setStyleSheet(
-      f"color: {T['SUCCESS'] if metrics_available else T['WARNING']}; font-size: 17px; font-weight: 700;"
+      f"color: {metrics_color}; font-size: 17px; font-weight: 700;"
     )
 
     # Render workloads.
@@ -2811,8 +2849,19 @@ class DashboardTab(QWidget):
 
       c = cond.get(name, {})
       pressures = [label for key, label in _pressure_names.items() if c.get(key) == "True"]
-      pressure_text = ", ".join(pressures) if pressures else "OK"
-      pressure_ok  = not pressures
+      pressure_unknown = [
+        label for key, label in _pressure_names.items()
+        if c.get(key) not in ("True", "False", "")
+      ]
+      if pressures:
+        pressure_text = ", ".join(pressures)
+        pressure_ok = False
+      elif pressure_unknown:
+        pressure_text = "Unknown"
+        pressure_ok = False
+      else:
+        pressure_text = "OK"
+        pressure_ok = True
 
       t = top.get(name)
       cpu_pct = mem_pct = None
