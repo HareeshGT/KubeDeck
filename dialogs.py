@@ -1687,147 +1687,235 @@ class FileEditorDialog(QDialog):
 
     fname = os.path.basename(remote_path)
     self.setWindowTitle(f"Edit — {fname}")
-    self.resize(960, 700)
+    self.resize(1180, 760)
+    self.setMinimumSize(900, 620)
+    self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
     apply_qss_to(self)
 
     lay = QVBoxLayout(self)
     lay.setContentsMargins(0, 0, 0, 0)
     lay.setSpacing(0)
 
-    # ── Toolbar ───────────────────────────────────────────
-    tb_widget = QWidget()
-    tb_widget.setFixedHeight(44)
-    tb_widget.setStyleSheet(
-      f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
+    # ── Editor header ─────────────────────────────────────────
+    header = QWidget()
+    header.setObjectName("editor_header")
+    header.setFixedHeight(64)
+    header.setStyleSheet(
+      f"QWidget#editor_header {{ background: {T['BG_PANEL']}; "
+      f"border-bottom: 1px solid {T['BORDER']}; }}"
     )
-    tb = QHBoxLayout(tb_widget)
-    tb.setContentsMargins(10, 0, 10, 0)
-    tb.setSpacing(6)
+    hl = QHBoxLayout(header)
+    hl.setContentsMargins(16, 8, 16, 8)
+    hl.setSpacing(10)
 
-    # ── Filename chip ─────────────────────────────────────
-    # File identity (icon + name + unsaved state) reads as one unit
-    # instead of an icon, a full path label, and a separate warning
-    # label competing for attention across the same row.
-    chip = QFrame()
-    chip.setObjectName("file_chip")
-    chip_lay = QHBoxLayout(chip)
-    chip_lay.setContentsMargins(10, 4, 10, 4)
-    chip_lay.setSpacing(6)
-    icon_lbl = QLabel("")
-    icon_lbl.setStyleSheet("font-size: 14px; background: transparent;")
-    chip_lay.addWidget(icon_lbl)
+    file_badge = QFrame()
+    file_badge.setFixedSize(38, 38)
+    file_badge.setStyleSheet(
+      f"QFrame {{ background: {_rgba(T['ACCENT'], 0.13)}; "
+      f"border: 1px solid {_rgba(T['ACCENT'], 0.28)}; border-radius: 10px; }}"
+    )
+    file_badge_lay = QHBoxLayout(file_badge)
+    file_badge_lay.setContentsMargins(0, 0, 0, 0)
+    file_icon = QLabel()
+    file_icon.setPixmap(icon_pixmap("file", color=T["ACCENT"], size=19))
+    file_icon.setAlignment(Qt.AlignCenter)
+    file_badge_lay.addWidget(file_icon)
+    hl.addWidget(file_badge)
+
+    title_col = QVBoxLayout()
+    title_col.setSpacing(0)
+    title_col.setContentsMargins(0, 1, 0, 1)
+
+    name_row = QHBoxLayout()
+    name_row.setSpacing(8)
     path_lbl = QLabel(fname)
-    path_lbl.setStyleSheet(f"color: {T['TEXT_PRIMARY']}; font-size: 13px; font-weight: 600; background: transparent;")
+    path_lbl.setStyleSheet(
+      f"color: {T['TEXT_PRIMARY']}; font-size: 14px; font-weight: 700; background: transparent;"
+    )
     path_lbl.setToolTip(remote_path)
-    chip_lay.addWidget(path_lbl)
-    self._modified_dot = QLabel("unsaved")
+    name_row.addWidget(path_lbl)
+
+    self._modified_dot = QLabel("Modified")
     self._modified_dot.setStyleSheet(
-      f"background: {T['WARNING']}; color: #1a1a1a; font-size: 10px; font-weight: 700; "
-      f"border-radius: 8px; padding: 1px 8px;"
+      f"background: {_rgba(T['WARNING'], 0.16)}; color: {T['WARNING']}; "
+      f"font-size: 10px; font-weight: 700; border: 1px solid {_rgba(T['WARNING'], 0.35)}; "
+      f"border-radius: 8px; padding: 2px 7px;"
     )
     self._modified_dot.hide()
-    chip_lay.addWidget(self._modified_dot)
-    chip.setStyleSheet(f"QFrame#file_chip {{ background: {T['BG_ITEM']}; border-radius: 14px; }}")
-    tb.addWidget(chip)
-    tb.addStretch()
+    name_row.addWidget(self._modified_dot)
+    name_row.addStretch(1)
+    title_col.addLayout(name_row)
 
-    # ── View controls: segmented zoom + icon toggles ──────
+    path_tail = remote_path
+    if len(path_tail) > 110:
+      path_tail = "…" + path_tail[-109:]
+    path_detail = QLabel(path_tail)
+    path_detail.setStyleSheet(
+      f"color: {T['TEXT_MUTED']}; font-size: 11px; background: transparent;"
+    )
+    path_detail.setToolTip(remote_path)
+    title_col.addWidget(path_detail)
+
+    hl.addLayout(title_col, 1)
+
+    remote_pill = QLabel("REMOTE")
+    remote_pill.setAlignment(Qt.AlignCenter)
+    remote_pill.setStyleSheet(
+      f"background: {T['BG_ITEM']}; color: {T['TEXT_DIM']}; font-size: 10px; font-weight: 700; "
+      f"letter-spacing: 0.8px; border: 1px solid {T['BORDER']}; border-radius: 8px; padding: 4px 8px;"
+    )
+    hl.addWidget(remote_pill)
+    hl.addSpacing(6)
+
+    self._save_close_btn = QCheckBox("Close after save")
+    self._save_close_btn.setToolTip("Save the file and close the editor in one step")
+    self._save_close_btn.setStyleSheet(
+      f"QCheckBox {{ color: {T['TEXT_DIM']}; font-size: 11px; spacing: 6px; }}"
+      f"QCheckBox::indicator {{ width: 14px; height: 14px; border-radius: 4px; border: 1px solid {T['BORDER']}; background: {T['BG_ITEM']}; }}"
+      f"QCheckBox::indicator:checked {{ background: {T['ACCENT']}; border-color: {T['ACCENT']}; }}"
+    )
+    hl.addWidget(self._save_close_btn)
+
+    discard_btn = QPushButton("Discard")
+    discard_btn.setToolTip("Discard local changes and close")
+    discard_btn.setFixedHeight(32)
+    discard_btn.setObjectName("editor_ghost_danger")
+    discard_btn.setStyleSheet(
+      f"QPushButton#editor_ghost_danger {{ background: transparent; color: {T['DANGER']}; "
+      f"border: 1px solid {_rgba(T['DANGER'], 0.4)}; border-radius: 8px; padding: 0 12px; }}"
+      f"QPushButton#editor_ghost_danger:hover {{ background: {_rgba(T['DANGER'], 0.10)}; }}"
+      f"QPushButton#editor_ghost_danger:pressed {{ background: {_rgba(T['DANGER'], 0.16)}; }}"
+      f"QPushButton#editor_ghost_danger:disabled {{ color: {T['TEXT_MUTED']}; border-color: {T['BORDER']}; }}"
+    )
+    discard_btn.clicked.connect(self._confirm_close)
+    hl.addWidget(discard_btn)
+
+    save_btn = icon_button(" Save")
+    save_btn.setObjectName("editor_primary")
+    save_btn.setFixedHeight(32)
+    save_btn.setMinimumWidth(92)
+    save_btn.setToolTip("Save (Ctrl+S)")
+    save_btn.clicked.connect(
+      lambda: self._save_and_close() if self._save_close_btn.isChecked() else self._save()
+    )
+    save_btn.setStyleSheet(
+      f"QPushButton#editor_primary {{ background: {T['ACCENT']}; color: #ffffff; border: 1px solid {T['ACCENT']}; "
+      f"border-radius: 8px; padding: 0 14px; font-weight: 700; }}"
+      f"QPushButton#editor_primary:hover {{ background: {T['ACCENT2']}; border-color: {T['ACCENT2']}; }}"
+      f"QPushButton#editor_primary:pressed {{ background: {T['ACCENT']}; }}"
+      f"QPushButton#editor_primary:disabled {{ background: {T['BG_ITEM']}; color: {T['TEXT_MUTED']}; border-color: {T['BORDER']}; }}"
+    )
+    hl.addWidget(save_btn)
+    self._save_btn = save_btn
+
+    lay.addWidget(header)
+
+    # ── Compact command bar ───────────────────────────────────
+    tools = QWidget()
+    tools.setObjectName("editor_toolbar")
+    tools.setFixedHeight(42)
+    tools.setStyleSheet(
+      f"QWidget#editor_toolbar {{ background: {T['BG_DARK']}; border-bottom: 1px solid {T['BORDER']}; }}"
+    )
+    tl = QHBoxLayout(tools)
+    tl.setContentsMargins(12, 5, 12, 5)
+    tl.setSpacing(5)
+
+    def _tool_btn(label, tooltip, width=34, checkable=False):
+      b = QPushButton(label)
+      b.setFixedSize(width, 30)
+      b.setCheckable(checkable)
+      b.setToolTip(tooltip)
+      b.setStyleSheet(
+        f"QPushButton {{ background: transparent; color: {T['TEXT_DIM']}; border: 1px solid transparent; border-radius: 7px; padding: 0 8px; }}"
+        f"QPushButton:hover {{ background: {T['BG_ITEM']}; color: {T['TEXT_PRIMARY']}; border-color: {T['BORDER']}; }}"
+        f"QPushButton:checked {{ background: {_rgba(T['ACCENT'], 0.14)}; color: {T['ACCENT2']}; border-color: {_rgba(T['ACCENT'], 0.38)}; }}"
+      )
+      return b
+
+    def _separator():
+      sep = QFrame()
+      sep.setFrameShape(QFrame.VLine)
+      sep.setFixedHeight(20)
+      sep.setStyleSheet(f"color: {T['BORDER']};")
+      return sep
+
+    undo_btn = _tool_btn("↶", "Undo (Ctrl+Z)")
+    undo_btn.clicked.connect(self.editor.undo)
+    tl.addWidget(undo_btn)
+    redo_btn = _tool_btn("↷", "Redo (Ctrl+Shift+Z)")
+    redo_btn.clicked.connect(self.editor.redo)
+    tl.addWidget(redo_btn)
+    tl.addWidget(_separator())
+
+    self._find_btn = icon_button(" Find")
+    self._find_btn.setCheckable(True)
+    self._find_btn.setFixedHeight(30)
+    self._find_btn.setMinimumWidth(78)
+    self._find_btn.setToolTip("Find / Replace (Ctrl+F)")
+    self._find_btn.toggled.connect(self._toggle_find_bar)
+    tl.addWidget(self._find_btn)
+
+    self._wrap_btn = _tool_btn("↔", "Wrap lines", width=72, checkable=True)
+    self._wrap_btn.setChecked(True)
+    self._wrap_btn.toggled.connect(self._toggle_wrap)
+    tl.addWidget(self._wrap_btn)
+
+    tl.addStretch(1)
+
+    view_lbl = QLabel("VIEW")
+    view_lbl.setStyleSheet(
+      f"color: {T['TEXT_MUTED']}; font-size: 9px; font-weight: 700; letter-spacing: 1px; padding-right: 2px;"
+    )
+    tl.addWidget(view_lbl)
+
     zoom_frame = QFrame()
     zoom_frame.setObjectName("zoom_group")
+    zoom_frame.setStyleSheet(
+      f"QFrame#zoom_group {{ background: {T['BG_ITEM']}; border: 1px solid {T['BORDER']}; border-radius: 8px; }}"
+    )
     zf = QHBoxLayout(zoom_frame)
     zf.setContentsMargins(2, 2, 2, 2)
     zf.setSpacing(0)
 
-    def _flat_btn(text, tip, size=(28, 26)):
-      b = QPushButton(text)
-      b.setFixedSize(*size)
-      b.setToolTip(tip)
-      b.setFlat(True)
-      b.setStyleSheet("border: none; background: transparent;")
-      return b
-
-    zoom_out_btn = _flat_btn("−", "Zoom out (Ctrl+-)")
+    zoom_out_btn = _tool_btn("−", "Zoom out (Ctrl+-)", width=30)
     zoom_out_btn.clicked.connect(lambda: (self.editor.zoom_out(), self._update_zoom_label()))
     zf.addWidget(zoom_out_btn)
 
     self._zoom_lbl = QLabel("100%")
-    self._zoom_lbl.setFixedWidth(38)
+    self._zoom_lbl.setFixedWidth(44)
     self._zoom_lbl.setAlignment(Qt.AlignCenter)
-    self._zoom_lbl.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 12px; background: transparent;")
+    self._zoom_lbl.setStyleSheet(
+      f"color: {T['TEXT_PRIMARY']}; font-size: 11px; font-weight: 600; background: transparent;"
+    )
     self._zoom_lbl.setToolTip("Reset zoom (Ctrl+0)")
     zf.addWidget(self._zoom_lbl)
 
-    zoom_in_btn = _flat_btn("+", "Zoom in (Ctrl++)")
+    zoom_in_btn = _tool_btn("+", "Zoom in (Ctrl++)", width=30)
     zoom_in_btn.clicked.connect(lambda: (self.editor.zoom_in(), self._update_zoom_label()))
     zf.addWidget(zoom_in_btn)
+    tl.addWidget(zoom_frame)
+    lay.addWidget(tools)
 
-    zoom_frame.setStyleSheet(f"QFrame#zoom_group {{ background: {T['BG_ITEM']}; border-radius: 7px; }}")
-    tb.addWidget(zoom_frame)
-
-    tb.addSpacing(6)
-
-    self._wrap_btn = QPushButton("⇌")
-    self._wrap_btn.setCheckable(True)
-    self._wrap_btn.setChecked(True)
-    self._wrap_btn.setFixedSize(30, 30)
-    self._wrap_btn.setToolTip("Wrap lines")
-    self._wrap_btn.toggled.connect(self._toggle_wrap)
-    tb.addWidget(self._wrap_btn)
-
-    self._find_btn = icon_button("")
-    self._find_btn.setCheckable(True)
-    self._find_btn.setFixedSize(30, 30)
-    self._find_btn.setToolTip("Find / Replace (Ctrl+F)")
-    self._find_btn.toggled.connect(self._toggle_find_bar)
-    tb.addWidget(self._find_btn)
-
-    tb.addSpacing(10)
-
-    # ── Actions: one primary CTA, save+close folded into a checkbox
-    # next to it rather than a third competing button ─────
-    self._save_close_btn = QCheckBox("Close after save")
-    self._save_close_btn.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 12px;")
-    tb.addWidget(self._save_close_btn)
-
-    discard_btn = QPushButton("Discard")
-    discard_btn.setObjectName("danger")
-    discard_btn.setFixedHeight(30)
-    discard_btn.clicked.connect(self._confirm_close)
-    tb.addWidget(discard_btn)
-
-    save_btn = icon_button(" Save")
-    save_btn.setObjectName("primary")
-    save_btn.setFixedSize(96, 30)
-    save_btn.clicked.connect(
-      lambda: self._save_and_close() if self._save_close_btn.isChecked() else self._save()
-    )
-    tb.addWidget(save_btn)
-    self._save_btn = save_btn
-
-    lay.addWidget(tb_widget)
-
-    # Thin indeterminate/progress strip shown only while a file is
-    # streaming in live (see _start_live_load) — hidden the rest of
-    # the time.
+    # Thin loading strip.
     self._load_bar = QProgressBar()
     self._load_bar.setFixedHeight(3)
     self._load_bar.setTextVisible(False)
     self._load_bar.setStyleSheet(
-      "QProgressBar {{ border: none; background: {bg}; }}"
-      "QProgressBar::chunk {{ background: {ac}; }}".format(
-        bg=T['BG_ITEM'], ac=T['ACCENT'])
+      f"QProgressBar {{ border: none; background: {T['BG_ITEM']}; }}"
+      f"QProgressBar::chunk {{ background: {T['ACCENT']}; }}"
     )
     self._load_bar.hide()
     lay.addWidget(self._load_bar)
 
     # ── Find/Replace bar ──────────────────────────────────
     self._find_bar = QWidget()
-    self._find_bar.setFixedHeight(44)
+    self._find_bar.setFixedHeight(50)
     self._find_bar.setStyleSheet(
-      f"background: {T['BG_ITEM']}; border-bottom: 1px solid {T['BORDER']};"
+      f"background: {T['BG_PANEL']}; border-bottom: 1px solid {T['BORDER']};"
     )
     fb = QHBoxLayout(self._find_bar)
-    fb.setContentsMargins(10, 6, 10, 6)
+    fb.setContentsMargins(12, 8, 12, 8)
     fb.setSpacing(6)
 
     input_style = (
@@ -1868,7 +1956,7 @@ class FileEditorDialog(QDialog):
 
     self._replace_inp = QLineEdit()
     self._replace_inp.setPlaceholderText("Replace…")
-    self._replace_inp.setFixedWidth(220)
+    self._replace_inp.setMinimumWidth(190)
     self._replace_inp.setStyleSheet(input_style)
     fb.addWidget(self._replace_inp)
 
@@ -1906,44 +1994,68 @@ class FileEditorDialog(QDialog):
     lay.addWidget(self._find_bar)
 
     # ── Editor area ───────────────────────────────────────
-    # CodeEditor paints its own line-number gutter directly into the
-    # QPlainTextEdit's viewport margin (see editor_widgets.py) — no
-    # second widget to keep scrolled in sync, and it comes with a
-    # soft current-line highlight and Ctrl+scroll zoom built in.
+    editor_frame = QFrame()
+    editor_frame.setObjectName("editor_surface")
+    editor_frame.setStyleSheet(
+      f"QFrame#editor_surface {{ background: {T['BG_DARK']}; border: 1px solid {T['BORDER']}; }}"
+    )
+    editor_lay = QVBoxLayout(editor_frame)
+    editor_lay.setContentsMargins(0, 0, 0, 0)
+    editor_lay.setSpacing(0)
+
     self.editor = CodeEditor(base_point_size=12)
     self.editor.setPlainText(content or "")
     self.editor.textChanged.connect(self._on_text_changed)
-    lay.addWidget(self.editor, 1)
+    editor_lay.addWidget(self.editor, 1)
+    lay.addWidget(editor_frame, 1)
 
     # Syntax highlighting — picked from the file extension; falls back
     # to plain text (no highlighter) for unrecognised extensions.
     self._highlighter, self._lang = make_highlighter(self.editor.document(), fname)
-
-    # ── Status bar ────────────────────────────────────────
+    # ── Status bar ─────────────────────────────────────────
     sb_widget = QWidget()
-    sb_widget.setFixedHeight(26)
+    sb_widget.setObjectName("editor_status")
+    sb_widget.setFixedHeight(30)
     sb_widget.setStyleSheet(
-      f"background: {T['BG_PANEL']}; border-top: 1px solid {T['BORDER']};"
+      f"QWidget#editor_status {{ background: {T['BG_PANEL']}; border-top: 1px solid {T['BORDER']}; }}"
     )
     sb = QHBoxLayout(sb_widget)
-    sb.setContentsMargins(12, 0, 12, 0)
-    sb.setSpacing(16)
+    sb.setContentsMargins(14, 0, 14, 0)
+    sb.setSpacing(12)
 
     self._status_lbl = QLabel("Ready")
-    self._status_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 13px;")
+    self._status_lbl.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 11px; font-weight: 600;")
     sb.addWidget(self._status_lbl)
+
+    status_divider = QFrame()
+    status_divider.setFrameShape(QFrame.VLine)
+    status_divider.setFixedHeight(14)
+    status_divider.setStyleSheet(f"color: {T['BORDER']};")
+    sb.addWidget(status_divider)
     sb.addStretch()
 
     self._cursor_lbl = QLabel("Ln 1, Col 1")
-    self._cursor_lbl.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 13px;")
+    self._cursor_lbl.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 11px;")
     sb.addWidget(self._cursor_lbl)
+
+    for badge_text in ("UTF-8", "LF"):
+      badge = QLabel(badge_text)
+      badge.setStyleSheet(
+        f"color: {T['TEXT_MUTED']}; font-size: 10px; font-weight: 600; "
+        f"background: {T['BG_ITEM']}; border: 1px solid {T['BORDER']}; "
+        f"border-radius: 6px; padding: 2px 6px;"
+      )
+      sb.addWidget(badge)
 
     ext = os.path.splitext(fname)[1].lower()
     lang_lbl = QLabel(LANG_LABEL.get(self._lang, ext.lstrip(".").upper() if ext else "Plain Text"))
-    lang_lbl.setStyleSheet(f"color: {T['ACCENT2']}; font-size: 13px; font-weight: 600;")
+    lang_lbl.setStyleSheet(
+      f"color: {T['ACCENT2']}; font-size: 10px; font-weight: 700; "
+      f"background: {_rgba(T['ACCENT2'], 0.10)}; border: 1px solid {_rgba(T['ACCENT2'], 0.28)}; "
+      f"border-radius: 6px; padding: 2px 7px;"
+    )
     sb.addWidget(lang_lbl)
     lay.addWidget(sb_widget)
-
     self.editor.cursorPositionChanged.connect(self._update_cursor_pos)
 
     QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self._save)

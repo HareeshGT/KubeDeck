@@ -341,7 +341,7 @@ class CodeEditor(QPlainTextEdit):
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
                 is_current = block_number == current_line
-                painter.setPen(QColor(T["TEXT_PRIMARY"] if is_current else T["TEXT_MUTED"]))
+                painter.setPen(QColor(T["ACCENT"] if is_current else T["TEXT_MUTED"]))
                 f = QFont(self.font())
                 f.setBold(is_current)
                 painter.setFont(f)
@@ -350,6 +350,9 @@ class CodeEditor(QPlainTextEdit):
             top = bottom
             bottom = top + int(self.blockBoundingRect(block).height())
             block_number += 1
+
+        painter.setPen(QPen(QColor(T["BORDER"]), 1))
+        painter.drawLine(gutter_w - 1, 0, gutter_w - 1, self.height())
 
     # ── Current-line highlight ──────────────────────────────
     def _highlight_current_line(self):
