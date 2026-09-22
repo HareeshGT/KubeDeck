@@ -1,0 +1,357 @@
+"""Monaco editor bridge for KubeDeck's remote file editor.
+
+The visible editor is Monaco (VS Code's editor engine) hosted by Qt WebEngine.
+A small QTextDocument shadow model is kept locally so KubeDeck's existing
+find/replace, save, dirty-state and streaming code can continue to operate
+without rewriting the remote-file layer.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from PyQt5.QtCore import QObject, QUrl, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QTextCursor
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPlainTextEdit, QLabel
+
+try:
+    from PyQt5.QtWebEngineWidgets import QWebEngineView
+except Exception:
+    QWebEngineView = None
+
+
+MONACO_VERSION = "0.55.1"
+
+
+def _language_for(filename: str) -> str:
+    ext = Path(filename).suffix.lower()
+    return {
+        ".py": "python", ".pyw": "python",
+        ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript",
+        ".ts": "typescript", ".tsx": "typescript",
+        ".json": "json", ".yaml": "yaml", ".yml": "yaml",
+        ".sh": "shell", ".bash": "shell", ".zsh": "shell",
+        ".sql": "sql", ".html": "html", ".htm": "html", ".xml": "xml",
+        ".css": "css", ".scss": "scss", ".md": "markdown",
+        ".go": "go", ".rs": "rust", ".java": "java",
+        ".c": "c", ".cpp": "cpp", ".h": "cpp", ".hpp": "cpp",
+        ".cs": "csharp", ".swift": "swift", ".kt": "kotlin",
+        ".rb": "ruby", ".php": "php",
+        ".ini": "ini", ".conf": "ini", ".cfg": "ini", ".toml": "ini",
+        ".env": "ini",
+    }.get(ext, "plaintext")
+
+
+class _Bridge(QObject):
+    textChanged = pyqtSignal(str)
+    saveRequested = pyqtSignal(str)
+    cursorChanged = pyqtSignal(int, int)
+
+    @pyqtSlot(str)
+    def onTextChanged(self, text):
+        self.textChanged.emit(text)
+
+    @pyqtSlot(str)
+    def onSaveRequested(self, text):
+        self.saveRequested.emit(text)
+
+    @pyqtSlot(int, int)
+    def onCursorChanged(self, line, column):
+        self.cursorChanged.emit(line, column)
+
+
+def _html():
+    return """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+html,body,#editor{width:100%;height:100%;margin:0;overflow:hidden;background:#0f1117}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.55.1/min/vs/loader.js"></script>
+<script>
+let editor = null;
+let decorations = [];
+function boot() {
+  if (!window.require) {
+    document.getElementById("editor").innerText = "Monaco could not be loaded.";
+    return;
+  }
+  require.config({paths:{vs:"https://cdn.jsdelivr.net/npm/monaco-editor@0.55.1/min/vs"}});
+  require(["vs/editor/editor.main"], function(monaco) {
+    editor = monaco.editor.create(document.getElementById("editor"), {
+      value: window.initialText || "",
+      language: window.initialLanguage || "plaintext",
+      theme: "vs-dark",
+      automaticLayout: true,
+      minimap: {enabled:true},
+      fontSize: 13,
+      fontFamily: "SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+      lineNumbers: "on",
+      folding: true,
+      smoothScrolling: true,
+      scrollBeyondLastLine: false,
+      renderWhitespace: "selection",
+      wordWrap: "on",
+      tabSize: 2,
+      insertSpaces: true,
+      padding: {top:10,bottom:10},
+      stickyScroll: {enabled:true},
+      cursorBlinking: "smooth",
+      bracketPairColorization: {enabled:true},
+      guides: {bracketPairs:true},
+      suggest: {showMethods:true,showFunctions:true},
+      quickSuggestions: true
+    });
+    editor.onDidChangeModelContent(() => {
+      if (window._bridge) _bridge.onTextChanged(editor.getValue());
+    });
+    editor.onDidChangeCursorPosition(e => {
+      if (window._bridge) _bridge.onCursorChanged(e.position.lineNumber, e.position.column);
+    });
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+      if (window._bridge) _bridge.onSaveRequested(editor.getValue());
+    });
+  });
+}
+function setText(v) {
+  if (!editor) return;
+  const p = editor.getPosition();
+  editor.setValue(v || "");
+  if (p) editor.setPosition(p);
+}
+function setLanguage(v) {
+  if (editor) monaco.editor.setModelLanguage(editor.getModel(), v || "plaintext");
+}
+function setCursor(offset) {
+  if (!editor) return;
+  const pos = editor.getModel().getPositionAt(offset);
+  editor.setPosition(pos);
+  editor.revealPositionInCenter(pos);
+}
+function setDecorations(ranges) {
+  if (!editor) return;
+  decorations = editor.deltaDecorations(decorations, ranges.map((r,i)=>({
+    range:new monaco.Range(r[0],r[1],r[2],r[3]),
+    options:{inlineClassName:i === ranges.length-1 ? "kubedeck-current-match" : "kubedeck-match"}
+  })));
+}
+function clearDecorations() {
+  if (editor) decorations = editor.deltaDecorations(decorations, []);
+}
+function setReadOnly(v) {
+  if (editor) editor.updateOptions({readOnly:!!v});
+}
+function undo(){if(editor)editor.trigger("keyboard","undo",null)}
+function redo(){if(editor)editor.trigger("keyboard","redo",null)}
+function setWrap(v){if(editor)editor.updateOptions({wordWrap:v?"on":"off"})}
+function setFontSize(v){if(editor)editor.updateOptions({fontSize:v})}
+function focusEditor(){if(editor)editor.focus()}
+</script>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<style>
+.kubedeck-match{background:rgba(255,190,70,.28);border-bottom:1px solid #e8ad45}
+.kubedeck-current-match{background:rgba(124,106,247,.65);color:#fff}
+</style>
+</head>
+<body><div id="editor"></div>
+<script>
+new QWebChannel(qt.webChannelTransport, function(channel) {
+  window._bridge = channel.objects.bridge;
+  window.initialText = "";
+  window.initialLanguage = "plaintext";
+  boot();
+});
+</script>
+</body>
+</html>"""
+
+
+class MonacoEditor(QWidget):
+    """VS Code-like Monaco editor with a QTextDocument compatibility model."""
+
+    saveRequested = pyqtSignal(str)
+    textChanged = pyqtSignal()
+    cursorPositionChanged = pyqtSignal()
+
+    MIN_PT, MAX_PT = 8, 28
+
+    def __init__(self, base_point_size=12, parent=None):
+        super().__init__(parent)
+        self._pt = base_point_size
+        self._base_pt = base_point_size
+        self._loaded = False
+        self._syncing = False
+        self._filename = ""
+        self._language = "plaintext"
+        self._shadow = QPlainTextEdit(self)
+        self._shadow.hide()
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        layout.setSpacing(0)
+
+        if QWebEngineView is None:
+            fallback = QLabel("PyQtWebEngine is not installed.\nUsing the built-in KubeDeck editor.")
+            layout.addWidget(fallback)
+            self._view = None
+            return
+
+        from PyQt5.QtWebChannel import QWebChannel
+        self._view = QWebEngineView(self)
+        self._bridge = _Bridge(self)
+        self._bridge.textChanged.connect(self._on_js_text)
+        self._bridge.saveRequested.connect(self.saveRequested)
+        self._bridge.cursorChanged.connect(self._on_js_cursor)
+
+        channel = QWebChannel(self._view.page())
+        channel.registerObject("bridge", self._bridge)
+        self._view.page().setWebChannel(channel)
+        self._channel = channel
+        layout.addWidget(self._view)
+        self._view.loadFinished.connect(self._on_loaded)
+        self._view.setHtml(_html(), QUrl("https://kubedeck.local/"))
+
+    @staticmethod
+    def available():
+        return QWebEngineView is not None
+
+    def _on_loaded(self, ok):
+        self._loaded = bool(ok)
+        if ok:
+            self._push_state()
+
+    def _on_js_text(self, text):
+        if self._syncing:
+            return
+        self._shadow.blockSignals(True)
+        self._shadow.setPlainText(text or "")
+        self._shadow.blockSignals(False)
+        self.textChanged.emit()
+
+    def _on_js_cursor(self, line, column):
+        block = self._shadow.document().findBlockByNumber(max(0, line - 1))
+        if block.isValid():
+            c = self._shadow.textCursor()
+            c.setPosition(block.position() + max(0, column - 1))
+            self._shadow.setTextCursor(c)
+        self.cursorPositionChanged.emit()
+
+    def _push_state(self):
+        if not self._view or not self._loaded:
+            return
+        text = json.dumps(self._shadow.toPlainText())
+        lang = json.dumps(self._language)
+        self._syncing = True
+        script = (
+            f"window.setText({text});"
+            f"window.setLanguage({lang});"
+        )
+        self._view.page().runJavaScript(script, lambda _=None: self._clear_sync())
+    
+    def _clear_sync(self):
+        self._syncing = False
+
+    def set_filename(self, filename):
+        self._filename = filename or ""
+        self._language = _language_for(self._filename)
+        self._push_state()
+
+    def setPlainText(self, text):
+        self._shadow.setPlainText(text or "")
+        self._push_state()
+        self.textChanged.emit()
+
+    def append_text(self, text):
+        if not text:
+            return
+        c = self._shadow.textCursor()
+        c.movePosition(QTextCursor.End)
+        c.insertText(text)
+        self._push_state()
+        self.textChanged.emit()
+
+    def toPlainText(self):
+        return self._shadow.toPlainText()
+
+    def document(self):
+        return self._shadow.document()
+
+    def textCursor(self):
+        return self._shadow.textCursor()
+
+    def setTextCursor(self, cursor):
+        self._shadow.setTextCursor(cursor)
+        if self._view and self._loaded:
+            self._view.page().runJavaScript(
+                f"window.setCursor({cursor.position()});window.focusEditor();"
+            )
+        self.cursorPositionChanged.emit()
+
+    def replace_selection(self, text):
+        cursor = self._shadow.textCursor()
+        cursor.insertText(text or "")
+        self._push_state()
+        self.textChanged.emit()
+
+    def undo(self):
+        if self._view and self._loaded:
+            self._view.page().runJavaScript("window.undo()")
+        else:
+            self._shadow.undo()
+
+    def redo(self):
+        if self._view and self._loaded:
+            self._view.page().runJavaScript("window.redo()")
+        else:
+            self._shadow.redo()
+
+    def setUndoRedoEnabled(self, enabled):
+        pass
+
+    def setLineWrapMode(self, mode):
+        wrap = mode != 0
+        if self._view and self._loaded:
+            self._view.page().runJavaScript(f"window.setWrap({str(wrap).lower()})")
+
+    def set_search_selections(self, selections):
+        ranges = []
+        for sel in selections:
+            c = sel.cursor
+            start = c.selectionStart()
+            end = c.selectionEnd()
+            a = self._shadow.document().findBlock(start)
+            b = self._shadow.document().findBlock(end)
+            if not a.isValid() or not b.isValid():
+                continue
+            ranges.append([
+                a.blockNumber()+1, start-a.position()+1,
+                b.blockNumber()+1, end-b.position()+1,
+            ])
+        if self._view and self._loaded:
+            self._view.page().runJavaScript(
+                f"window.setDecorations({json.dumps(ranges)})"
+            )
+
+    def zoom_in(self):
+        self.set_point_size(self._pt + 1)
+
+    def zoom_out(self):
+        self.set_point_size(self._pt - 1)
+
+    def zoom_reset(self):
+        self.set_point_size(self._base_pt)
+
+    def set_point_size(self, pt):
+        self._pt = max(self.MIN_PT, min(self.MAX_PT, pt))
+        if self._view and self._loaded:
+            self._view.page().runJavaScript(f"window.setFontSize({self._pt})")
+
+    def setFocus(self):
+        super().setFocus()
+        if self._view and self._loaded:
+            self._view.page().runJavaScript("window.focusEditor()")
+
+    def refresh_theme(self):
+        pass

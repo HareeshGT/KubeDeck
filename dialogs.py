@@ -31,6 +31,10 @@ from themes import T, apply_qss_to
 from utils import load_recent_instances, size_fmt, append_terminal_html, append_terminal_text, html_escape, monospace_font
 from workers import CommandWorker, PodExecStreamWorker, _TransferWorker, ScpTransferWorker, track_worker, FileStreamReadWorker, MediaStreamServer, _StreamServerStartWorker, AudioTranscodeWorker, managed_exec_command, open_managed_session, close_managed_session
 from editor_widgets import CodeEditor, make_highlighter, LANG_LABEL
+try:
+  from monaco_editor import MonacoEditor
+except Exception:
+  MonacoEditor = None
 import ai_assist
 from ansi_terminal import AnsiStreamRenderer, plain_text
 
@@ -1841,10 +1845,10 @@ class FileEditorDialog(QDialog):
       return sep
 
     undo_btn = _tool_btn("↶", "Undo (Ctrl+Z)")
-    undo_btn.clicked.connect(self.editor.undo)
+    undo_btn.clicked.connect(lambda: self.editor.undo())
     tl.addWidget(undo_btn)
     redo_btn = _tool_btn("↷", "Redo (Ctrl+Shift+Z)")
-    redo_btn.clicked.connect(self.editor.redo)
+    redo_btn.clicked.connect(lambda: self.editor.redo())
     tl.addWidget(redo_btn)
     tl.addWidget(_separator())
 
@@ -2003,15 +2007,28 @@ class FileEditorDialog(QDialog):
     editor_lay.setContentsMargins(0, 0, 0, 0)
     editor_lay.setSpacing(0)
 
-    self.editor = CodeEditor(base_point_size=12)
-    self.editor.setPlainText(content or "")
+    # Monaco provides the VS Code-style editing surface when Qt WebEngine
+    # is available. Keep the native editor as a compatibility fallback so
+    # missing WebEngine never prevents the remote file editor from opening.
+    if MonacoEditor is not None and MonacoEditor.available():
+      self.editor = MonacoEditor(base_point_size=12)
+      self.editor.set_filename(fname)
+      self.editor.setPlainText(content or "")
+    else:
+      self.editor = CodeEditor(base_point_size=12)
+      self.editor.setPlainText(content or "")
     self.editor.textChanged.connect(self._on_text_changed)
+    if hasattr(self.editor, "cursorPositionChanged"):
+      self.editor.cursorPositionChanged.connect(self._update_cursor_pos)
     editor_lay.addWidget(self.editor, 1)
     lay.addWidget(editor_frame, 1)
 
-    # Syntax highlighting — picked from the file extension; falls back
-    # to plain text (no highlighter) for unrecognised extensions.
-    self._highlighter, self._lang = make_highlighter(self.editor.document(), fname)
+    # Syntax highlighting is handled by Monaco when it is active. The
+    # native editor keeps the existing Qt highlighter as its fallback.
+    if isinstance(self.editor, CodeEditor):
+      self._highlighter, self._lang = make_highlighter(self.editor.document(), fname)
+    else:
+      self._highlighter, self._lang = None, None
     # ── Status bar ─────────────────────────────────────────
     sb_widget = QWidget()
     sb_widget.setObjectName("editor_status")
@@ -2185,17 +2202,24 @@ class FileEditorDialog(QDialog):
     try:
       tail = self._decoder.decode(b"", final=True)
       if tail:
-        cur = self.editor.textCursor()
-        cur.movePosition(QTextCursor.End)
-        cur.insertText(tail)
+        if hasattr(self.editor, "append_text"):
+          self.editor.append_text(tail)
+        else:
+          cur = self.editor.textCursor()
+          cur.movePosition(QTextCursor.End)
+          cur.insertText(tail)
       if total_bytes >= self.MAX_EDIT_BYTES:
-        cur = self.editor.textCursor()
-        cur.movePosition(QTextCursor.End)
-        cur.insertText(
+        truncation = (
           "\n\n[... file truncated at {} -- too large to fully load "
           "into the editor. Download it instead to view the whole "
           "thing.]".format(size_fmt(self.MAX_EDIT_BYTES))
         )
+        if hasattr(self.editor, "append_text"):
+          self.editor.append_text(truncation)
+        else:
+          cur = self.editor.textCursor()
+          cur.movePosition(QTextCursor.End)
+          cur.insertText(truncation)
       self._loading = False
       self._load_bar.hide()
       self.editor.setUndoRedoEnabled(True)
@@ -2342,7 +2366,10 @@ class FileEditorDialog(QDialog):
     c = self.editor.textCursor()
     c.setPosition(start)
     c.setPosition(end, QTextCursor.KeepAnchor)
-    c.insertText(self._replace_inp.text())
+    if hasattr(self.editor, "replace_selection"):
+      self.editor.replace_selection(self._replace_inp.text())
+    else:
+      c.insertText(self._replace_inp.text())
     self._do_highlight()
 
   def _replace_all(self):

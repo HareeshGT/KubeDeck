@@ -26,3 +26,6 @@ pyobjc; sys_platform == "darwin"
 
 # ── Optional: only needed to build the macOS .app bundle ──
 pyinstaller>=6.0
+# ── Optional VS Code-style remote file editor ──
+# Monaco is hosted by Qt WebEngine; the native editor remains the fallback.
+PyQtWebEngine>=5.15.7,<5.16; sys_platform != "linux" or platform_machine != "aarch64"
