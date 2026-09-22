@@ -1908,13 +1908,16 @@ class EC2FileManager(QMainWindow):
     the packet stream ("Garbage packet received").
     """
     if self._preview_worker is not None:
-      self._preview_worker.cancel()
+      worker = self._preview_worker
       self._preview_worker = None
-      # cancel() now closes the worker's handle immediately (see
-      # workers.py), so its chunk_ready/finished_ok/finished_err
-      # callbacks correctly never fire for it — nothing else would
-      # ever move the pane off the "Loading…" text _fetch_preview set,
-      # so reset it here explicitly.
+      try:
+        worker.cancel()
+      except RuntimeError:
+        # Qt may have already destroyed the Python wrapper after the
+        # worker finished. Treat that as already cancelled.
+        pass
+      # Nothing else should move the pane off the previous preview's
+      # loading state after cancellation.
       self.preview.reset_text()
 
   # ── Edit helpers ──────────────────────────────────────────

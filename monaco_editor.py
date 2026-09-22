@@ -21,7 +21,7 @@ except Exception:
     QWebEngineView = None
 
 
-MONACO_VERSION = "0.55.1"
+MONACO_VERSION = "0.34.1"
 
 
 def _language_for(filename: str) -> str:
@@ -69,7 +69,7 @@ def _html():
 <style>
 html,body,#editor{width:100%;height:100%;margin:0;overflow:hidden;background:#0f1117}
 </style>
-<script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.55.1/min/vs/loader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.34.1/min/vs/loader.js"></script>
 <script>
 let editor = null;
 let decorations = [];
@@ -78,7 +78,7 @@ function boot() {
     document.getElementById("editor").innerText = "Monaco could not be loaded.";
     return;
   }
-  require.config({paths:{vs:"https://cdn.jsdelivr.net/npm/monaco-editor@0.55.1/min/vs"}});
+  require.config({paths:{vs:"https://cdn.jsdelivr.net/npm/monaco-editor@0.34.1/min/vs"}});
   require(["vs/editor/editor.main"], function(monaco) {
     editor = monaco.editor.create(document.getElementById("editor"), {
       value: window.initialText || "",

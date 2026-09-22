@@ -2180,9 +2180,16 @@ class FileEditorDialog(QDialog):
       return # dialog is mid-teardown; drop the chunk
     if not text:
       return
-    cur = self.editor.textCursor()
-    cur.movePosition(QTextCursor.End)
-    cur.insertText(text)
+    if hasattr(self.editor, "append_text"):
+      # Monaco has a browser-side model plus a QTextDocument shadow model.
+      # Always use the editor's append API during streaming so both stay
+      # synchronized. Writing only to the shadow model makes an existing
+      # remote file appear as a brand-new/empty file in Monaco.
+      self.editor.append_text(text)
+    else:
+      cur = self.editor.textCursor()
+      cur.movePosition(QTextCursor.End)
+      cur.insertText(text)
     self._chunks_since_sync += 1
 
   def _on_load_progress(self, done, total):
