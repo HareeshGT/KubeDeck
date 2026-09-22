@@ -14,6 +14,11 @@ import time
 import threading
 import sys
 
+try:
+  import sip
+except ImportError:
+  sip = None
+
 from PyQt5.QtWidgets import (
   QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
   QProgressBar, QDialogButtonBox,
@@ -2443,21 +2448,49 @@ class FileEditorDialog(QDialog):
       self.accept()
 
   def _cancel_live_load(self):
-    """Stops a still-running load worker and disconnects its signals
-    so a late chunk/finished/error can't touch a dialog that's mid-
-    close (same pattern used for the media player's teardown)."""
-    if self._load_worker:
+    """Safely stop the live-load worker during dialog teardown.
+
+    QThread calls deleteLater() when it finishes. That means the Python
+    attribute can briefly outlive the underlying QObject. Never touch
+    signals or methods on a wrapper whose C++ object has already gone.
+    """
+    worker = self._load_worker
+    self._load_worker = None
+
+    if worker is None:
+      self._loading = False
+      return
+
+    if sip is not None:
+      try:
+        if sip.isdeleted(worker):
+          self._loading = False
+          return
+      except Exception:
+        pass
+
+    try:
       for sig, slot in (
-        (self._load_worker.chunk_ready, self._on_load_chunk),
-        (self._load_worker.progress,   self._on_load_progress),
-        (self._load_worker.finished_ok, self._on_load_finished),
-        (self._load_worker.finished_err, self._on_load_error),
+        (worker.chunk_ready, self._on_load_chunk),
+        (worker.progress, self._on_load_progress),
+        (worker.finished_ok, self._on_load_finished),
+        (worker.finished_err, self._on_load_error),
       ):
         try:
           sig.disconnect(slot)
-        except Exception:
+        except (TypeError, RuntimeError):
           pass
-      self._load_worker.cancel()
+
+      try:
+        worker.cancel()
+      except RuntimeError:
+        pass
+    except RuntimeError:
+      # Qt can destroy the worker between the lifetime check and the
+      # first signal/method access. Closing the dialog must still win.
+      pass
+    finally:
+      self._loading = False
 
   def _confirm_close(self):
     if self._loading:
