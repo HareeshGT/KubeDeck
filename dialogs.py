@@ -2417,12 +2417,12 @@ class FileEditorDialog(QDialog):
       if self._sudo_user:
         tmp = f"/tmp/.ec2mgr_edit_{os.getpid()}"
         self._sftp._sftp.putfo(io.BytesIO(data), tmp)
-        _, err = self._sftp._run(
+        code, out, err = self._sftp._run(
           f"sudo mv {self._sftp._sq(tmp)} {self._sftp._sq(self._remote)} "
           f"&& sudo chown {self._sudo_user} {self._sftp._sq(self._remote)}"
         )
-        if err.strip():
-          raise PermissionError(err.strip())
+        if code != 0:
+          raise PermissionError((err or out or "sudo save failed").strip())
       else:
         if hasattr(self._sftp, "_ftp"):
           self._sftp.putfo(buf, self._remote)
