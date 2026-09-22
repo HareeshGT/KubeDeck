@@ -31,6 +31,83 @@ else
 fi
 
 # --------------------------------------------------
+# macOS .pkg execution mode
+# --------------------------------------------------
+#
+# macOS Installer runs package scripts as root. KubeDeck's normal
+# installer intentionally uses the logged-in user's Homebrew toolchain.
+# In .pkg mode we therefore keep the overall install elevated (so the
+# final application can be copied into /Applications), while executing
+# Homebrew commands as the active GUI user.
+KUBEDECK_PKG_MODE="${KUBEDECK_PKG_MODE:-0}"
+
+if [[ "$OS" == "Darwin" && "$KUBEDECK_PKG_MODE" == "1" && "$(id -u)" = "0" ]]; then
+  KUBEDECK_INSTALL_USER="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)"
+
+  if [ -z "$KUBEDECK_INSTALL_USER" ] || [ "$KUBEDECK_INSTALL_USER" = "root" ] || [ "$KUBEDECK_INSTALL_USER" = "loginwindow" ]; then
+    echo
+    echo "ERROR: Could not determine the logged-in macOS user."
+    echo "Run the KubeDeck package from an active macOS GUI session."
+    exit 1
+  fi
+
+  KUBEDECK_INSTALL_HOME="$(
+    /usr/bin/dscl . -read "/Users/$KUBEDECK_INSTALL_USER" NFSHomeDirectory 2>/dev/null |
+      awk '{print $2}'
+  )"
+
+  if [ -z "$KUBEDECK_INSTALL_HOME" ]; then
+    echo
+    echo "ERROR: Could not determine the home directory for:"
+    echo "$KUBEDECK_INSTALL_USER"
+    exit 1
+  fi
+
+  KUBEDECK_BREW_BIN=""
+  for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    if [ -x "$candidate" ]; then
+      KUBEDECK_BREW_BIN="$candidate"
+      break
+    fi
+  done
+
+  if [ -z "$KUBEDECK_BREW_BIN" ]; then
+    echo
+    echo "ERROR: Homebrew was not found."
+    echo "Install Homebrew first, then run the KubeDeck .pkg again."
+    exit 1
+  fi
+
+  # Wrapper keeps every existing `brew ...` call in this installer
+  # unchanged while ensuring Homebrew itself never runs as root.
+  brew() {
+    local command_line="$KUBEDECK_BREW_BIN"
+    local arg quoted
+    for arg in "$@"; do
+      printf -v quoted '%q' "$arg"
+      command_line+=" $quoted"
+    done
+    /usr/bin/su - "$KUBEDECK_INSTALL_USER" -c "$command_line"
+  }
+
+  # Use the logged-in user's Homebrew environment for Python/pip paths and
+  # HOME-based application configuration, while retaining root privileges
+  # for the final /Applications installation step.
+  export HOME="$KUBEDECK_INSTALL_HOME"
+  export USER="$KUBEDECK_INSTALL_USER"
+  export LOGNAME="$KUBEDECK_INSTALL_USER"
+  export KUBEDECK_PKG_INSTALL_USER="$KUBEDECK_INSTALL_USER"
+
+  KUBEDECK_BREW_PREFIX="$(brew --prefix)"
+  export PATH="$KUBEDECK_BREW_PREFIX/bin:$PATH"
+
+  echo
+  echo "Package mode: running elevated as root."
+  echo "Homebrew user: $KUBEDECK_INSTALL_USER"
+  echo "Homebrew: $KUBEDECK_BREW_PREFIX"
+fi
+
+# --------------------------------------------------
 # Windows: Relaunch as Administrator if needed
 # --------------------------------------------------
 if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
