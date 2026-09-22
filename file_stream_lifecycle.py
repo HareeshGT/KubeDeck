@@ -1,4 +1,4 @@
-"""Reliable lifecycle for KubeDeck remote file/preview stream workers."""
+"""Reliable lifecycle for KubeDock remote file/preview stream workers."""
 
 from PyQt5 import sip
 from PyQt5.QtCore import QThread

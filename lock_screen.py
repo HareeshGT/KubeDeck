@@ -163,7 +163,7 @@ class _PillField(QWidget):
 class AppLockDialog(QDialog):
   """Modern blocking PIN-entry lock screen."""
 
-  def __init__(self, parent=None, title="KubeDeck is locked"):
+  def __init__(self, parent=None, title="KubeDock is locked"):
     super().__init__(parent)
 
     self.setWindowTitle("Locked")
@@ -655,7 +655,7 @@ class SetPinDialog(QDialog):
     title_box.setSpacing(0)
     title = QLabel("Set a PIN")
     title.setStyleSheet(f"color: {T['TEXT_PRIMARY']}; font-size: 16px; font-weight: 700; background: transparent; border: none;")
-    subtitle = QLabel("Used to lock KubeDeck when idle")
+    subtitle = QLabel("Used to lock KubeDock when idle")
     subtitle.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 12px; background: transparent; border: none;")
     title_box.addWidget(title)
     title_box.addWidget(subtitle)

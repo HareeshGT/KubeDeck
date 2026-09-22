@@ -1,7 +1,7 @@
-"""Monaco editor bridge for KubeDeck's remote file editor.
+"""Monaco editor bridge for KubeDock's remote file editor.
 
 The visible editor is Monaco (VS Code's editor engine) hosted by Qt WebEngine.
-A small QTextDocument shadow model is kept locally so KubeDeck's existing
+A small QTextDocument shadow model is kept locally so KubeDock's existing
 find/replace, save, dirty-state and streaming code can continue to operate
 without rewriting the remote-file layer.
 """
@@ -193,7 +193,7 @@ class MonacoEditor(QWidget):
         layout.setSpacing(0)
 
         if QWebEngineView is None:
-            fallback = QLabel("PyQtWebEngine is not installed.\nUsing the built-in KubeDeck editor.")
+            fallback = QLabel("PyQtWebEngine is not installed.\nUsing the built-in KubeDock editor.")
             layout.addWidget(fallback)
             self._view = None
             return

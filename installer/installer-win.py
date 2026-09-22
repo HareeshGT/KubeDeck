@@ -6,8 +6,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO = "https://github.com/HareeshGT/KubeDeck.git"
-APP = "KubeDeck"
+REPO = "https://github.com/HareeshGT/KubeDock.git"
+APP = "KubeDock"
 ICON = "VM_Visualizer.ico"
 BUILD_ID = "WINDOWS-PYAUDIO-FIX-2026-09-20-R3"
 RECOMMENDED_PYTHON = "3.13"
@@ -50,7 +50,7 @@ def relaunch_as_admin():
 
 def ensure_admin():
     if not is_admin():
-        print("\nAdministrator permissions are required to install KubeDeck into Program Files.")
+        print("\nAdministrator permissions are required to install KubeDock into Program Files.")
         print("Requesting Windows UAC elevation...\n")
         relaunch_as_admin()
         raise SystemExit(0)
@@ -136,7 +136,7 @@ def find_python():
             continue
 
     raise RuntimeError(
-        "SUPPORTED PYTHON NOT FOUND. KubeDeck Windows installation requires "
+        "SUPPORTED PYTHON NOT FOUND. KubeDock Windows installation requires "
         "64-bit Python 3.13 (preferred), 3.12, or 3.11. Python 3.14 is intentionally "
         "rejected because PyAudio 0.2.14 does not provide a CPython 3.14 Windows wheel. "
         "Run 'py --list' to see installed versions."
@@ -167,7 +167,7 @@ def get_branches():
 
 def choose_branch(branches):
     print("\n==========================================")
-    print("KubeDeck GitHub Branch Selection")
+    print("KubeDock GitHub Branch Selection")
     print("==========================================\n")
     for i, branch in enumerate(branches, 1):
         print(f" [{i}] {branch}")
@@ -291,17 +291,17 @@ def build(python, repo):
 
     output = Path(repo) / "dist" / APP
     if not output.is_dir():
-        raise RuntimeError("PyInstaller did not create dist\\KubeDeck")
+        raise RuntimeError("PyInstaller did not create dist\\KubeDock")
     return output
 
 
 def stop_running_kubedeck():
-    """Stop an existing KubeDeck process before replacing its files."""
+    """Stop an existing KubeDock process before replacing its files."""
     if platform.system() != "Windows":
         return
 
     subprocess.run(
-        ["taskkill", "/F", "/IM", "KubeDeck.exe"],
+        ["taskkill", "/F", "/IM", "KubeDock.exe"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
@@ -375,7 +375,7 @@ def copy_windows_bundle(source, destination):
     # Robocopy uses 0-7 for success/non-fatal differences; 8+ is failure.
     if result.returncode >= 8:
         raise RuntimeError(
-            "Robocopy failed while installing KubeDeck "
+            "Robocopy failed while installing KubeDock "
             f"(exit code {result.returncode}).\n{result.stdout}\n{result.stderr}"
         )
 
@@ -402,7 +402,7 @@ def install_application(output):
 
 def main():
     print("==========================================")
-    print(f"KubeDeck Installer: {BUILD_ID}")
+    print(f"KubeDock Installer: {BUILD_ID}")
     print("==========================================")
 
     if platform.system() != "Windows":
@@ -437,10 +437,10 @@ def main():
         destination = install_application(output)
 
         print("\n==========================================")
-        print("KubeDeck installed successfully!")
+        print("KubeDock installed successfully!")
         print("==========================================")
         print("Installed to:", destination)
-        print("Executable:", destination / "KubeDeck.exe")
+        print("Executable:", destination / "KubeDock.exe")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

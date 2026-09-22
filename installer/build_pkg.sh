@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 INSTALLER="$SCRIPT_DIR/installer.sh"
 VERSION="${1:-1.0.0}"
-OUTPUT="${2:-$ROOT/dist/KubeDeck-$VERSION.pkg}"
+OUTPUT="${2:-$ROOT/dist/KubeDock-$VERSION.pkg}"
 
 if [ ! -f "$INSTALLER" ]; then
   echo "ERROR: installer.sh not found: $INSTALLER"

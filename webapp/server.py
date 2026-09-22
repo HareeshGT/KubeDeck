@@ -1,8 +1,8 @@
-"""Embedded KubeDeck Web server.
+"""Embedded KubeDock Web server.
 
 The desktop application supplies its live Paramiko SSHClient through
 ``configure_runtime``. This module never creates an SSH connection of its
-own; commands use KubeDeck's managed SSH session helper from workers.py.
+own; commands use KubeDock's managed SSH session helper from workers.py.
 """
 
 from __future__ import annotations
@@ -73,24 +73,24 @@ def configure_runtime(ssh_provider: Callable[[], Optional[paramiko.SSHClient]]) 
     global _SSH_PROVIDER
     with _RUNTIME_LOCK:
         _SSH_PROVIDER = ssh_provider
-    logger.info("Web runtime attached to KubeDeck SSH provider")
+    logger.info("Web runtime attached to KubeDock SSH provider")
 
 
 def _ssh() -> paramiko.SSHClient:
     with _RUNTIME_LOCK:
         provider = _SSH_PROVIDER
     if provider is None:
-        raise HTTPException(503, "KubeDeck SSH runtime is not attached")
+        raise HTTPException(503, "KubeDock SSH runtime is not attached")
     try:
         client = provider()
     except Exception:
         logger.exception("SSH provider failed")
-        raise HTTPException(503, "KubeDeck SSH runtime is unavailable")
+        raise HTTPException(503, "KubeDock SSH runtime is unavailable")
     if client is None:
-        raise HTTPException(503, "Connect to a VM in KubeDeck first")
+        raise HTTPException(503, "Connect to a VM in KubeDock first")
     transport = client.get_transport()
     if transport is None or not transport.is_active():
-        raise HTTPException(503, "KubeDeck SSH connection is not active")
+        raise HTTPException(503, "KubeDock SSH connection is not active")
     return client
 
 
@@ -175,10 +175,10 @@ def _safe_user_agent(request: Request) -> str:
 
 
 def _lookup_client_mac(client_ip: str) -> str:
-    """Best-effort MAC lookup from the KubeDeck host's local neighbor/ARP table.
+    """Best-effort MAC lookup from the KubeDock host's local neighbor/ARP table.
 
     MAC addresses are normally available only when the requesting device is on
-    the same Layer-2 network as the KubeDeck host. Forwarded MAC/IP headers are
+    the same Layer-2 network as the KubeDock host. Forwarded MAC/IP headers are
     intentionally ignored.
     """
     try:
@@ -374,7 +374,7 @@ def require_login(
 ) -> None:
     username, password_hash, password_salt, legacy_password = _credentials()
     if not username or not (password_hash and password_salt or legacy_password):
-        raise HTTPException(503, "Web App login is not configured in KubeDeck Settings")
+        raise HTTPException(503, "Web App login is not configured in KubeDock Settings")
 
     client_ip = _client_ip(request)
     retry_after = _auth_block_seconds(client_ip)
@@ -426,7 +426,7 @@ def require_login(
     _log_client_identity(request, username)
 
 
-app = FastAPI(title="KubeDeck Web")
+app = FastAPI(title="KubeDock Web")
 
 
 @app.middleware("http")
@@ -809,7 +809,7 @@ def start_server(
         try:
             selected_port, reserved_socket = _reserve_port(host, preferred_port)
         except OSError:
-            logger.exception("Unable to start KubeDeck Web server")
+            logger.exception("Unable to start KubeDock Web server")
             return False
 
         config = uvicorn.Config(
@@ -826,7 +826,7 @@ def start_server(
 
         def run() -> None:
             logger.info(
-                "Starting KubeDeck Web on http://%s:%s",
+                "Starting KubeDock Web on http://%s:%s",
                 host,
                 selected_port,
             )
@@ -839,11 +839,11 @@ def start_server(
                     reserved_socket.close()
                 except OSError:
                     pass
-                logger.info("KubeDeck Web server stopped")
+                logger.info("KubeDock Web server stopped")
 
         _server_thread = threading.Thread(
             target=run,
-            name="KubeDeck-Web",
+            name="KubeDock-Web",
             daemon=True,
         )
         _server_thread.start()
@@ -859,7 +859,7 @@ def stop_server(timeout: float = 3.0) -> None:
         _server_port = None
 
     if server is not None:
-        logger.info("Stopping KubeDeck Web server")
+        logger.info("Stopping KubeDock Web server")
         server.should_exit = True
 
     if thread is not None and thread.is_alive():

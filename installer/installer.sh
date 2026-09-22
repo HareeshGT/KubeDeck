@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="https://github.com/HareeshGT/KubeDeck.git"
+REPO="https://github.com/HareeshGT/KubeDock.git"
 DIR="VM-Visualizer"
 
 OS="$(uname -s)"
@@ -34,7 +34,7 @@ fi
 # macOS .pkg execution mode
 # --------------------------------------------------
 #
-# macOS Installer runs package scripts as root. KubeDeck's normal
+# macOS Installer runs package scripts as root. KubeDock's normal
 # installer intentionally uses the logged-in user's Homebrew toolchain.
 # In .pkg mode we therefore keep the overall install elevated (so the
 # final application can be copied into /Applications), while executing
@@ -47,7 +47,7 @@ if [[ "$OS" == "Darwin" && "$KUBEDECK_PKG_MODE" == "1" && "$(id -u)" = "0" ]]; t
   if [ -z "$KUBEDECK_INSTALL_USER" ] || [ "$KUBEDECK_INSTALL_USER" = "root" ] || [ "$KUBEDECK_INSTALL_USER" = "loginwindow" ]; then
     echo
     echo "ERROR: Could not determine the logged-in macOS user."
-    echo "Run the KubeDeck package from an active macOS GUI session."
+    echo "Run the KubeDock package from an active macOS GUI session."
     exit 1
   fi
 
@@ -74,7 +74,7 @@ if [[ "$OS" == "Darwin" && "$KUBEDECK_PKG_MODE" == "1" && "$(id -u)" = "0" ]]; t
   if [ -z "$KUBEDECK_BREW_BIN" ]; then
     echo
     echo "ERROR: Homebrew was not found."
-    echo "Install Homebrew first, then run the KubeDeck .pkg again."
+    echo "Install Homebrew first, then run the KubeDock .pkg again."
     exit 1
   fi
 
@@ -148,7 +148,7 @@ SELECTED_BRANCH="${1:-}"
 
 echo
 echo "=========================================="
-echo "KubeDeck GitHub Branch Selection"
+echo "KubeDock GitHub Branch Selection"
 echo "=========================================="
 echo
 
@@ -268,7 +268,7 @@ if [ -d "$DIR/.git" ]; then
   echo "Git commit:"
   git log -1 --oneline
 else
-  echo "Cloning KubeDeck branch '$SELECTED_BRANCH'..."
+  echo "Cloning KubeDock branch '$SELECTED_BRANCH'..."
   git clone --branch "$SELECTED_BRANCH" --single-branch "$REPO" "$DIR"
   cd "$DIR"
 
@@ -599,14 +599,14 @@ fi
 # --------------------------------------------------
 
 echo
-echo "Preparing KubeDeck Web UI assets..."
+echo "Preparing KubeDock Web UI assets..."
 
 WEBAPP_INDEX="webapp/static/index.html"
 WEBAPP_FALLBACK="webapp/static_content.py"
 
 if [ ! -f "$WEBAPP_INDEX" ]; then
   echo
-  echo "ERROR: KubeDeck Web UI was not found:"
+  echo "ERROR: KubeDock Web UI was not found:"
   echo "$WEBAPP_INDEX"
   exit 1
 fi
@@ -625,7 +625,7 @@ target = Path("webapp/static_content.py")
 html = source.read_bytes()
 encoded = base64.b64encode(gzip.compress(html, compresslevel=9)).decode("ascii")
 target.write_text(
-    "# Auto-generated fallback used when KubeDeck runs from a PyInstaller bundle.\n"
+    "# Auto-generated fallback used when KubeDock runs from a PyInstaller bundle.\n"
     "# Source: webapp/static/index.html\n"
     "import base64\n"
     "import gzip\n\n"
@@ -668,12 +668,12 @@ echo
 echo "Cleaning previous PyInstaller build..."
 
 rm -rf build
-rm -rf "dist/KubeDeck.app"
-rm -rf "dist/KubeDeck"
+rm -rf "dist/KubeDock.app"
+rm -rf "dist/KubeDock"
 
 # Remove stale spec so the generated build always reflects
 # the current project state.
-rm -f "KubeDeck.spec"
+rm -f "KubeDock.spec"
 
 # --------------------------------------------------
 # Build
@@ -689,7 +689,7 @@ CMD=(
   --windowed
   --onedir
   --name
-  "KubeDeck"
+  "KubeDock"
   --osx-bundle-identifier
   "com.hareeshgt.ec2manager"
 
@@ -723,7 +723,7 @@ if [ -n "$ICON" ]; then
   )
 fi
 
-# Bundle KubeDeck SVG icons into the PyInstaller application.
+# Bundle KubeDock SVG icons into the PyInstaller application.
 # PyInstaller uses ":" on macOS/Linux and ";" on Windows.
 if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
   CMD=(
@@ -763,7 +763,7 @@ fi
 
 if [[ "$OS" == "Darwin" ]]; then
 
-  APP_PATH="dist/KubeDeck.app"
+  APP_PATH="dist/KubeDock.app"
   APP_PLIST="$APP_PATH/Contents/Info.plist"
 
   # Finder-launched apps need an explicit microphone usage description.
@@ -785,7 +785,7 @@ if [[ "$OS" == "Darwin" ]]; then
     "$APP_PLIST" 2>/dev/null || true
 
   /usr/libexec/PlistBuddy \
-    -c "Add :NSMicrophoneUsageDescription string 'KubeDeck uses the microphone for Kubernetes voice commands.'" \
+    -c "Add :NSMicrophoneUsageDescription string 'KubeDock uses the microphone for Kubernetes voice commands.'" \
     "$APP_PLIST"
 
   # Give the application a stable bundle identifier.
@@ -853,7 +853,7 @@ Darwin)
   echo
   echo "Installing on macOS..."
 
-  APP_PATH="dist/KubeDeck.app"
+  APP_PATH="dist/KubeDock.app"
 
   if [ ! -d "$APP_PATH" ]; then
     echo
@@ -862,12 +862,12 @@ Darwin)
     exit 1
   fi
 
-  $SUDO rm -rf "/Applications/KubeDeck.app"
+  $SUDO rm -rf "/Applications/KubeDock.app"
   $SUDO cp -R "$APP_PATH" "/Applications/"
 
   echo
   echo "Installed:"
-  echo "/Applications/KubeDeck.app"
+  echo "/Applications/KubeDock.app"
   ;;
 
 Linux)
@@ -875,24 +875,24 @@ Linux)
   echo
   echo "Installing on Linux..."
 
-  if [ ! -d "dist/KubeDeck" ]; then
+  if [ ! -d "dist/KubeDock" ]; then
     echo
     echo "ERROR: PyInstaller did not create:"
-    echo "dist/KubeDeck"
+    echo "dist/KubeDock"
     exit 1
   fi
 
-  $SUDO rm -rf "/opt/KubeDeck"
-  $SUDO mkdir -p "/opt/KubeDeck"
-  $SUDO cp -R "dist/KubeDeck/." "/opt/KubeDeck/"
+  $SUDO rm -rf "/opt/KubeDock"
+  $SUDO mkdir -p "/opt/KubeDock"
+  $SUDO cp -R "dist/KubeDock/." "/opt/KubeDock/"
 
   if [ -d "/usr/local/bin" ] || $SUDO mkdir -p "/usr/local/bin" 2>/dev/null; then
-    $SUDO ln -sf "/opt/KubeDeck/KubeDeck" "/usr/local/bin/kubedeck" 2>/dev/null || true
+    $SUDO ln -sf "/opt/KubeDock/KubeDock" "/usr/local/bin/kubedeck" 2>/dev/null || true
   fi
 
   if [ -n "$ICON" ] && [ -f "$ICON" ]; then
-    $SUDO mkdir -p "/opt/KubeDeck/icon" 2>/dev/null || true
-    $SUDO cp "$ICON" "/opt/KubeDeck/icon/KubeDeck.ico" 2>/dev/null || true
+    $SUDO mkdir -p "/opt/KubeDock/icon" 2>/dev/null || true
+    $SUDO cp "$ICON" "/opt/KubeDock/icon/KubeDock.ico" 2>/dev/null || true
   fi
 
   if $SUDO mkdir -p "/usr/share/applications" 2>/dev/null; then
@@ -900,10 +900,10 @@ Linux)
     cat > "$DESKTOP_FILE" <<EOF
 [Desktop Entry]
 Type=Application
-Name=KubeDeck
+Name=KubeDock
 Comment=Kubernetes / VM visualizer and manager
-Exec=/opt/KubeDeck/KubeDeck
-Icon=/opt/KubeDeck/icon/KubeDeck.ico
+Exec=/opt/KubeDock/KubeDock
+Icon=/opt/KubeDock/icon/KubeDock.ico
 Terminal=false
 Categories=Development;Utility;
 EOF
@@ -913,7 +913,7 @@ EOF
 
   echo
   echo "Installed:"
-  echo "/opt/KubeDeck"
+  echo "/opt/KubeDock"
   echo "Run from any terminal with: kubedeck"
   ;;
 
@@ -922,19 +922,19 @@ MINGW*|MSYS*|CYGWIN*)
   echo
   echo "Installing on Windows..."
 
-  INSTALL_DIR="/c/Program Files/KubeDeck"
+  INSTALL_DIR="/c/Program Files/KubeDock"
 
-  if [ ! -d "dist/KubeDeck" ]; then
+  if [ ! -d "dist/KubeDock" ]; then
     echo
     echo "ERROR: PyInstaller did not create:"
-    echo "dist/KubeDeck"
+    echo "dist/KubeDock"
     exit 1
   fi
 
   rm -rf "$INSTALL_DIR"
   mkdir -p "$INSTALL_DIR"
 
-  cp -R "dist/KubeDeck/." "$INSTALL_DIR/"
+  cp -R "dist/KubeDock/." "$INSTALL_DIR/"
 
   echo
   echo "Installed to:"
@@ -961,7 +961,7 @@ rm -rf "$DIR"
 
 echo
 echo "=========================================="
-echo "KubeDeck installed successfully!"
+echo "KubeDock installed successfully!"
 echo "=========================================="
 echo
 echo "Built from GitHub branch:"

@@ -1,4 +1,4 @@
-"""KubeDeck SVG icon helpers.
+"""KubeDock SVG icon helpers.
 
 Icons are stored under assets/icons and rendered with Qt's SVG renderer.
 The helpers below preserve the public API used by the existing application.

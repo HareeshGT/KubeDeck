@@ -584,7 +584,7 @@ def _general_question_response(request: str, namespace: str = None):
 
   if any(phrase in clean for phrase in identity_patterns):
     return (
-      "I'm the Kubernetes Ops Mind assistant in KubeDeck. "
+      "I'm the Kubernetes Ops Mind assistant in KubeDock. "
       "I can interpret Kubernetes requests and run approved "
       "operations."
     )

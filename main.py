@@ -1,4 +1,4 @@
-"""main.py — Application entry point for KubeDeck."""
+"""main.py — Application entry point for KubeDock."""
 
 import sys
 
@@ -48,7 +48,7 @@ def main() -> int:
         )
 
     app = QApplication(sys.argv)
-    app.setApplicationName("KubeDeck")
+    app.setApplicationName("KubeDock")
     app.setOrganizationName("EC2Manager")
 
     if "Fusion" in QStyleFactory.keys():
@@ -61,7 +61,7 @@ def main() -> int:
     window_ref = {}
 
     # The web server lives with the desktop process. It receives a callback
-    # to the current EC2FileManager.ssh object, so reconnecting in KubeDeck
+    # to the current EC2FileManager.ssh object, so reconnecting in KubeDock
     # automatically changes the SSH connection used by the web app too.
     app.aboutToQuit.connect(webapp_app.stop_server)
 

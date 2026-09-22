@@ -2,20 +2,20 @@
 
 set -euo pipefail
 
-APP_NAME="KubeDeck"
-MAC_APP="/Applications/KubeDeck.app"
-MAC_USER_APP="$HOME/Applications/KubeDeck.app"
-LINUX_APP="/opt/KubeDeck"
-WINDOWS_APP="/c/Program Files/KubeDeck"
+APP_NAME="KubeDock"
+MAC_APP="/Applications/KubeDock.app"
+MAC_USER_APP="$HOME/Applications/KubeDock.app"
+LINUX_APP="/opt/KubeDock"
+WINDOWS_APP="/c/Program Files/KubeDock"
 
 OS="$(uname -s)"
 
 echo
 echo "=========================================="
-echo "          KubeDeck Uninstaller"
+echo "          KubeDock Uninstaller"
 echo "=========================================="
 echo
-echo "This will remove KubeDeck and KubeDeck-related"
+echo "This will remove KubeDock and KubeDock-related"
 echo "voice/audio components installed by the installer."
 echo
 
@@ -23,7 +23,7 @@ echo
 # Confirmation
 # --------------------------------------------------
 
-read -r -p "Continue with complete KubeDeck uninstall? [y/N]: " CONFIRM
+read -r -p "Continue with complete KubeDock uninstall? [y/N]: " CONFIRM
 
 case "$CONFIRM" in
     y|Y|yes|YES) ;;
@@ -52,28 +52,28 @@ remove_path() {
 }
 
 # --------------------------------------------------
-# Stop KubeDeck
+# Stop KubeDock
 # --------------------------------------------------
 
-echo "Stopping KubeDeck..."
+echo "Stopping KubeDock..."
 
 if command -v osascript >/dev/null 2>&1; then
-    osascript -e 'tell application "KubeDeck" to quit' >/dev/null 2>&1 || true
+    osascript -e 'tell application "KubeDock" to quit' >/dev/null 2>&1 || true
 fi
 
-pkill -f "/KubeDeck.app/" >/dev/null 2>&1 || true
-pkill -f "KubeDeck" >/dev/null 2>&1 || true
+pkill -f "/KubeDock.app/" >/dev/null 2>&1 || true
+pkill -f "KubeDock" >/dev/null 2>&1 || true
 
 sleep 2
 
-echo "  ✓ KubeDeck processes stopped"
+echo "  ✓ KubeDock processes stopped"
 
 # --------------------------------------------------
 # Remove application
 # --------------------------------------------------
 
 echo
-echo "Removing KubeDeck application..."
+echo "Removing KubeDock application..."
 
 case "$OS" in
 
@@ -82,7 +82,7 @@ case "$OS" in
             sudo rm -rf "$MAC_APP"
             echo "  ✓ Removed $MAC_APP"
         else
-            echo "  ✓ /Applications/KubeDeck.app not found"
+            echo "  ✓ /Applications/KubeDock.app not found"
         fi
 
         if [ -d "$MAC_USER_APP" ]; then
@@ -96,7 +96,7 @@ case "$OS" in
             sudo rm -rf "$LINUX_APP"
             echo "  ✓ Removed $LINUX_APP"
         else
-            echo "  ✓ /opt/KubeDeck not found"
+            echo "  ✓ /opt/KubeDock not found"
         fi
         ;;
 
@@ -105,7 +105,7 @@ case "$OS" in
             rm -rf "$WINDOWS_APP"
             echo "  ✓ Removed $WINDOWS_APP"
         else
-            echo "  ✓ Windows KubeDeck installation not found"
+            echo "  ✓ Windows KubeDock installation not found"
         fi
         ;;
 
@@ -115,71 +115,71 @@ case "$OS" in
 esac
 
 # --------------------------------------------------
-# Remove KubeDeck user data
+# Remove KubeDock user data
 # --------------------------------------------------
 
 echo
-echo "Removing KubeDeck user data..."
+echo "Removing KubeDock user data..."
 
 if [[ "$OS" == "Darwin" ]]; then
 
     remove_path "$HOME/.vm_visualizer" \
-        "KubeDeck legacy user data"
-    remove_path "$HOME/Library/Application Support/KubeDeck" \
-        "KubeDeck Application Support"
+        "KubeDock legacy user data"
+    remove_path "$HOME/Library/Application Support/KubeDock" \
+        "KubeDock Application Support"
 
     remove_path "$HOME/Library/Application Support/kubedeck" \
-        "KubeDeck Application Support"
+        "KubeDock Application Support"
 
-    remove_path "$HOME/Library/Caches/KubeDeck" \
-        "KubeDeck cache"
+    remove_path "$HOME/Library/Caches/KubeDock" \
+        "KubeDock cache"
 
     remove_path "$HOME/Library/Caches/kubedeck" \
-        "KubeDeck cache"
+        "KubeDock cache"
 
-    remove_path "$HOME/Library/Logs/KubeDeck" \
-        "KubeDeck logs"
+    remove_path "$HOME/Library/Logs/KubeDock" \
+        "KubeDock logs"
 
     remove_path "$HOME/Library/Logs/kubedeck" \
-        "KubeDeck logs"
+        "KubeDock logs"
 
-    remove_path "$HOME/Library/WebKit/KubeDeck" \
-        "KubeDeck WebKit data"
+    remove_path "$HOME/Library/WebKit/KubeDock" \
+        "KubeDock WebKit data"
 
     remove_path "$HOME/Library/WebKit/kubedeck" \
-        "KubeDeck WebKit data"
+        "KubeDock WebKit data"
 
     # Preferences can be .plist files with either capitalization.
     find "$HOME/Library/Preferences" -maxdepth 1 -type f \
-        \( -iname "*KubeDeck*.plist" -o -iname "*kubedeck*.plist" \) \
+        \( -iname "*KubeDock*.plist" -o -iname "*kubedeck*.plist" \) \
         -print -exec rm -f {} + 2>/dev/null || true
 
     # Saved state
     find "$HOME/Library/Saved Application State" -maxdepth 1 \
-        \( -iname "*KubeDeck*" -o -iname "*kubedeck*" \) \
+        \( -iname "*KubeDock*" -o -iname "*kubedeck*" \) \
         -print -exec rm -rf {} + 2>/dev/null || true
 
-    echo "  ✓ macOS KubeDeck user data removed"
+    echo "  ✓ macOS KubeDock user data removed"
 
 elif [[ "$OS" == Linux* ]]; then
 
-    remove_path "$HOME/.config/KubeDeck" "KubeDeck config"
-    remove_path "$HOME/.config/kubedeck" "KubeDeck config"
-    remove_path "$HOME/.cache/KubeDeck" "KubeDeck cache"
-    remove_path "$HOME/.cache/kubedeck" "KubeDeck cache"
-    remove_path "$HOME/.local/share/KubeDeck" "KubeDeck data"
-    remove_path "$HOME/.local/share/kubedeck" "KubeDeck data"
+    remove_path "$HOME/.config/KubeDock" "KubeDock config"
+    remove_path "$HOME/.config/kubedeck" "KubeDock config"
+    remove_path "$HOME/.cache/KubeDock" "KubeDock cache"
+    remove_path "$HOME/.cache/kubedeck" "KubeDock cache"
+    remove_path "$HOME/.local/share/KubeDock" "KubeDock data"
+    remove_path "$HOME/.local/share/kubedeck" "KubeDock data"
 
-    echo "  ✓ Linux KubeDeck user data removed"
+    echo "  ✓ Linux KubeDock user data removed"
 
 fi
 
 # --------------------------------------------------
-# Remove KubeDeck-specific Python environments
+# Remove KubeDock-specific Python environments
 # --------------------------------------------------
 
 echo
-echo "Removing KubeDeck-specific Python environments..."
+echo "Removing KubeDock-specific Python environments..."
 
 KUBEDECK_PYTHON_ENVS=(
     "$HOME/.kubedeck"
@@ -187,8 +187,8 @@ KUBEDECK_PYTHON_ENVS=(
     "$HOME/.venvs/kubedeck"
     "$HOME/venv/kubedeck"
     "$HOME/virtualenvs/kubedeck"
-    "$HOME/KubeDeck/.venv"
-    "$HOME/KubeDeck/venv"
+    "$HOME/KubeDock/.venv"
+    "$HOME/KubeDock/venv"
     "$HOME/VM-Visualizer/.venv"
     "$HOME/VM-Visualizer/venv"
 )
@@ -200,14 +200,14 @@ for ENV_PATH in "${KUBEDECK_PYTHON_ENVS[@]}"; do
     fi
 done
 
-echo "  ✓ KubeDeck-specific Python environments cleaned"
+echo "  ✓ KubeDock-specific Python environments cleaned"
 
 # --------------------------------------------------
 # Audio / speech dependency cleanup
 # --------------------------------------------------
 
 echo
-echo "KubeDeck voice/audio dependencies:"
+echo "KubeDock voice/audio dependencies:"
 echo
 echo "  • Google Web Speech / SpeechRecognition"
 echo "  • PyAudio"
@@ -241,10 +241,10 @@ if [ "$REMOVE_DEPS" = true ]; then
         if command -v brew >/dev/null 2>&1; then
 
             # These are the native dependencies explicitly installed
-            # by the KubeDeck installer.
+            # by the KubeDock installer.
             #
             # Note: Homebrew cannot reliably tell us whether another
-            # application needed these packages before KubeDeck.
+            # application needed these packages before KubeDock.
             # Therefore removal is explicitly confirmed above.
 
             if brew list --formula portaudio >/dev/null 2>&1; then
@@ -266,7 +266,7 @@ if [ "$REMOVE_DEPS" = true ]; then
             # The installer uses Homebrew Python 3.14.
             # Only remove it when the user explicitly confirms it.
             echo
-            read -r -p "Also remove Homebrew Python 3.14 installed/used by KubeDeck? [y/N]: " REMOVE_PYTHON
+            read -r -p "Also remove Homebrew Python 3.14 installed/used by KubeDock? [y/N]: " REMOVE_PYTHON
 
             case "$REMOVE_PYTHON" in
                 y|Y|yes|YES)
@@ -380,31 +380,31 @@ else
 fi
 
 # --------------------------------------------------
-# Remove KubeDeck temporary files
+# Remove KubeDock temporary files
 # --------------------------------------------------
 
 echo
-echo "Removing temporary KubeDeck files..."
+echo "Removing temporary KubeDock files..."
 
 if [[ "$OS" == "Darwin" || "$OS" == Linux* ]]; then
 
     TMP_DIR="${TMPDIR:-/tmp}"
 
-    remove_path "/tmp/KubeDeck" "temporary KubeDeck files"
-    remove_path "/tmp/kubedeck" "temporary KubeDeck files"
-    remove_path "$TMP_DIR/KubeDeck" "temporary KubeDeck files"
-    remove_path "$TMP_DIR/kubedeck" "temporary KubeDeck files"
+    remove_path "/tmp/KubeDock" "temporary KubeDock files"
+    remove_path "/tmp/kubedeck" "temporary KubeDock files"
+    remove_path "$TMP_DIR/KubeDock" "temporary KubeDock files"
+    remove_path "$TMP_DIR/kubedeck" "temporary KubeDock files"
 
 fi
 
 echo "  ✓ Temporary files cleaned"
 
 # --------------------------------------------------
-# Remove KubeDeck launch agents/services
+# Remove KubeDock launch agents/services
 # --------------------------------------------------
 
 echo
-echo "Removing KubeDeck launch agents/services..."
+echo "Removing KubeDock launch agents/services..."
 
 if [[ "$OS" == "Darwin" ]]; then
 
@@ -426,14 +426,14 @@ if [[ "$OS" == "Darwin" ]]; then
             fi
         done < <(
             find "$LAUNCH_DIR" -maxdepth 1 -type f \
-                \( -iname "*KubeDeck*.plist" -o -iname "*kubedeck*.plist" \) \
+                \( -iname "*KubeDock*.plist" -o -iname "*kubedeck*.plist" \) \
                 2>/dev/null
         )
     fi
 
 elif [[ "$OS" == Linux* ]]; then
 
-    # Remove only KubeDeck-named user systemd units.
+    # Remove only KubeDock-named user systemd units.
     SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 
     if [ -d "$SYSTEMD_USER_DIR" ]; then
@@ -449,7 +449,7 @@ elif [[ "$OS" == Linux* ]]; then
             echo "  ✓ Removed user service: $UNIT_NAME"
         done < <(
             find "$SYSTEMD_USER_DIR" -maxdepth 1 -type f \
-                \( -iname "*KubeDeck*.service" -o -iname "*kubedeck*.service" \) \
+                \( -iname "*KubeDock*.service" -o -iname "*kubedeck*.service" \) \
                 2>/dev/null
         )
 
@@ -458,7 +458,7 @@ elif [[ "$OS" == Linux* ]]; then
 
 fi
 
-echo "  ✓ KubeDeck launch/service entries checked"
+echo "  ✓ KubeDock launch/service entries checked"
 
 # --------------------------------------------------
 # macOS application cache refresh
@@ -477,49 +477,49 @@ fi
 
 echo
 echo "=========================================="
-echo "       KubeDeck Uninstall Complete"
+echo "       KubeDock Uninstall Complete"
 echo "=========================================="
 echo
 
 case "$OS" in
     Darwin)
         if [ -d "$MAC_APP" ] || [ -d "$MAC_USER_APP" ]; then
-            echo "  ! KubeDeck application still exists"
+            echo "  ! KubeDock application still exists"
         else
-            echo "  ✓ KubeDeck application removed"
+            echo "  ✓ KubeDock application removed"
         fi
         ;;
     Linux*)
         if [ -d "$LINUX_APP" ]; then
-            echo "  ! /opt/KubeDeck still exists"
+            echo "  ! /opt/KubeDock still exists"
         else
-            echo "  ✓ KubeDeck application removed"
+            echo "  ✓ KubeDock application removed"
         fi
         ;;
     MINGW*|MSYS*|CYGWIN*)
         if [ -d "$WINDOWS_APP" ]; then
-            echo "  ! Windows KubeDeck directory still exists"
+            echo "  ! Windows KubeDock directory still exists"
         else
-            echo "  ✓ KubeDeck application removed"
+            echo "  ✓ KubeDock application removed"
         fi
         ;;
 esac
 
-if pgrep -f "KubeDeck" >/dev/null 2>&1; then
-    echo "  ! A KubeDeck process is still running"
+if pgrep -f "KubeDock" >/dev/null 2>&1; then
+    echo "  ! A KubeDock process is still running"
 else
-    echo "  ✓ No KubeDeck process detected"
+    echo "  ✓ No KubeDock process detected"
 fi
 
 echo
 echo "Cleanup performed:"
-echo "  ✓ KubeDeck application"
-echo "  ✓ KubeDeck caches"
-echo "  ✓ KubeDeck preferences"
-echo "  ✓ KubeDeck application data"
-echo "  ✓ KubeDeck temporary files"
-echo "  ✓ KubeDeck-specific Python environments"
-echo "  ✓ KubeDeck launch agents/services"
+echo "  ✓ KubeDock application"
+echo "  ✓ KubeDock caches"
+echo "  ✓ KubeDock preferences"
+echo "  ✓ KubeDock application data"
+echo "  ✓ KubeDock temporary files"
+echo "  ✓ KubeDock-specific Python environments"
+echo "  ✓ KubeDock launch agents/services"
 
 if [ "$REMOVE_DEPS" = true ]; then
     echo "  ✓ SpeechRecognition / Google Web Speech Python packages"

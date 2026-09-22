@@ -1,6 +1,6 @@
-"""KubeDeck Web application entry point.
+"""KubeDock Web application entry point.
 
-The implementation lives in :mod:`webapp.server` so the desktop KubeDeck
+The implementation lives in :mod:`webapp.server` so the desktop KubeDock
 process can import the FastAPI app without creating a second SSH connection.
 """
 

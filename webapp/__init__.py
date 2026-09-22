@@ -1,1 +1,1 @@
-"""Embedded KubeDeck Web package."""
+"""Embedded KubeDock Web package."""
