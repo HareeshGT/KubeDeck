@@ -21,7 +21,7 @@ import re
 from PyQt5.QtWidgets import QPlainTextEdit, QWidget
 from PyQt5.QtCore import Qt, QRect, QSize
 from PyQt5.QtGui import (
-    QColor, QPainter, QTextFormat, QTextCharFormat, QFont,
+    QColor, QPainter, QPen, QTextFormat, QTextCharFormat, QFont,
     QSyntaxHighlighter, QTextCursor,
 )
 
