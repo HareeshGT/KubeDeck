@@ -52,6 +52,13 @@ from progress_ring import CircularProgress
 
 REFRESH_MS = 3000 # live-dashboard cadence; never overlaps an in-flight refresh
 
+# Pod placement is collected independently from the large Kubernetes
+# dashboard snapshot. This query is tiny and fast, so node pod counts do not
+# depend on the completion/size of workloads, events, metrics, or pod details.
+_PODMAP_CMD = r"""
+kubectl get pods --all-namespaces -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' --no-headers 2>/dev/null
+"""
+
 
 class _FTPDashboardWorker(QThread):
   """Collect richer FTP/FTPS server and current-directory information.
@@ -411,16 +418,6 @@ else
 
  echo __TOP__
  kubectl top nodes --no-headers 2>/dev/null
-
- # Pod placement is the critical dashboard value. Collect this compact
- # snapshot BEFORE any detailed pod/workload queries so a later slow query
- # cannot prevent the node pod counts from reaching the client.
- echo __PODNODEMAP__
- podmap_status=0
- podmap_output=$(kubectl get pods --all-namespaces -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' --no-headers 2>/dev/null) || podmap_status=$?
- printf '%s\\n' "$podmap_output"
- echo __PODNODEMAP_STATUS__
- printf '%s\\n' "$podmap_status"
 
  echo __NAMESPACES__
  kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null
@@ -1392,12 +1389,14 @@ class DashboardTab(QWidget):
     self._busy  = False
     self._host_done = False
     self._k8s_done = False
+    self._podmap_done = False
     self._refresh_started_at = 0.0
     # Keep each collection cycle isolated. Workers only fill these
     # buffers; the UI is updated once BOTH snapshots belong to the same
     # cycle. This prevents mixed-time host/Kubernetes data.
     self._host_snapshot = None
     self._k8s_snapshot = None
+    self._podmap_snapshot = None
     self._snapshot_generation = 0
     self._workers = []
 
@@ -2233,6 +2232,18 @@ class DashboardTab(QWidget):
     self._update_live_label()
 
   # ── Refresh ────────────────────────────────────────────────
+  def _contextual_command(self, command: str) -> str:
+    ctx = (self._kube_context or "").strip()
+    if not ctx:
+      return command
+    flag = f"--context={shlex.quote(ctx)}"
+    return re.sub(
+      r"(^\s*)kubectl(?=\s)",
+      lambda m: m.group(1) + "kubectl " + flag,
+      command,
+      flags=re.MULTILINE,
+    )
+
   def _contextual_k8s_command(self) -> str:
     """Bind every kubectl invocation in the dashboard snapshot to the
     selected context. The `=value` form is deliberate: context names are
@@ -2259,8 +2270,10 @@ class DashboardTab(QWidget):
     self._busy = True
     self._host_done = False
     self._k8s_done = False
+    self._podmap_done = False
     self._host_snapshot = None
     self._k8s_snapshot = None
+    self._podmap_snapshot = None
     self._snapshot_generation += 1
     generation = self._snapshot_generation
     self._refresh_started_at = time.monotonic()
@@ -2278,14 +2291,35 @@ class DashboardTab(QWidget):
     track_worker(self._workers, k8s_worker)
     k8s_worker.start()
 
+    # Run pod placement independently. The main Kubernetes snapshot can take
+    # several seconds because it also collects workloads, services, events,
+    # metrics, and detailed pod state. Node pod counts must not wait on that.
+    podmap_worker = CommandWorker(
+      self.ssh,
+      self._contextual_command(_PODMAP_CMD),
+      timeout=15,
+    )
+    podmap_worker.done.connect(
+      lambda out, g=generation: self._on_podmap_stats(out)
+      if g == self._snapshot_generation else None
+    )
+    podmap_worker.error.connect(
+      lambda err, g=generation: self._on_podmap_error(err)
+      if g == self._snapshot_generation else None
+    )
+    track_worker(self._workers, podmap_worker)
+    podmap_worker.start()
+
   def _worker_finished(self, worker_name: str):
     """Finish one side of the current cycle and atomically publish both."""
     if worker_name == "host":
       self._host_done = True
     elif worker_name == "k8s":
       self._k8s_done = True
+    elif worker_name == "podmap":
+      self._podmap_done = True
 
-    if not (self._host_done and self._k8s_done):
+    if not (self._host_done and self._k8s_done and self._podmap_done):
       return
 
     # Both outputs now belong to exactly this refresh generation.
@@ -2306,6 +2340,9 @@ class DashboardTab(QWidget):
       self._on_host_render_error()
 
     if k8s_out is not None:
+      if self._podmap_snapshot is not None:
+        k8s_out += "\n__PODNODEMAP__\n" + self._podmap_snapshot
+        k8s_out += "\n__PODNODEMAP_STATUS__\n0\n"
       self._render_k8s_stats(k8s_out)
     else:
       self._render_k8s_error(k8s_error or "snapshot collection failed")
@@ -2513,6 +2550,15 @@ class DashboardTab(QWidget):
     self._worker_finished("host")
 
   # ── Kubernetes stats ──────────────────────────────────────
+  def _on_podmap_stats(self, out: str):
+    self._podmap_snapshot = out
+    self._worker_finished("podmap")
+
+  def _on_podmap_error(self, err: str):
+    self._podmap_snapshot = None
+    self._podmap_error = err
+    self._worker_finished("podmap")
+
   def _on_k8s_stats(self, out: str):
     # Collection callback: hold the raw snapshot until the host snapshot
     # for this same cycle is also complete.
