@@ -2681,7 +2681,7 @@ class FileEditorDialog(QDialog):
         return
     event.accept()
 
-  MAX_EDIT_BYTES = 20 * 1024 * 1024
+  MAX_EDIT_BYTES = 100 * 1024 * 1024
 
   @classmethod
   def open_remote(cls, parent, sftp, ssh, remote_path: str, sudo_user=None):

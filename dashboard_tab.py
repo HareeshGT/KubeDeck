@@ -911,7 +911,7 @@ class NodeDetailWindow(QWidget):
   def refresh_theme(self):
     self._apply_styles()
 
-  def update_pods(self, pods: list, pod_usage: dict):
+  def update_pods(self, pods: list, pod_usage: dict, parse_error: str = None):
     self._pod_snapshot = {(p["namespace"], p["name"]): p for p in pods}
     self.pod_tree.clear()
 
@@ -947,10 +947,19 @@ class NodeDetailWindow(QWidget):
     for col in range(10):
       self.pod_tree.resizeColumnToContents(col)
 
-    self.summary_lbl.setText(
-      f"{len(pods)} pod(s) scheduled here · double-click a pod for details · "
-      f"updated {time.strftime('%H:%M:%S')}"
-    )
+    if parse_error:
+      # Distinguish "the cluster genuinely has 0 pods here" from "the last
+      # kubectl snapshot failed to parse" — previously both looked
+      # identical (an empty list + "0 pod(s) scheduled here"), which made
+      # a transient parse failure indistinguishable from reality.
+      self.summary_lbl.setText(f"⚠ {parse_error} · updated {time.strftime('%H:%M:%S')}")
+      self.summary_lbl.setStyleSheet(f"color: {T['WARNING']}; font-size: 12px;")
+    else:
+      self.summary_lbl.setText(
+        f"{len(pods)} pod(s) scheduled here · double-click a pod for details · "
+        f"updated {time.strftime('%H:%M:%S')}"
+      )
+      self.summary_lbl.setStyleSheet(f"color: {_dashboard_text('muted')}; font-size: 12px;")
 
   def _pod_tooltip(self, pod):
     lines = [
@@ -1387,6 +1396,7 @@ class DashboardTab(QWidget):
     # pods up with no extra bookkeeping). Rebuilt on every refresh.
     self._pods_by_node_cache = {}
     self._pod_usage_cache  = {}
+    self._pods_parse_error = None
 
     # Open NodeDetailWindow instances, keyed the same way, so an
     # already-open window is refreshed in place instead of duplicated.
@@ -2518,6 +2528,7 @@ class DashboardTab(QWidget):
     if no_cluster:
       self._clear_node_grid()
       self._pods_by_node_cache = {}
+      self._pods_parse_error = None
       for win in self._node_windows.values():
         win.update_pods([], {}) # clear stale data rather than leave it showing
       joined_raw = "\n".join(raw_node_lines).lower()
@@ -2586,8 +2597,21 @@ class DashboardTab(QWidget):
     pod_json = "\n".join(sec.get("PODS", [])).strip()
     try:
       pod_data = json.loads(pod_json) if pod_json else {"items": []}
-    except json.JSONDecodeError:
+      self._pods_parse_error = None
+    except json.JSONDecodeError as e:
+      # Previously failed silently here, which meant a truncated/garbled
+      # `kubectl get pods --all-namespaces -o json` response (large output,
+      # SSH buffering, a transient API hiccup) quietly turned into "every
+      # node has 0 pods" with no indication anything had gone wrong. Now
+      # the failure is recorded so callers (e.g. NodeDetailWindow) can
+      # surface it instead of showing a misleading empty pod list.
       pod_data = {"items": []}
+      self._pods_parse_error = (
+        f"Pod list failed to parse ({e}); showing 0 pods until the next "
+        f"successful refresh — this usually means the kubectl output was "
+        f"truncated or the cluster returned malformed JSON, not that the "
+        f"node genuinely has no pods."
+      )
 
     for item in pod_data.get("items", []):
       meta = item.get("metadata") or {}
@@ -2902,7 +2926,8 @@ class DashboardTab(QWidget):
     # Push fresh data into any node detail windows that are still open,
     # instead of leaving them showing a stale snapshot until re-clicked.
     for node_name, win in self._node_windows.items():
-      win.update_pods(self._pods_by_node_cache.get(node_name, []), self._pod_usage_cache)
+      win.update_pods(self._pods_by_node_cache.get(node_name, []), self._pod_usage_cache,
+               parse_error=self._pods_parse_error)
 
 
     self.status_msg.emit("Dashboard updated")
@@ -2917,7 +2942,7 @@ class DashboardTab(QWidget):
       win.closed.connect(self._on_node_window_closed)
       self._node_windows[node_name] = win
 
-    win.update_pods(pods, self._pod_usage_cache)
+    win.update_pods(pods, self._pod_usage_cache, parse_error=self._pods_parse_error)
     win.show()
     win.raise_()
     win.activateWindow()
