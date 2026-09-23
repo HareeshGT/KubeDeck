@@ -1688,6 +1688,7 @@ class FileEditorDialog(QDialog):
     self._remote  = remote_path
     self._sudo_user = sudo_user
     self._original = content or ""
+    self._large_file = False
     self._matches  = []  # [(start, end), ...] offsets of current find matches
     self._match_idx = -1
     self._highlighter = None
@@ -1701,6 +1702,12 @@ class FileEditorDialog(QDialog):
     self._chunks_since_sync = 0
     self._buffer_small   = False
     self._pending_bytes   = None
+    self._remote_size = None
+    try:
+      self._remote_size = int(self._sftp.stat(remote_path).st_size)
+    except Exception:
+      pass
+    self._large_file = bool(self._remote_size and self._remote_size >= 50 * 1024 * 1024)
 
     fname = os.path.basename(remote_path)
     self.setWindowTitle(f"Edit — {fname}")
@@ -2024,7 +2031,7 @@ class FileEditorDialog(QDialog):
     # is available. Keep the native editor as a compatibility fallback so
     # missing WebEngine never prevents the remote file editor from opening.
     if MonacoEditor is not None and MonacoEditor.available():
-      self.editor = MonacoEditor(base_point_size=12)
+      self.editor = MonacoEditor(base_point_size=12, large_file=self._large_file)
       self.editor.set_filename(fname)
       self.editor.setPlainText(content or "")
     else:
@@ -2137,6 +2144,9 @@ class FileEditorDialog(QDialog):
       self._clear_highlights()
 
   def _on_text_changed(self):
+    if self._large_file:
+      self._modified_dot.show()
+      return
     self._modified_dot.setVisible(self.editor.toPlainText() != self._original)
 
   def _update_cursor_pos(self):
