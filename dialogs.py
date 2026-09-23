@@ -2045,6 +2045,9 @@ class FileEditorDialog(QDialog):
 
     # Syntax highlighting is handled by Monaco when it is active. The
     # native editor keeps the existing Qt highlighter as its fallback.
+    if self._large_file:
+      self._find_btn.setEnabled(False)
+      self._find_btn.setToolTip("Find/Replace is disabled for large-file memory mode")
     if isinstance(self.editor, CodeEditor):
       self._highlighter, self._lang = make_highlighter(self.editor.document(), fname)
     else:
@@ -2574,9 +2577,35 @@ class FileEditorDialog(QDialog):
       self._set_status(f"Save failed: {e}", T["DANGER"])
       QMessageBox.critical(self, "Save Failed", str(e))
   def _save_and_close(self):
+    if self._large_file:
+      self._set_status("Preparing save…", T["WARNING"])
+      self.editor.get_text(self._save_large_content_and_close)
+      return
     if self._save():
       self.accept()
 
+  def _save_large_content_and_close(self, content):
+    try:
+      data = (content or "").encode("utf-8")
+      buf = io.BytesIO(data)
+      self._set_status("Saving…", T["WARNING"])
+      if self._sudo_user:
+        tmp = f"/tmp/.ec2mgr_edit_{os.getpid()}"
+        self._sftp._sftp.putfo(buf, tmp)
+        code, out, err = self._sftp._run(
+          f"sudo mv {self._sftp._sq(tmp)} {self._sftp._sq(self._remote)} "
+          f"&& sudo chown {self._sudo_user} {self._sftp._sq(self._remote)}"
+        )
+        if code != 0:
+          raise PermissionError((err or out or "sudo save failed").strip())
+      elif hasattr(self._sftp, "_ftp"):
+        self._sftp.putfo(buf, self._remote)
+      else:
+        self._sftp._sftp.putfo(buf, self._remote)
+      self.accept()
+    except Exception as e:
+      self._set_status(f"Save failed: {e}", T["DANGER"])
+      QMessageBox.critical(self, "Save Failed", str(e))
   def _cancel_live_load(self):
     """Safely stop the live-load worker during dialog teardown.
 
