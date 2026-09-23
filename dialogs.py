@@ -2516,6 +2516,10 @@ class FileEditorDialog(QDialog):
     if self._loading:
       self._set_status("Still loading — please wait", T['WARNING'])
       return False
+    if self._large_file:
+      self._set_status("Preparing save…", T["WARNING"])
+      self.editor.get_text(self._save_large_content)
+      return True
     content = self.editor.toPlainText()
     self._set_status("Saving…", T['WARNING'])
     try:
@@ -2545,6 +2549,30 @@ class FileEditorDialog(QDialog):
       QMessageBox.critical(self, "Save Failed", str(e))
       return False
 
+  def _save_large_content(self, content):
+    try:
+      data = (content or "").encode("utf-8")
+      buf = io.BytesIO(data)
+      self._set_status("Saving…", T["WARNING"])
+      if self._sudo_user:
+        tmp = f"/tmp/.ec2mgr_edit_{os.getpid()}"
+        self._sftp._sftp.putfo(buf, tmp)
+        code, out, err = self._sftp._run(
+          f"sudo mv {self._sftp._sq(tmp)} {self._sftp._sq(self._remote)} "
+          f"&& sudo chown {self._sudo_user} {self._sftp._sq(self._remote)}"
+        )
+        if code != 0:
+          raise PermissionError((err or out or "sudo save failed").strip())
+      elif hasattr(self._sftp, "_ftp"):
+        self._sftp.putfo(buf, self._remote)
+      else:
+        self._sftp._sftp.putfo(buf, self._remote)
+      self._modified_dot.hide()
+      self._set_status("Saved", T["SUCCESS"])
+      QTimer.singleShot(2000, lambda: self._set_status("Ready"))
+    except Exception as e:
+      self._set_status(f"Save failed: {e}", T["DANGER"])
+      QMessageBox.critical(self, "Save Failed", str(e))
   def _save_and_close(self):
     if self._save():
       self.accept()
