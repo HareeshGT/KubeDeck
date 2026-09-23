@@ -977,6 +977,71 @@ class NodeDetailWindow(QWidget):
       )
       self.summary_lbl.setStyleSheet(f"color: {_dashboard_text('muted')}; font-size: 12px;")
 
+  def _on_sort_changed(self, value):
+    self._sort_key = value
+    self._rebuild_pod_rows()
+
+  def _toggle_sort_order(self):
+    self._sort_ascending = not self._sort_ascending
+    self.sort_order_btn.setText("↑ Ascending" if self._sort_ascending else "↓ Descending")
+    self._rebuild_pod_rows()
+
+  def _sorted_pods(self, pods):
+    def key(p):
+      if self._sort_key == "Pod name": return str(p.get("name") or "").lower()
+      if self._sort_key == "Namespace": return str(p.get("namespace") or "").lower()
+      if self._sort_key == "Status": return str(p.get("phase") or "").lower()
+      if self._sort_key == "Owner": return str(p.get("owner") or "").lower()
+      if self._sort_key == "Restarts": return int(p.get("restarts") or 0)
+      if self._sort_key == "Ready":
+        raw = str(p.get("ready") or "")
+        try:
+          got, want = raw.split("/", 1)
+          return (int(got), int(want), got != want)
+        except ValueError: return (-1, -1, True)
+      if self._sort_key == "Age": return self._age_seconds(p)
+      if self._sort_key in ("CPU", "Memory"):
+        usage = self._pod_usage.get((p.get("namespace"), p.get("name"))) or {}
+        return self._metric_value(usage.get("cpu" if self._sort_key == "CPU" else "mem"))
+      return str(p.get("name") or "").lower()
+    return sorted(pods, key=key, reverse=not self._sort_ascending)
+
+  @staticmethod
+  def _metric_value(value):
+    if not value or value == "n/a": return float("inf")
+    m = re.match(r"^([0-9.]+)\\s*([a-zA-Z]+)?$", str(value).strip())
+    if not m: return float("inf")
+    number = float(m.group(1))
+    unit = (m.group(2) or "").lower()
+    multipliers = {"": 1, "m": 0.001, "u": 0.000001, "n": 0.000000001, "ki": 1024, "mi": 1024**2, "gi": 1024**3, "ti": 1024**4}
+    return number * multipliers.get(unit, 1)
+
+  @staticmethod
+  def _age_seconds(p):
+    created = str(p.get("created") or "")
+    if created:
+      try:
+        return max(0.0, (datetime.now().astimezone() - datetime.fromisoformat(created.replace("Z", "+00:00"))).total_seconds())
+      except (ValueError, TypeError): pass
+    age = str(p.get("age") or "")
+    m = re.match(r"^(\\d+)([smhdw])$", age.lower())
+    if m: return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
+    return float("inf")
+
+  def _rebuild_pod_rows(self):
+    pods = list(self._pod_snapshot.values())
+    self.pod_tree.clear()
+    for pod in self._sorted_pods(pods):
+      usage = self._pod_usage.get((pod["namespace"], pod["name"]))
+      item = QTreeWidgetItem([pod["name"], pod["namespace"], pod["phase"], usage["cpu"] if usage else "n/a", usage["mem"] if usage else "n/a", str(pod["restarts"]), pod["ready"], pod.get("pod_ip") or "—", pod.get("age") or _short_age(pod.get("created", "")), pod.get("owner") or "—"])
+      item.setData(0, Qt.UserRole, (pod["namespace"], pod["name"]))
+      item.setForeground(2, QColor(_status_color(pod["phase"])))
+      if pod["restarts"] > 0: item.setForeground(5, QColor(T["WARNING"] if pod["restarts"] < 5 else T["DANGER"]))
+      for col in (3, 4): item.setForeground(col, QColor(_dashboard_text("primary") if usage else _dashboard_text("muted")))
+      tooltip = self._pod_tooltip(pod)
+      for col in range(10): item.setToolTip(col, tooltip)
+      self.pod_tree.addTopLevelItem(item)
+    for col in range(10): self.pod_tree.resizeColumnToContents(col)
   def _pod_tooltip(self, pod):
     lines = [
       f"Pod: {pod['name']}", f"Namespace: {pod['namespace']}",
