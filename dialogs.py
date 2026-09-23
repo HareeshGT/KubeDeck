@@ -14,10 +14,16 @@ import time
 import threading
 import sys
 
+# PyQt5 exposes sip as either a top-level package or as PyQt5.sip.
+# Some environments have one but not the other, so prefer the bundled
+# PyQt5 module and fall back to the top-level import when needed.
 try:
-  import sip
-except ImportError:
-  sip = None
+  from PyQt5 import sip  # type: ignore[attr-defined]
+except Exception:
+  try:
+    import sip  # type: ignore[import-not-found]
+  except ImportError:
+    sip = None
 
 from PyQt5.QtWidgets import (
   QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,

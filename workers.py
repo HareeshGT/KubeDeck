@@ -950,25 +950,68 @@ class FileStreamReadWorker(QThread):
         except Exception:
             total = 0
         done = 0
-        out = bytearray()
-        def cb(data):
-            nonlocal done
-            if self._cancelled or (self._max_bytes and done >= self._max_bytes):
-                return
-            take = data
-            if self._max_bytes:
-                take = data[:max(0, self._max_bytes - done)]
-            if take:
-                done += len(take)
-                self.chunk_ready.emit(bytes(take))
-                self.progress.emit(done, total)
-        self._sftp._ftp.retrbinary("RETR " + self._sftp.normalize(self._remote), cb, blocksize=self.CHUNK_SIZE)
+        # Use a dedicated per-transfer connection (FTPFS.open_stream()),
+        # not self._sftp._ftp — that's the one shared control connection
+        # the whole app uses for browsing/other operations. Calling
+        # retrbinary() directly on it meant that closing this dialog and
+        # reopening the same file fast enough left the old worker's
+        # transfer still running against that shared connection when the
+        # new worker's transfer started on it too: both workers' command/
+        # response traffic interleaved on the same socket, which is what
+        # produced garbage content on reopen. A dedicated connection per
+        # worker also means cancel() (below) can actually stop an
+        # in-flight read by closing this worker's own handle, instead of
+        # having nothing to close and leaving the transfer running.
+        reader = self._sftp.open_stream(self._remote)
+        self._handle = reader
+        try:
+            while True:
+                if self._cancelled or (self._max_bytes and done >= self._max_bytes):
+                    break
+                try:
+                    data = reader.read(self.CHUNK_SIZE)
+                except Exception:
+                    if self._cancelled:
+                        break
+                    raise
+                if not data:
+                    break
+                take = data
+                if self._max_bytes:
+                    take = data[:max(0, self._max_bytes - done)]
+                if take:
+                    done += len(take)
+                    self.chunk_ready.emit(bytes(take))
+                    self.progress.emit(done, total)
+        finally:
+            self._handle = None
+            try:
+                reader.close()
+            except Exception:
+                pass
         if not self._cancelled:
             self.finished_ok.emit(done)
 
     # ── plain SFTP path — real chunked reads with real progress ──
     def _run_direct_stream(self):
-        raw = getattr(self._sftp, "_sftp", self._sftp)
+        # Open a dedicated SFTP channel on the same SSH transport rather
+        # than reusing self._sftp._sftp — the one paramiko SFTPClient
+        # every other reader (the preview pane, another open editor)
+        # also reads through. paramiko's SFTPClient is documented as not
+        # safe for concurrent use from more than one thread (see
+        # _SFTPStreamReader above, which already opens its own
+        # ssh.open_sftp() per reader for media playback for exactly this
+        # reason): two workers issuing requests on the same client at
+        # once can interleave their wire packets, and paramiko raises
+        # "Garbage packet received" trying to parse the result. That's
+        # what happens when a file's still loading in the preview pane
+        # and gets double-clicked to edit before _cancel_preview_worker's
+        # cancel() has actually stopped that thread — both workers end up
+        # on the shared client at the same time. LocalBackend has no SSH
+        # transport (self._ssh is None there), so it keeps using the
+        # passed-in filesystem object directly, unchanged.
+        dedicated = self._ssh is not None and hasattr(self._sftp, "_sftp")
+        raw = self._ssh.open_sftp() if dedicated else getattr(self._sftp, "_sftp", self._sftp)
         try:
             total = raw.stat(self._remote).st_size
         except Exception:
@@ -1013,6 +1056,11 @@ class FileStreamReadWorker(QThread):
                 f.close()
             except Exception:
                 pass
+            if dedicated:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
         self.finished_ok.emit(done)
 
     # ── sudo path — stream a "sudo -u <user> cat" over a raw channel ──
