@@ -428,7 +428,9 @@ else
  kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null
 
  echo __PODS__
- kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}|{.metadata.name}|{.status.phase}|{.status.reason}|{.spec.nodeName}|{.status.podIP}|{.status.hostIP}|{.status.qosClass}|{.metadata.creationTimestamp}|{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}|{range .status.containerStatuses[*]}{.ready},{.restartCount},{.state.waiting.reason};{end}{"\n"}{end}' 2>/dev/null
+ # Use kubectl's tabular formatter for detailed pod metadata too. This is
+ # deliberately less fragile than a nested JSONPath over containerStatuses.
+ kubectl get pods --all-namespaces --no-headers -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName,PODIP:.status.podIP,HOSTIP:.status.hostIP,QOS:.status.qosClass,CREATED:.metadata.creationTimestamp,OWNERKIND:.metadata.ownerReferences[0].kind,OWNERNAME:.metadata.ownerReferences[0].name,READY:.status.containerStatuses[*].ready,RESTARTS:.status.containerStatuses[*].restartCount' 2>/dev/null
 
  echo __PODTOP__
  kubectl top pods --all-namespaces --no-headers 2>/dev/null
@@ -2650,61 +2652,48 @@ class DashboardTab(QWidget):
           "cpu_cores": parts[1], "mem_bytes": parts[3],
         }
 
-    # Full pod inventory, grouped by the node each pod is scheduled on.
-    # The command above returns compact pipe-delimited rows instead of a
-    # potentially huge Kubernetes JSON document. This avoids turning a
-    # transient/truncated SSH response into a false "0 pods" dashboard.
+    # Full pod inventory. The detailed query uses custom-columns, so each
+    # pod is exactly one whitespace-delimited row and cannot be broken by a
+    # nested JSONPath/container loop.
     pods_by_node = {}
     pod_lines = [l for l in sec.get("PODS", []) if l.strip()]
     self._pods_parse_error = None
     malformed_pod_rows = 0
 
     for line in pod_lines:
-      bits = line.split("|", 10)
-      if len(bits) < 11:
+      parts = line.split()
+      if len(parts) < 12:
         malformed_pod_rows += 1
         continue
-      (ns, pname, phase, reason, node, pod_ip, host_ip, qos, created,
-       owner, containers_raw) = bits[:11]
-      ns, pname = ns.strip(), pname.strip()
+      (ns, pname, phase, node, pod_ip, host_ip, qos, created,
+       owner_kind, owner_name, ready_raw, restarts_raw) = parts[:12]
       if not pname:
         malformed_pod_rows += 1
         continue
 
-      ready_count = 0
-      container_count = 0
-      restarts = 0
-      waiting_parts = []
-      for container_raw in containers_raw.split(";"):
-        container_raw = container_raw.strip()
-        if not container_raw:
-          continue
-        fields = container_raw.split(",", 2)
-        if len(fields) < 2:
-          continue
-        container_count += 1
-        if fields[0].strip().lower() == "true":
-          ready_count += 1
-        try:
-          restarts += int(fields[1].strip() or 0)
-        except ValueError:
-          pass
-        if len(fields) >= 3 and fields[2].strip():
-          waiting_parts.append(fields[2].strip())
+      ready_values = [x.strip().lower() for x in ready_raw.split(",") if x.strip()]
+      restart_values = [x.strip() for x in restarts_raw.split(",") if x.strip()]
+      ready_count = sum(1 for x in ready_values if x == "true")
+      container_count = len(ready_values)
+      try:
+        restarts = sum(int(x) for x in restart_values)
+      except ValueError:
+        restarts = 0
 
+      owner = f"{owner_kind}/{owner_name}".strip("/") if owner_kind or owner_name else ""
       pods_by_node.setdefault(node.strip() or "(unscheduled)", []).append({
-        "namespace": ns, "name": pname,
+        "namespace": ns.strip(), "name": pname.strip(),
         "phase": phase.strip() or "Unknown",
         "restarts": restarts,
         "ready": f"{ready_count}/{container_count}" if container_count else "-",
-        "reason": reason.strip(),
+        "reason": "",
         "message": "",
         "pod_ip": pod_ip.strip(),
         "host_ip": host_ip.strip(),
         "qos": qos.strip(),
         "created": created.strip(),
-        "owner": owner.strip().strip("/") if owner.strip().strip("/") else "",
-        "waiting": ";".join(waiting_parts),
+        "owner": owner,
+        "waiting": "",
       })
 
     if malformed_pod_rows:
