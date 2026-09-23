@@ -373,6 +373,21 @@ class MonacoEditor(QWidget):
             )
         self.textChanged.emit()
 
+    def get_text(self, callback=None):
+        """Get the current Monaco document without maintaining a Qt shadow copy."""
+        if not self._large_file:
+            value = self._shadow.toPlainText()
+            if callback:
+                callback(value)
+            return value
+        if not self._view or not self._editor_ready:
+            if callback:
+                callback("")
+            return ""
+        if callback is None:
+            return None
+        self._view.page().runJavaScript("window.getValue()", callback)
+
     def toPlainText(self):
         if self._large_file:
             return ""
