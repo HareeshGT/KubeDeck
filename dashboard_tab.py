@@ -397,15 +397,6 @@ if ! command -v kubectl >/dev/null 2>&1; then
  echo __NODEDETAILS__
  echo __TOP__
  echo __PODS__
- # Independent compact node mapping used as a reliable fallback for pod counts.
- echo __PODNODEMAP__
- kubectl get pods --all-namespaces -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' --no-headers 2>/dev/null
-
- # Lightweight authoritative pod-to-node map. This is intentionally
- # independent of the detailed pod inventory above.
- echo __PODNODEMAP__
- kubectl get pods --all-namespaces -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' --no-headers 2>/dev/null
-
  echo __PODTOP__
  echo __WORKLOADS__
  echo __SERVICES_ENDPOINTS__
@@ -426,6 +417,11 @@ else
 
  echo __PODS__
  kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}|{.metadata.name}|{.status.phase}|{.status.reason}|{.spec.nodeName}|{.status.podIP}|{.status.hostIP}|{.status.qosClass}|{.metadata.creationTimestamp}|{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}|{range .status.containerStatuses[*]}{.ready},{.restartCount},{.state.waiting.reason};{end}{"\\n"}{end}' 2>/dev/null
+
+ # Lightweight authoritative pod-to-node map, independent of the detailed
+ # pod status response.
+ echo __PODNODEMAP__
+ kubectl get pods --all-namespaces -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' --no-headers 2>/dev/null
 
  echo __PODTOP__
  kubectl top pods --all-namespaces --no-headers 2>/dev/null
