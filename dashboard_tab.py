@@ -1913,7 +1913,7 @@ class DashboardTab(QWidget):
     # of each node, which made this card feel cramped. They now live in
     # a separate NodeDetailWindow opened per-node (see _on_node_double_
     # clicked), so this table stays one clean row per node.
-    self.k8s_card = self._make_card("⎈ Kubernetes Nodes")
+    self.k8s_card = self._make_card(" Kubernetes Nodes")
     self.k8s_note = QLabel("")
     self.k8s_note.setStyleSheet(f"color: {_dashboard_text('muted')}; font-size: 12px;")
     self.k8s_note.hide()
