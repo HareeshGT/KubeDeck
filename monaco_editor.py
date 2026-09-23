@@ -191,6 +191,11 @@ function redo(){if(editor)editor.trigger("keyboard","redo",null)}
 function setWrap(v){if(editor)editor.updateOptions({wordWrap:v?"on":"off"})}
 function setFontSize(v){if(editor)editor.updateOptions({fontSize:v})}
 function focusEditor(){if(editor)editor.focus()}
+function disposeEditor(){
+  try { if (editor) { editor.setModel(null); editor.dispose(); } } catch(e) {}
+  editor = null;
+  decorations = [];
+}
 </script>
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 <style>
@@ -485,5 +490,25 @@ class MonacoEditor(QWidget):
         if self._view and self._editor_ready:
             self._view.page().runJavaScript("window.focusEditor()")
 
+    def dispose(self):
+        """Release the Monaco model and WebEngine page resources."""
+        view = getattr(self, "_view", None)
+        if view is None:
+            return
+        try:
+            view.page().runJavaScript("window.disposeEditor();")
+        except Exception:
+            pass
+        try:
+            view.stop()
+            view.setHtml("<html><body></body></html>")
+        except Exception:
+            pass
+        try:
+            view.deleteLater()
+        except Exception:
+            pass
+        self._view = None
+        self._editor_ready = False
     def refresh_theme(self):
         pass
