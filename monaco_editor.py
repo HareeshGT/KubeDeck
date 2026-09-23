@@ -231,7 +231,8 @@ class MonacoEditor(QWidget):
         self._language = "plaintext"
         self._large_file = bool(large_file)
         self._shadow = None if self._large_file else QPlainTextEdit(self)
-        self._shadow.hide()
+        if self._shadow is not None:
+            self._shadow.hide()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0,0,0,0)
