@@ -416,7 +416,7 @@ else
  kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null
 
  echo __PODS__
- kubectl get pods --all-namespaces -o json
+ kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}|{.metadata.name}|{.status.phase}|{.status.reason}|{.spec.nodeName}|{.status.podIP}|{.status.hostIP}|{.status.qosClass}|{.metadata.creationTimestamp}|{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}|{range .status.containerStatuses[*]}{.ready},{.restartCount},{.state.waiting.reason};{end}{"\\n"}{end}' 2>/dev/null
 
  echo __PODTOP__
  kubectl top pods --all-namespaces --no-headers 2>/dev/null
@@ -2590,70 +2590,79 @@ class DashboardTab(QWidget):
         }
 
     # Full pod inventory, grouped by the node each pod is scheduled on.
-    # Pods not yet scheduled (nodeName empty — usually Pending) are
-    # collected under a synthetic "(unscheduled)" key instead of being
-    # dropped, so they're still visible somewhere.
+    # The command above returns compact pipe-delimited rows instead of a
+    # potentially huge Kubernetes JSON document. This avoids turning a
+    # transient/truncated SSH response into a false "0 pods" dashboard.
     pods_by_node = {}
-    pod_json = "\n".join(sec.get("PODS", [])).strip()
-    try:
-      pod_data = json.loads(pod_json) if pod_json else {"items": []}
-      self._pods_parse_error = None
-    except json.JSONDecodeError as e:
-      # Previously failed silently here, which meant a truncated/garbled
-      # `kubectl get pods --all-namespaces -o json` response (large output,
-      # SSH buffering, a transient API hiccup) quietly turned into "every
-      # node has 0 pods" with no indication anything had gone wrong. Now
-      # the failure is recorded so callers (e.g. NodeDetailWindow) can
-      # surface it instead of showing a misleading empty pod list.
-      pod_data = {"items": []}
-      self._pods_parse_error = (
-        f"Pod list failed to parse ({e}); showing 0 pods until the next "
-        f"successful refresh — this usually means the kubectl output was "
-        f"truncated or the cluster returned malformed JSON, not that the "
-        f"node genuinely has no pods."
-      )
+    pod_lines = [l for l in sec.get("PODS", []) if l.strip()]
+    self._pods_parse_error = None
+    malformed_pod_rows = 0
 
-    for item in pod_data.get("items", []):
-      meta = item.get("metadata") or {}
-      status = item.get("status") or {}
-      spec = item.get("spec") or {}
-      containers = status.get("containerStatuses") or []
-      init_containers = status.get("initContainerStatuses") or []
-      ready_count = sum(1 for x in containers if x.get("ready"))
-      restarts = sum(
-        int(x.get("restartCount", 0) or 0)
-        for x in (init_containers + containers)
-      )
-      waiting_parts = []
-      for container in containers:
-        waiting = (container.get("state") or {}).get("waiting") or {}
-        reason = waiting.get("reason")
-        message = waiting.get("message")
-        if reason or message:
-          waiting_parts.append("{}={}".format(reason or "Waiting", message or ""))
-      owners = meta.get("ownerReferences") or []
-      owner = ""
-      if owners:
-        owner = "{}/{}".format(owners[0].get("kind", ""), owners[0].get("name", "")).strip("/")
-      ns = str(meta.get("namespace") or "")
-      pname = str(meta.get("name") or "")
-      if not pname:
+    for line in pod_lines:
+      bits = line.split("|", 10)
+      if len(bits) < 11:
+        malformed_pod_rows += 1
         continue
-      node = str(spec.get("nodeName") or "")
-      pods_by_node.setdefault(node or "(unscheduled)", []).append({
+      (ns, pname, phase, reason, node, pod_ip, host_ip, qos, created,
+       owner, containers_raw) = bits[:11]
+      ns, pname = ns.strip(), pname.strip()
+      if not pname:
+        malformed_pod_rows += 1
+        continue
+
+      ready_count = 0
+      container_count = 0
+      restarts = 0
+      waiting_parts = []
+      for container_raw in containers_raw.split(";"):
+        container_raw = container_raw.strip()
+        if not container_raw:
+          continue
+        fields = container_raw.split(",", 2)
+        if len(fields) < 2:
+          continue
+        container_count += 1
+        if fields[0].strip().lower() == "true":
+          ready_count += 1
+        try:
+          restarts += int(fields[1].strip() or 0)
+        except ValueError:
+          pass
+        if len(fields) >= 3 and fields[2].strip():
+          waiting_parts.append(fields[2].strip())
+
+      pods_by_node.setdefault(node.strip() or "(unscheduled)", []).append({
         "namespace": ns, "name": pname,
-        "phase": str(status.get("phase") or "Unknown"),
+        "phase": phase.strip() or "Unknown",
         "restarts": restarts,
-        "ready": f"{ready_count}/{len(containers)}" if containers else "-",
-        "reason": str(status.get("reason") or ""),
-        "message": str(status.get("message") or ""),
-        "pod_ip": str(status.get("podIP") or ""),
-        "host_ip": str(status.get("hostIP") or ""),
-        "qos": str(status.get("qosClass") or ""),
-        "created": str(meta.get("creationTimestamp") or ""),
-        "owner": owner,
+        "ready": f"{ready_count}/{container_count}" if container_count else "-",
+        "reason": reason.strip(),
+        "message": "",
+        "pod_ip": pod_ip.strip(),
+        "host_ip": host_ip.strip(),
+        "qos": qos.strip(),
+        "created": created.strip(),
+        "owner": owner.strip().strip("/") if owner.strip().strip("/") else "",
         "waiting": ";".join(waiting_parts),
       })
+
+    if malformed_pod_rows:
+      self._pods_parse_error = (
+        f"Pod inventory returned {malformed_pod_rows} malformed row(s); "
+        f"valid pod rows are still shown."
+      )
+    if not pod_lines:
+      # An empty response is not automatically the same thing as a cluster
+      # with zero pods. Keep the previous successful snapshot instead of
+      # replacing every node's pod list with an apparently healthy zero.
+      previous = getattr(self, "_pods_by_node_cache", {}) or {}
+      if previous:
+        pods_by_node = {k: list(v) for k, v in previous.items()}
+        self._pods_parse_error = (
+          "Pod inventory was empty during this refresh; showing the "
+          "previous successful pod snapshot."
+        )
+
     # Per-pod CPU/memory usage from `kubectl top pods`, keyed by
     # (namespace, name). Missing entirely (no metrics-server) just
     # means every pod row shows "n/a" instead of a bar — same
