@@ -984,53 +984,58 @@ class NodeDetailWindow(QWidget):
     self._rebuild_pod_rows()
 
   def _sorted_pods(self, pods):
-    # Sort using the actual underlying value, not the formatted text shown
-    # in the table. Missing metrics are always placed last.
-    def key(p):
-      missing = False
+    # Sort by the underlying value, not the formatted text displayed in the
+    # table. Missing values are always kept at the bottom in either direction.
+    def key_value(p):
       if self._sort_key == "Pod name":
-        value = str(p.get("name") or "").lower()
-      elif self._sort_key == "Namespace":
-        value = str(p.get("namespace") or "").lower()
-      elif self._sort_key == "Status":
-        status_order = {"running": 0, "pending": 1, "succeeded": 2, "failed": 3, "unknown": 4}
+        return str(p.get("name") or "").lower(), False
+      if self._sort_key == "Namespace":
+        return str(p.get("namespace") or "").lower(), False
+      if self._sort_key == "Status":
+        status_order = {
+          "running": 0, "pending": 1, "succeeded": 2,
+          "failed": 3, "unknown": 4,
+        }
         status = str(p.get("phase") or "Unknown").lower()
-        value = status_order.get(status, 99)
-      elif self._sort_key == "Owner":
-        value = str(p.get("owner") or "").lower()
-      elif self._sort_key == "Restarts":
-        value = int(p.get("restarts") or 0)
-      elif self._sort_key == "Ready":
+        return status_order.get(status, 99), False
+      if self._sort_key == "Owner":
+        owner = str(p.get("owner") or "").lower()
+        return owner, not bool(owner)
+      if self._sort_key == "Restarts":
+        return int(p.get("restarts") or 0), False
+      if self._sort_key == "Ready":
         raw = str(p.get("ready") or "")
         try:
           got, want = raw.split("/", 1)
-          value = (int(got), int(want), got != want)
-        except ValueError:
-          value = (-1, -1, True)
-          missing = True
-      elif self._sort_key == "Age":
+          return (int(got), int(want)), False
+        except (ValueError, TypeError):
+          return None, True
+      if self._sort_key == "Age":
         value = self._age_seconds(p)
-        missing = value is None
-      elif self._sort_key in ("CPU", "Memory"):
+        return value, value is None
+      if self._sort_key in ("CPU", "Memory"):
         usage = self._pod_usage.get((p.get("namespace"), p.get("name"))) or {}
-        value = self._metric_value(usage.get("cpu" if self._sort_key == "CPU" else "mem"))
-        missing = value is None
-      else:
-        value = str(p.get("name") or "").lower()
-      return (1 if missing else 0, value)
+        value = self._metric_value(
+          usage.get("cpu" if self._sort_key == "CPU" else "mem")
+        )
+        return value, value is None
+      return str(p.get("name") or "").lower(), False
 
-    return sorted(
-      pods,
-      key=key,
-      reverse=not self._sort_ascending,
-    )
+    valid = []
+    missing = []
+    for pod in pods:
+      value, is_missing = key_value(pod)
+      (missing if is_missing else valid).append((value, pod))
+
+    valid.sort(key=lambda item: item[0], reverse=not self._sort_ascending)
+    return [pod for _, pod in valid] + [pod for _, pod in missing]
 
   @staticmethod
   def _metric_value(value):
     if not value or str(value).strip().lower() in ("n/a", "—", "-"):
       return None
     # Kubernetes quantities: CPU can be n/u/m, memory can be Ki/Mi/Gi/Ti.
-    m = re.match(r"^([0-9]+(?:\\.[0-9]+)?)\\s*([a-zA-Z]+)?$", str(value).strip())
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]+)?$", str(value).strip())
     if not m:
       return None
     number = float(m.group(1))
@@ -1053,7 +1058,7 @@ class NodeDetailWindow(QWidget):
       except (ValueError, TypeError):
         pass
     age = str(p.get("age") or "")
-    m = re.match(r"^(\\d+)([smhdw])$", age.lower())
+    m = re.match(r"^(\d+)([smhdw])$", age.lower())
     if m:
       return int(m.group(1)) * {
         "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800
