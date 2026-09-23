@@ -428,7 +428,7 @@ else
  kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null
 
  echo __PODS__
- kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}|{.metadata.name}|{.status.phase}|{.status.reason}|{.spec.nodeName}|{.status.podIP}|{.status.hostIP}|{.status.qosClass}|{.metadata.creationTimestamp}|{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}|{range .status.containerStatuses[*]}{.ready},{.restartCount},{.state.waiting.reason};{end}{"\\n"}{end}' 2>/dev/null
+ kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}|{.metadata.name}|{.status.phase}|{.status.reason}|{.spec.nodeName}|{.status.podIP}|{.status.hostIP}|{.status.qosClass}|{.metadata.creationTimestamp}|{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}|{range .status.containerStatuses[*]}{.ready},{.restartCount},{.state.waiting.reason};{end}{"\n"}{end}' 2>/dev/null
 
  echo __PODTOP__
  kubectl top pods --all-namespaces --no-headers 2>/dev/null
