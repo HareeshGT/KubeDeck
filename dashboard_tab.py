@@ -401,6 +401,11 @@ if ! command -v kubectl >/dev/null 2>&1; then
  echo __PODNODEMAP__
  kubectl get pods --all-namespaces -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' --no-headers 2>/dev/null
 
+ # Lightweight authoritative pod-to-node map. This is intentionally
+ # independent of the detailed pod inventory above.
+ echo __PODNODEMAP__
+ kubectl get pods --all-namespaces -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' --no-headers 2>/dev/null
+
  echo __PODTOP__
  echo __WORKLOADS__
  echo __SERVICES_ENDPOINTS__
@@ -2667,31 +2672,46 @@ class DashboardTab(QWidget):
           "previous successful pod snapshot."
         )
 
-    # The compact rich inventory is preferred for pod details. Keep an
-    # independent custom-columns node map as a fallback: it is much smaller
-    # and uses kubectl's tabular formatter, so a large/complex pod status
-    # response cannot make every node appear to have zero pods.
-    if not pods_by_node:
-      fallback_rows = 0
-      for line in sec.get("PODNODEMAP", []):
-        parts = line.split()
-        if len(parts) < 3 or parts[0] == "NAMESPACE":
-          continue
-        ns, pname, node = parts[0], parts[1], parts[2]
-        if not pname:
-          continue
-        fallback_rows += 1
-        pods_by_node.setdefault(node or "(unscheduled)", []).append({
-          "namespace": ns, "name": pname, "phase": "Unknown",
-          "restarts": 0, "ready": "-", "reason": "", "message": "",
-          "pod_ip": "", "host_ip": "", "qos": "", "created": "",
-          "owner": "", "waiting": "",
-        })
-      if fallback_rows:
-        self._pods_parse_error = (
-          "Detailed pod inventory was unavailable; showing pod counts from "
-          "a compact Kubernetes node map."
-        )
+    # Use the lightweight node map as the authoritative source for
+    # node pod counts. Detailed pod records are merged below when available.
+    node_map = {}
+    for line in sec.get("PODNODEMAP", []):
+      parts = line.split()
+      if len(parts) < 3 or parts[0].upper() == "NAMESPACE":
+        continue
+      ns, pname = parts[0], parts[1]
+      node = " ".join(parts[2:]).strip()
+      if not pname:
+        continue
+      node_map.setdefault(node or "(unscheduled)", []).append((ns, pname))
+
+    if node_map:
+      # Preserve detailed records where their node mapping agrees with the
+      # authoritative map, and synthesize lightweight records for anything
+      # that was not returned by the detailed query.
+      detailed = {}
+      for node, items in pods_by_node.items():
+        for pod in items:
+          detailed[(pod["namespace"], pod["name"])] = pod
+      merged = {}
+      for node, items in node_map.items():
+        rows = []
+        for ns, pname in items:
+          pod = detailed.get((ns, pname))
+          if pod is None:
+            pod = {
+              "namespace": ns, "name": pname, "phase": "Unknown",
+              "restarts": 0, "ready": "-", "reason": "", "message": "",
+              "pod_ip": "", "host_ip": "", "qos": "", "created": "",
+              "owner": "", "waiting": "",
+            }
+          rows.append(pod)
+        merged[node] = rows
+      pods_by_node = merged
+      self._pods_parse_error = None if detailed else (
+        "Using compact Kubernetes pod inventory; detailed pod status "
+        "was unavailable for this refresh."
+      )
 
     # Per-pod CPU/memory usage from `kubectl top pods`, keyed by
     # (namespace, name). Missing entirely (no metrics-server) just
