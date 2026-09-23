@@ -2697,7 +2697,7 @@ class DashboardTab(QWidget):
       for pod in items:
         detailed[(pod["namespace"], pod["name"])] = pod
 
-    if pod_map_status == 0:
+    if pod_map_status == 0 and node_map:
       merged = {}
       for node, items in node_map.items():
         rows = []
@@ -2723,6 +2723,17 @@ class DashboardTab(QWidget):
         "was unavailable for this refresh."
       )
     else:
+      # Empty output is not treated as a real zero-pod cluster when we
+      # already have a known-good snapshot. This is important because
+      # kubectl can exit 0 while returning no rows during a transient
+      # API/SSH response problem.
+      previous = getattr(self, "_last_good_pods_by_node", {}) or {}
+      if previous:
+        pods_by_node = {k: list(v) for k, v in previous.items()}
+        self._pods_parse_error = (
+          "Pod inventory returned no rows; showing the previous successful "
+          "pod snapshot."
+        )
       # Non-zero status (or no status marker, for compatibility) means the
       # pod query did not complete successfully. Keep the previous snapshot
       # rather than displaying a false zero-pod state.
