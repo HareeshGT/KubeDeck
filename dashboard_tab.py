@@ -422,6 +422,8 @@ else
  # pod status response.
  echo __PODNODEMAP__
  kubectl get pods --all-namespaces -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' --no-headers 2>/dev/null
+ echo __PODNODEMAP_STATUS__
+ echo $?
 
  echo __PODTOP__
  kubectl top pods --all-namespaces --no-headers 2>/dev/null
@@ -1400,6 +1402,7 @@ class DashboardTab(QWidget):
     # the node table's first column (so a click on a row can look its
     # pods up with no extra bookkeeping). Rebuilt on every refresh.
     self._pods_by_node_cache = {}
+    self._last_good_pods_by_node = {}
     self._pod_usage_cache  = {}
     self._pods_parse_error = None
 
@@ -2669,11 +2672,13 @@ class DashboardTab(QWidget):
         )
 
     # Use the lightweight node map as the authoritative source for
-    # node pod counts. Detailed pod records are merged below when available.
+    # node pod counts. Most importantly, distinguish a successful empty
+    # result from a failed/interrupted kubectl request. A failed request
+    # must never be rendered as "0 pods".
     node_map = {}
     for line in sec.get("PODNODEMAP", []):
       parts = line.split()
-      if len(parts) < 3 or parts[0].upper() == "NAMESPACE":
+      if len(parts) < 2 or parts[0].upper() == "NAMESPACE":
         continue
       ns, pname = parts[0], parts[1]
       node = " ".join(parts[2:]).strip()
@@ -2681,14 +2686,18 @@ class DashboardTab(QWidget):
         continue
       node_map.setdefault(node or "(unscheduled)", []).append((ns, pname))
 
-    if node_map:
-      # Preserve detailed records where their node mapping agrees with the
-      # authoritative map, and synthesize lightweight records for anything
-      # that was not returned by the detailed query.
-      detailed = {}
-      for node, items in pods_by_node.items():
-        for pod in items:
-          detailed[(pod["namespace"], pod["name"])] = pod
+    status_lines = [x.strip() for x in sec.get("PODNODEMAP_STATUS", []) if x.strip()]
+    try:
+      pod_map_status = int(status_lines[-1]) if status_lines else None
+    except ValueError:
+      pod_map_status = None
+
+    detailed = {}
+    for node, items in pods_by_node.items():
+      for pod in items:
+        detailed[(pod["namespace"], pod["name"])] = pod
+
+    if pod_map_status == 0:
       merged = {}
       for node, items in node_map.items():
         rows = []
@@ -2704,10 +2713,31 @@ class DashboardTab(QWidget):
           rows.append(pod)
         merged[node] = rows
       pods_by_node = merged
+      # Only a successful kubectl response is allowed to replace the
+      # dashboard's last known-good pod snapshot.
+      self._last_good_pods_by_node = {
+        k: list(v) for k, v in pods_by_node.items()
+      }
       self._pods_parse_error = None if detailed else (
         "Using compact Kubernetes pod inventory; detailed pod status "
         "was unavailable for this refresh."
       )
+    else:
+      # Non-zero status (or no status marker, for compatibility) means the
+      # pod query did not complete successfully. Keep the previous snapshot
+      # rather than displaying a false zero-pod state.
+      previous = getattr(self, "_last_good_pods_by_node", {}) or {}
+      if previous:
+        pods_by_node = {k: list(v) for k, v in previous.items()}
+        self._pods_parse_error = (
+          "Pod inventory refresh failed; showing the previous successful "
+          "pod snapshot."
+        )
+      elif pod_map_status is not None:
+        pods_by_node = {}
+        self._pods_parse_error = (
+          f"Pod inventory query failed (kubectl exit {pod_map_status})."
+        )
 
     # Per-pod CPU/memory usage from `kubectl top pods`, keyed by
     # (namespace, name). Missing entirely (no metrics-server) just
