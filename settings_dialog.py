@@ -424,13 +424,23 @@ class SettingsDialog(QDialog):
         v.setSpacing(10)
         v.setContentsMargins(4, 14, 4, 4)
 
-        self.webapp_enable_chk = QCheckBox("Enable the local web dashboard")
-        self.webapp_enable_chk.setChecked(self._webapp_enabled)
-        v.addWidget(self.webapp_enable_chk)
+        self.webapp_enable_btn = QPushButton()
+        self.webapp_enable_btn.setCheckable(True)
+        self.webapp_enable_btn.setChecked(self._webapp_enabled)
+        self.webapp_enable_btn.setMinimumHeight(38)
+        self.webapp_enable_btn.clicked.connect(self._update_webapp_toggle_button)
+        self._update_webapp_toggle_button(self._webapp_enabled)
+        v.addWidget(self.webapp_enable_btn)
+
+        self.webapp_status_lbl = QLabel()
+        self.webapp_status_lbl.setStyleSheet(
+            f"color: {T['TEXT_DIM']}; font-size: 12px;"
+        )
+        v.addWidget(self.webapp_status_lbl)
 
         desc = QLabel(
-            "Optional local web dashboard. It is disabled by default and binds "
-            "only to 127.0.0.1 when enabled. It reuses the current SSH connection."
+            "Enable or disable the local web dashboard. When enabled, KubeDock "
+            "starts the web server automatically and reuses the current SSH connection."
         )
         v.addWidget(desc)
         v.addSpacing(6)
@@ -476,6 +486,21 @@ class SettingsDialog(QDialog):
         v.addStretch()
         return w
 
+    def _update_webapp_toggle_button(self, checked):
+        self.webapp_enable_btn.blockSignals(True)
+        self.webapp_enable_btn.setChecked(bool(checked))
+        self.webapp_enable_btn.setText(
+            "●  Web App Enabled — Click to Disable"
+            if checked else
+            "○  Web App Disabled — Click to Enable"
+        )
+        self.webapp_enable_btn.blockSignals(False)
+        self.webapp_status_lbl.setText(
+            "Web App is currently enabled."
+            if checked else
+            "Web App is currently disabled."
+        )
+
     def _on_toggle_show_web_password(self, checked):
         self.web_password_edit.setEchoMode(
             QLineEdit.Normal if checked else QLineEdit.Password
@@ -511,7 +536,7 @@ class SettingsDialog(QDialog):
             self._ai_models,
         )
         webapp_extra = {
-            "webapp_enabled": self.webapp_enable_chk.isChecked(),
+            "webapp_enabled": self.webapp_enable_btn.isChecked(),
             "webapp_username": self.web_username_edit.text().strip(),
         }
         new_web_password = self.web_password_edit.text()
@@ -530,7 +555,7 @@ class SettingsDialog(QDialog):
         try:
             from webapp import app as webapp_app
             main_window = self.parent()
-            if self.webapp_enable_chk.isChecked():
+            if self.webapp_enable_btn.isChecked():
                 webapp_app.start_server(lambda: getattr(main_window, "ssh", None))
             else:
                 webapp_app.stop_server()
