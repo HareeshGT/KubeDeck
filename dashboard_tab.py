@@ -428,9 +428,9 @@ else
  kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null
 
  echo __PODS__
- # Use kubectl's built-in wide pod table for the core live fields. It is
- # intentionally simple and stable across kubectl versions.
- kubectl get pods --all-namespaces -o wide --no-headers 2>/dev/null
+ # jsonpath, pipe-delimited — see the note below this script for why this
+ # replaced the old `-o wide` text table.
+ kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}|{.metadata.name}|{.status.phase}|{.spec.nodeName}|{.status.podIP}|{.status.hostIP}|{.status.qosClass}|{.metadata.creationTimestamp}|{.status.reason}|{range .status.containerStatuses[*]}{.ready}{","}{end}|{range .status.containerStatuses[*]}{.restartCount}{","}{end}|{.status.message}{"\n"}{end}' 2>/dev/null
  echo __PODOWNERS__
  kubectl get pods --all-namespaces --no-headers -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNERKIND:.metadata.ownerReferences[0].kind,OWNERNAME:.metadata.ownerReferences[0].name' 2>/dev/null
 
@@ -2654,10 +2654,11 @@ class DashboardTab(QWidget):
           "cpu_cores": parts[1], "mem_bytes": parts[3],
         }
 
-    # Full pod inventory from kubectl's stable wide table.
-    # Layout is: namespace name ready status restarts age podIP node.
-    # Some kubectl versions add restart-age text in the RESTARTS column, so
-    # use the last three columns for age/IP/node instead of fixed positions.
+    # Full pod inventory via jsonpath, pipe-delimited (see the note below
+    # this file's _K8S_CMD for why this replaced the old `-o wide` text
+    # table): namespace|name|phase|node|podIP|hostIP|qos|created|reason|
+    # ready-flags|restart-counts|message, with message last and unsplit so
+    # embedded "|" in a message can never shift the fields before it.
     pods_by_node = {}
     pod_lines = [l for l in sec.get("PODS", []) if l.strip()]
     self._pods_parse_error = None
@@ -2670,32 +2671,30 @@ class DashboardTab(QWidget):
         pod_meta[(parts[0], parts[1])] = f"{parts[2]}/{parts[3]}".strip("/")
 
     for line in pod_lines:
-      parts = line.split()
-      if len(parts) < 8:
+      parts = line.split("|", 11)
+      if len(parts) < 11:
         malformed_pod_rows += 1
         continue
-      ns, pname, ready_raw, phase = parts[:4]
-      ip, node = parts[-2], parts[-1]
-      age = parts[-3]
-      restarts_raw = parts[4]
+      (ns, pname, phase, node, pod_ip, host_ip, qos, created, reason,
+       ready_raw, restart_raw) = parts[:11]
+      message = parts[11] if len(parts) > 11 else ""
       if not pname:
         malformed_pod_rows += 1
         continue
-      try:
-        restarts = int(restarts_raw)
-      except ValueError:
-        restarts = 0
-      ready = ready_raw if re.match(r"^\\d+/\\d+$", ready_raw) else "-"
+      ready_flags = [x for x in ready_raw.split(",") if x]
+      restart_counts = [x for x in restart_raw.split(",") if x]
+      ready_count = sum(1 for x in ready_flags if x == "true")
+      restarts = sum(int(x) for x in restart_counts if x.lstrip("-").isdigit())
+      ready = f"{ready_count}/{len(ready_flags)}" if ready_flags else "-"
       owner = pod_meta.get((ns, pname), "")
       pods_by_node.setdefault(node.strip() or "(unscheduled)", []).append({
         "namespace": ns.strip(), "name": pname.strip(),
         "phase": phase.strip() or "Unknown",
         "restarts": restarts,
         "ready": ready,
-        "reason": "", "message": "",
-        "pod_ip": ip.strip() if ip not in ("<none>", "<none>") else "",
-        "host_ip": "", "qos": "", "created": "",
-        "age": age.strip(),
+        "reason": reason.strip(), "message": message.strip(),
+        "pod_ip": pod_ip.strip(),
+        "host_ip": host_ip.strip(), "qos": qos.strip(), "created": created.strip(),
         "owner": owner,
         "waiting": "",
       })
