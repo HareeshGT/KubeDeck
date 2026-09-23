@@ -429,7 +429,6 @@ class SettingsDialog(QDialog):
         self.webapp_enable_btn.setChecked(self._webapp_enabled)
         self.webapp_enable_btn.setMinimumHeight(38)
         self.webapp_enable_btn.clicked.connect(self._update_webapp_toggle_button)
-        self._update_webapp_toggle_button(self._webapp_enabled)
         v.addWidget(self.webapp_enable_btn)
 
         self.webapp_status_lbl = QLabel()
@@ -437,6 +436,7 @@ class SettingsDialog(QDialog):
             f"color: {T['TEXT_DIM']}; font-size: 12px;"
         )
         v.addWidget(self.webapp_status_lbl)
+        self._update_webapp_toggle_button(self._webapp_enabled)
 
         desc = QLabel(
             "Enable or disable the local web dashboard. When enabled, KubeDock "
