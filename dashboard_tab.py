@@ -428,9 +428,11 @@ else
  kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null
 
  echo __PODS__
- # Use kubectl's tabular formatter for detailed pod metadata too. This is
- # deliberately less fragile than a nested JSONPath over containerStatuses.
- kubectl get pods --all-namespaces --no-headers -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName,PODIP:.status.podIP,HOSTIP:.status.hostIP,QOS:.status.qosClass,CREATED:.metadata.creationTimestamp,OWNERKIND:.metadata.ownerReferences[0].kind,OWNERNAME:.metadata.ownerReferences[0].name,READY:.status.containerStatuses[*].ready,RESTARTS:.status.containerStatuses[*].restartCount' 2>/dev/null
+ # Use kubectl's built-in wide pod table for the core live fields. It is
+ # intentionally simple and stable across kubectl versions.
+ kubectl get pods --all-namespaces -o wide --no-headers 2>/dev/null
+ echo __PODOWNERS__
+ kubectl get pods --all-namespaces --no-headers -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNERKIND:.metadata.ownerReferences[0].kind,OWNERNAME:.metadata.ownerReferences[0].name' 2>/dev/null
 
  echo __PODTOP__
  kubectl top pods --all-namespaces --no-headers 2>/dev/null
@@ -937,7 +939,7 @@ class NodeDetailWindow(QWidget):
         usage["mem"] if usage else "n/a",
         str(pod["restarts"]), pod["ready"],
         pod.get("pod_ip") or "—",
-        _short_age(pod.get("created", "")),
+        pod.get("age") or _short_age(pod.get("created", "")),
         pod.get("owner") or "—",
       ])
       item.setData(0, Qt.UserRole, (pod["namespace"], pod["name"]))
@@ -2652,46 +2654,48 @@ class DashboardTab(QWidget):
           "cpu_cores": parts[1], "mem_bytes": parts[3],
         }
 
-    # Full pod inventory. The detailed query uses custom-columns, so each
-    # pod is exactly one whitespace-delimited row and cannot be broken by a
-    # nested JSONPath/container loop.
+    # Full pod inventory from kubectl's stable wide table.
+    # Layout is: namespace name ready status restarts age podIP node.
+    # Some kubectl versions add restart-age text in the RESTARTS column, so
+    # use the last three columns for age/IP/node instead of fixed positions.
     pods_by_node = {}
     pod_lines = [l for l in sec.get("PODS", []) if l.strip()]
     self._pods_parse_error = None
     malformed_pod_rows = 0
+    pod_meta = {}
+
+    for line in sec.get("PODOWNERS", []):
+      parts = line.split()
+      if len(parts) >= 4:
+        pod_meta[(parts[0], parts[1])] = f"{parts[2]}/{parts[3]}".strip("/")
 
     for line in pod_lines:
       parts = line.split()
-      if len(parts) < 12:
+      if len(parts) < 8:
         malformed_pod_rows += 1
         continue
-      (ns, pname, phase, node, pod_ip, host_ip, qos, created,
-       owner_kind, owner_name, ready_raw, restarts_raw) = parts[:12]
+      ns, pname, ready_raw, phase = parts[:4]
+      ip, node = parts[-2], parts[-1]
+      age = parts[-3]
+      restarts_raw = parts[4]
       if not pname:
         malformed_pod_rows += 1
         continue
-
-      ready_values = [x.strip().lower() for x in ready_raw.split(",") if x.strip()]
-      restart_values = [x.strip() for x in restarts_raw.split(",") if x.strip()]
-      ready_count = sum(1 for x in ready_values if x == "true")
-      container_count = len(ready_values)
       try:
-        restarts = sum(int(x) for x in restart_values)
+        restarts = int(restarts_raw)
       except ValueError:
         restarts = 0
-
-      owner = f"{owner_kind}/{owner_name}".strip("/") if owner_kind or owner_name else ""
+      ready = ready_raw if re.match(r"^\\d+/\\d+$", ready_raw) else "-"
+      owner = pod_meta.get((ns, pname), "")
       pods_by_node.setdefault(node.strip() or "(unscheduled)", []).append({
         "namespace": ns.strip(), "name": pname.strip(),
         "phase": phase.strip() or "Unknown",
         "restarts": restarts,
-        "ready": f"{ready_count}/{container_count}" if container_count else "-",
-        "reason": "",
-        "message": "",
-        "pod_ip": pod_ip.strip(),
-        "host_ip": host_ip.strip(),
-        "qos": qos.strip(),
-        "created": created.strip(),
+        "ready": ready,
+        "reason": "", "message": "",
+        "pod_ip": ip.strip() if ip not in ("<none>", "<none>") else "",
+        "host_ip": "", "qos": "", "created": "",
+        "age": age.strip(),
         "owner": owner,
         "waiting": "",
       })
