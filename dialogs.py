@@ -1691,9 +1691,10 @@ class FileEditorDialog(QDialog):
     # than blocking behind a separate "downloading" dialog first.
     self._loading      = content is None
     self._load_worker    = None
-    self._load_sftp      = None
     self._decoder      = None
     self._chunks_since_sync = 0
+    self._buffer_small   = False
+    self._pending_bytes   = None
 
     fname = os.path.basename(remote_path)
     self.setWindowTitle(f"Edit — {fname}")
@@ -2113,6 +2114,13 @@ class FileEditorDialog(QDialog):
     self.editor.setLineWrapMode(QPlainTextEdit.WidgetWidth if on else QPlainTextEdit.NoWrap)
 
   def _toggle_find_bar(self, on: bool):
+    if on and self._loading:
+      # Ctrl+F can still fire this while a big file is mid-stream (the
+      # button itself is disabled, but the shortcut isn't gated on that).
+      # Matches computed against a partially-loaded document are wrong
+      # anyway, so just bounce it back off instead of opening the bar.
+      self._find_btn.setChecked(False)
+      return
     self._find_bar.setVisible(on)
     if on:
       self._find_inp.setFocus()
@@ -2144,14 +2152,40 @@ class FileEditorDialog(QDialog):
   # scrolling the file as soon as the first chunks land. Save stays
   # disabled until the whole file has arrived, so there's no risk of
   # saving back a partially-loaded file.
+  # Files at or under this size are buffered fully in memory and dropped
+  # into the editor in one shot instead of being appended chunk-by-chunk
+  # (see _on_load_chunk / _on_load_finished). Streaming was previously
+  # unconditional — every file, however small, opened behind a "Loading…"
+  # spinner and a stream of incremental JS calls into Monaco meant purely
+  # for files too big to read in one go. For a small file that's just
+  # visible lag for no benefit, and firing several of those JS round-trips
+  # back-to-back (each one replacing the whole Monaco model) right before
+  # the user starts typing into Find was what made Find crash the app.
+  SMALL_FILE_BYTES = 256 * 1024
+
   def _start_live_load(self):
     self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     self._chunks_since_sync = 0
     self._save_btn.setEnabled(False)
     self._save_close_btn.setEnabled(False)
-    self._load_bar.show()
-    self._load_bar.setRange(0, 0)
-    self._set_status("Loading…", T['WARNING'])
+    self._find_btn.setEnabled(False)
+
+    # Assume small until proven otherwise, and find out reactively from
+    # data the *background* worker reports (chunk_ready / progress),
+    # rather than statting the file up front here. An earlier version of
+    # this called self._sftp.stat(...) directly in this method — which
+    # runs on the GUI thread — right before starting the worker. Right
+    # after closing a previous editor, that previous worker's QThread
+    # can still be winding down (cancel() only closes its handle, it
+    # doesn't wait() for the thread to exit), so a synchronous stat()
+    # call here from the GUI thread could contend with it for the same
+    # SFTP/SSH connection, which isn't safe to use from two threads at
+    # once — that's what turned a quick close-then-reopen of the same
+    # file into a long/hung "Loading…". Nothing here now touches the
+    # connection except the worker itself, on its own thread.
+    self._buffer_small = True
+    self._pending_bytes = bytearray()
+    self._load_bar.hide()
 
     # Undo/redo would otherwise record every one of the ~240 chunk
     # inserts that make up a big file's load as its own undo command —
@@ -2169,32 +2203,8 @@ class FileEditorDialog(QDialog):
     except Exception:
       pass
 
-    # Direct editor reads get their own SFTP session. The shared SFTP
-    # client is also used by directory browsing, previews and transfers;
-    # a blocked request there must not leave this editor stuck on
-    # "Loading..." forever.
-    load_sftp = self._sftp
-    self._load_sftp = None
-    if (
-      not self._sudo_user
-      and not hasattr(self._sftp, "_ftp")
-      and self._ssh is not None
-    ):
-      try:
-        load_sftp = self._ssh.open_sftp()
-        self._load_sftp = load_sftp
-        try:
-          load_sftp.get_channel().settimeout(30.0)
-        except Exception:
-          pass
-      except Exception:
-        # Fall back to the existing SFTP object if a second session cannot
-        # be opened. The worker still runs off the UI thread.
-        load_sftp = self._sftp
-        self._load_sftp = None
-
     self._load_worker = FileStreamReadWorker(
-      load_sftp, self._ssh, self._remote,
+      self._sftp, self._ssh, self._remote,
       sudo_user=self._sudo_user, max_bytes=self.MAX_EDIT_BYTES,
     )
     self._load_worker.chunk_ready.connect(self._on_load_chunk)
@@ -2203,7 +2213,39 @@ class FileEditorDialog(QDialog):
     self._load_worker.finished_err.connect(self._on_load_error)
     self._load_worker.start()
 
+  def _flush_small_buffer(self):
+    """Switch from buffering to live-append mode mid-load.
+
+    Called once we learn (from data the background worker has already
+    sent us) that the file is bigger than SMALL_FILE_BYTES after all.
+    Pushes what's been buffered so far into the editor as one chunk,
+    then lets subsequent chunks flow through the normal live-append path.
+    """
+    if not self._buffer_small:
+      return
+    self._buffer_small = False
+    self._load_bar.show()
+    self._load_bar.setRange(0, 0)
+    self._set_status("Loading…", T['WARNING'])
+    try:
+      text = self._decoder.decode(bytes(self._pending_bytes))
+    except RuntimeError:
+      text = ""
+    self._pending_bytes = bytearray()
+    if text:
+      if hasattr(self.editor, "append_text"):
+        self.editor.append_text(text)
+      else:
+        cur = self.editor.textCursor()
+        cur.movePosition(QTextCursor.End)
+        cur.insertText(text)
+
   def _on_load_chunk(self, chunk: bytes):
+    if self._buffer_small:
+      self._pending_bytes += chunk
+      if len(self._pending_bytes) > self.SMALL_FILE_BYTES:
+        self._flush_small_buffer()
+      return
     try:
       text = self._decoder.decode(chunk)
     except RuntimeError:
@@ -2223,6 +2265,14 @@ class FileEditorDialog(QDialog):
     self._chunks_since_sync += 1
 
   def _on_load_progress(self, done, total):
+    # A known total bigger than the small-file cutoff means this isn't
+    # going to fit in one buffered shot — flip into live-streaming mode
+    # right away instead of waiting for the buffer itself to cross the
+    # threshold, so the loading UI shows up promptly for a big file.
+    if self._buffer_small and total > self.SMALL_FILE_BYTES:
+      self._flush_small_buffer()
+    if self._buffer_small:
+      return
     try:
       if total > 0:
         self._load_bar.setRange(0, 1000)
@@ -2237,14 +2287,21 @@ class FileEditorDialog(QDialog):
 
   def _on_load_finished(self, total_bytes: int):
     try:
-      tail = self._decoder.decode(b"", final=True)
-      if tail:
-        if hasattr(self.editor, "append_text"):
-          self.editor.append_text(tail)
-        else:
-          cur = self.editor.textCursor()
-          cur.movePosition(QTextCursor.End)
-          cur.insertText(tail)
+      if self._buffer_small:
+        # File turned out to be small end-to-end — render it in one
+        # shot rather than replaying the incremental-append path.
+        full_text = self._pending_bytes.decode("utf-8", errors="replace")
+        self._pending_bytes = bytearray()
+        self.editor.setPlainText(full_text)
+      else:
+        tail = self._decoder.decode(b"", final=True)
+        if tail:
+          if hasattr(self.editor, "append_text"):
+            self.editor.append_text(tail)
+          else:
+            cur = self.editor.textCursor()
+            cur.movePosition(QTextCursor.End)
+            cur.insertText(tail)
       if total_bytes >= self.MAX_EDIT_BYTES:
         truncation = (
           "\n\n[... file truncated at {} -- too large to fully load "
@@ -2262,6 +2319,7 @@ class FileEditorDialog(QDialog):
       self.editor.setUndoRedoEnabled(True)
       self._save_btn.setEnabled(True)
       self._save_close_btn.setEnabled(True)
+      self._find_btn.setEnabled(True)
       self._original = self.editor.toPlainText()
       self._modified_dot.hide()
       self._set_status("Ready")
@@ -2274,13 +2332,14 @@ class FileEditorDialog(QDialog):
       # alive for the rest of the dialog's lifetime.
       self._load_worker = None
       self._decoder   = None
-      self._close_load_sftp()
+      self._pending_bytes = None
 
   def _on_load_error(self, msg):
     try:
       self._loading = False
       self._load_bar.hide()
       self.editor.setUndoRedoEnabled(True)
+      self._find_btn.setEnabled(True)
       self._set_status("Failed to load: {}".format(msg), T['DANGER'])
       self.editor.textChanged.connect(self._on_text_changed)
     except RuntimeError:
@@ -2288,7 +2347,7 @@ class FileEditorDialog(QDialog):
     finally:
       self._load_worker = None
       self._decoder   = None
-      self._close_load_sftp()
+      self._pending_bytes = None
     QMessageBox.critical(self, "Cannot Open File", msg)
 
   # ── Find / Replace ────────────────────────────────────────
@@ -2312,91 +2371,51 @@ class FileEditorDialog(QDialog):
       return None
 
   def _do_highlight(self):
-    # Never search a document while the initial remote load is still
-    # changing it. The user can start Find immediately, but highlighting
-    # begins once the editor reaches Ready.
-    if self._loading:
-      self._matches = []
-      self._match_idx = -1
-      try:
-        self.editor.set_search_selections([])
-      except RuntimeError:
-        pass
-      self._update_match_label()
+    pattern = self._compiled_pattern()
+    self._matches  = []
+    self._match_idx = -1
+    if pattern is None:
+      self.editor.set_search_selections([])
+      if self._find_inp.text() and self._regex_chk.isChecked():
+        self._match_lbl.setText("bad regex")
+        self._match_lbl.setStyleSheet(f"color: {T['DANGER']}; font-size: 12px;")
+      else:
+        self._match_lbl.setText("")
+        self._match_lbl.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 12px;")
       return
 
-    pattern = self._compiled_pattern()
-    self._matches = []
-    self._match_idx = -1
+    text = self.editor.toPlainText()
+    self._matches = [(m.start(), m.end()) for m in pattern.finditer(text)]
 
-    try:
-      if pattern is None:
-        self.editor.set_search_selections([])
-        if self._find_inp.text() and self._regex_chk.isChecked():
-          self._match_lbl.setText("bad regex")
-          self._match_lbl.setStyleSheet(f"color: {T['DANGER']}; font-size: 12px;")
-        else:
-          self._match_lbl.setText("")
-          self._match_lbl.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 12px;")
-        return
+    # Keep navigation anchored near the cursor rather than always
+    # snapping back to match #1 on every keystroke.
+    cur_pos = self.editor.textCursor().position()
+    self._match_idx = next(
+      (i for i, (s, _e) in enumerate(self._matches) if s >= cur_pos), 0
+    ) if self._matches else -1
 
-      text = self.editor.toPlainText()
-
-      # Do not create an unbounded ExtraSelection for every occurrence.
-      # Very common search terms in large files can otherwise allocate
-      # thousands of QTextCursor objects and make Qt abort the process.
-      max_matches = 2000
-      self._matches = []
-      for match in pattern.finditer(text):
-        self._matches.append((match.start(), match.end()))
-        if len(self._matches) >= max_matches:
-          break
-
-      cur_pos = self.editor.textCursor().position()
-      self._match_idx = next(
-        (i for i, (start, _end) in enumerate(self._matches) if start >= cur_pos),
-        0,
-      ) if self._matches else -1
-
-      self._apply_match_selections()
-      self._update_match_label()
-    except (RuntimeError, ValueError):
-      self._matches = []
-      self._match_idx = -1
-      try:
-        self.editor.set_search_selections([])
-      except (RuntimeError, ValueError):
-        pass
+    self._apply_match_selections()
+    self._update_match_label()
 
   def _apply_match_selections(self):
-    try:
-      doc = self.editor.document()
-      doc_len = doc.characterCount()
-      selections = []
+    doc = self.editor.document()
+    selections = []
+    normal_fmt = QTextCharFormat()
+    normal_fmt.setBackground(QColor(T['WARNING']))
+    normal_fmt.setForeground(QColor("#1a1a1a"))
+    current_fmt = QTextCharFormat()
+    current_fmt.setBackground(QColor(T['ACCENT']))
+    current_fmt.setForeground(QColor("#ffffff"))
 
-      normal_fmt = QTextCharFormat()
-      normal_fmt.setBackground(QColor(T['WARNING']))
-      normal_fmt.setForeground(QColor("#1a1a1a"))
-      current_fmt = QTextCharFormat()
-      current_fmt.setBackground(QColor(T['ACCENT']))
-      current_fmt.setForeground(QColor("#ffffff"))
-
-      for i, (start, end) in enumerate(self._matches):
-        start = max(0, min(start, doc_len - 1))
-        end = max(start, min(end, doc_len - 1))
-        if end <= start:
-          continue
-        sel = QTextEdit.ExtraSelection()
-        sel.format = current_fmt if i == self._match_idx else normal_fmt
-        c = QTextCursor(doc)
-        c.setPosition(start)
-        c.setPosition(end, QTextCursor.KeepAnchor)
-        sel.cursor = c
-        selections.append(sel)
-
-      self.editor.set_search_selections(selections)
-    except (RuntimeError, ValueError):
-      pass
+    for i, (start, end) in enumerate(self._matches):
+      sel = QTextEdit.ExtraSelection()
+      sel.format = current_fmt if i == self._match_idx else normal_fmt
+      c = QTextCursor(doc)
+      c.setPosition(start)
+      c.setPosition(end, QTextCursor.KeepAnchor)
+      sel.cursor = c
+      selections.append(sel)
+    self.editor.set_search_selections(selections)
 
   def _update_match_label(self):
     if not self._matches:
@@ -2514,42 +2533,50 @@ class FileEditorDialog(QDialog):
     if self._save():
       self.accept()
 
-  def _close_load_sftp(self):
-    load_sftp = self._load_sftp
-    self._load_sftp = None
-    if load_sftp is not None:
-      try:
-        load_sftp.close()
-      except Exception:
-        pass
-
   def _cancel_live_load(self):
-    """Safely stop the live-load worker during dialog teardown."""
+    """Safely stop the live-load worker during dialog teardown.
+
+    QThread calls deleteLater() when it finishes. That means the Python
+    attribute can briefly outlive the underlying QObject. Never touch
+    signals or methods on a wrapper whose C++ object has already gone.
+    """
     worker = self._load_worker
     self._load_worker = None
 
     if worker is None:
       self._loading = False
-      self._close_load_sftp()
       return
 
     if sip is not None:
       try:
         if sip.isdeleted(worker):
           self._loading = False
-          self._close_load_sftp()
           return
       except Exception:
         pass
 
     try:
-      worker.cancel()
+      for sig, slot in (
+        (worker.chunk_ready, self._on_load_chunk),
+        (worker.progress, self._on_load_progress),
+        (worker.finished_ok, self._on_load_finished),
+        (worker.finished_err, self._on_load_error),
+      ):
+        try:
+          sig.disconnect(slot)
+        except (TypeError, RuntimeError):
+          pass
+
+      try:
+        worker.cancel()
+      except RuntimeError:
+        pass
     except RuntimeError:
-      # The QThread wrapper can already have been deleted by Qt.
+      # Qt can destroy the worker between the lifetime check and the
+      # first signal/method access. Closing the dialog must still win.
       pass
     finally:
       self._loading = False
-      self._close_load_sftp()
 
   def _confirm_close(self):
     if self._loading:

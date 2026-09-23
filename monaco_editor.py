@@ -47,6 +47,7 @@ class _Bridge(QObject):
     textChanged = pyqtSignal(str)
     saveRequested = pyqtSignal(str)
     cursorChanged = pyqtSignal(int, int)
+    editorReady = pyqtSignal()
 
     @pyqtSlot(str)
     def onTextChanged(self, text):
@@ -59,6 +60,10 @@ class _Bridge(QObject):
     @pyqtSlot(int, int)
     def onCursorChanged(self, line, column):
         self.cursorChanged.emit(line, column)
+
+    @pyqtSlot()
+    def onEditorReady(self):
+        self.editorReady.emit()
 
 
 def _html():
@@ -113,6 +118,14 @@ function boot() {
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
       if (window._bridge) _bridge.onSaveRequested(editor.getValue());
     });
+    // Let Python know the *editor object itself* exists now. loadFinished
+    // (the Qt side's signal) only means this HTML page's DOM is ready —
+    // Monaco's own bundle is still downloading from the CDN at that point
+    // and `editor` is still null for a bit longer. Every window.* call
+    // above silently no-ops while `editor` is null, so anything pushed
+    // from Python before this fires (e.g. the file's content) is just
+    // dropped on the floor rather than queued.
+    if (window._bridge) _bridge.onEditorReady();
   });
 }
 function setText(v) {
@@ -120,6 +133,22 @@ function setText(v) {
   const p = editor.getPosition();
   editor.setValue(v || "");
   if (p) editor.setPosition(p);
+}
+function appendText(v) {
+  // Used while a file is streaming in from the server. Unlike setText()
+  // this does NOT replace the model, so it doesn't reset the undo stack,
+  // scroll position or (most importantly) any in-flight search
+  // decorations on every single chunk of a large file.
+  if (!editor || !v) return;
+  const model = editor.getModel();
+  if (!model) return;
+  const lastLine = model.getLineCount();
+  const lastCol = model.getLineMaxColumn(lastLine);
+  model.applyEdits([{
+    range: new monaco.Range(lastLine, lastCol, lastLine, lastCol),
+    text: v,
+    forceMoveMarkers: true
+  }]);
 }
 function setLanguage(v) {
   if (editor) monaco.editor.setModelLanguage(editor.getModel(), v || "plaintext");
@@ -182,6 +211,7 @@ class MonacoEditor(QWidget):
         self._pt = base_point_size
         self._base_pt = base_point_size
         self._loaded = False
+        self._editor_ready = False
         self._syncing = False
         self._filename = ""
         self._language = "plaintext"
@@ -204,6 +234,7 @@ class MonacoEditor(QWidget):
         self._bridge.textChanged.connect(self._on_js_text)
         self._bridge.saveRequested.connect(self.saveRequested)
         self._bridge.cursorChanged.connect(self._on_js_cursor)
+        self._bridge.editorReady.connect(self._on_editor_ready)
 
         channel = QWebChannel(self._view.page())
         channel.registerObject("bridge", self._bridge)
@@ -219,8 +250,15 @@ class MonacoEditor(QWidget):
 
     def _on_loaded(self, ok):
         self._loaded = bool(ok)
-        if ok:
-            self._push_state()
+
+    def _on_editor_ready(self):
+        # This is the actual "safe to talk to Monaco" signal (see the
+        # comment next to _bridge.onEditorReady() in the HTML) — flush
+        # whatever's currently in the shadow document now that JS calls
+        # will actually land, instead of the (possibly still-empty, or
+        # possibly stale) state that was pushed too early.
+        self._editor_ready = True
+        self._push_state()
 
     def _on_js_text(self, text):
         if self._syncing:
@@ -239,7 +277,7 @@ class MonacoEditor(QWidget):
         self.cursorPositionChanged.emit()
 
     def _push_state(self):
-        if not self._view or not self._loaded:
+        if not self._view or not self._editor_ready:
             return
         text = json.dumps(self._shadow.toPlainText())
         lang = json.dumps(self._language)
@@ -269,7 +307,21 @@ class MonacoEditor(QWidget):
         c = self._shadow.textCursor()
         c.movePosition(QTextCursor.End)
         c.insertText(text)
-        self._push_state()
+        # Send just the new chunk via window.appendText() rather than
+        # routing through _push_state(), which re-serializes and resends
+        # the *entire* accumulated document on every call. For a file
+        # streaming in as ~64KB chunks that turned every chunk into an
+        # O(total-size-so-far) JSON dump + a full Monaco setValue() (which
+        # also nukes any active search decorations) — dozens of these
+        # firing in quick succession is what destabilized the WebEngine
+        # renderer when Find was used on/right after a file that had just
+        # finished loading.
+        if self._view and self._editor_ready:
+            self._syncing = True
+            self._view.page().runJavaScript(
+                f"window.appendText({json.dumps(text)})",
+                lambda _=None: self._clear_sync(),
+            )
         self.textChanged.emit()
 
     def toPlainText(self):
@@ -283,7 +335,7 @@ class MonacoEditor(QWidget):
 
     def setTextCursor(self, cursor):
         self._shadow.setTextCursor(cursor)
-        if self._view and self._loaded:
+        if self._view and self._editor_ready:
             self._view.page().runJavaScript(
                 f"window.setCursor({cursor.position()});window.focusEditor();"
             )
@@ -296,13 +348,13 @@ class MonacoEditor(QWidget):
         self.textChanged.emit()
 
     def undo(self):
-        if self._view and self._loaded:
+        if self._view and self._editor_ready:
             self._view.page().runJavaScript("window.undo()")
         else:
             self._shadow.undo()
 
     def redo(self):
-        if self._view and self._loaded:
+        if self._view and self._editor_ready:
             self._view.page().runJavaScript("window.redo()")
         else:
             self._shadow.redo()
@@ -312,7 +364,7 @@ class MonacoEditor(QWidget):
 
     def setLineWrapMode(self, mode):
         wrap = mode != 0
-        if self._view and self._loaded:
+        if self._view and self._editor_ready:
             self._view.page().runJavaScript(f"window.setWrap({str(wrap).lower()})")
 
     def set_search_selections(self, selections):
@@ -329,7 +381,7 @@ class MonacoEditor(QWidget):
                 a.blockNumber()+1, start-a.position()+1,
                 b.blockNumber()+1, end-b.position()+1,
             ])
-        if self._view and self._loaded:
+        if self._view and self._editor_ready:
             self._view.page().runJavaScript(
                 f"window.setDecorations({json.dumps(ranges)})"
             )
@@ -345,12 +397,12 @@ class MonacoEditor(QWidget):
 
     def set_point_size(self, pt):
         self._pt = max(self.MIN_PT, min(self.MAX_PT, pt))
-        if self._view and self._loaded:
+        if self._view and self._editor_ready:
             self._view.page().runJavaScript(f"window.setFontSize({self._pt})")
 
     def setFocus(self):
         super().setFocus()
-        if self._view and self._loaded:
+        if self._view and self._editor_ready:
             self._view.page().runJavaScript("window.focusEditor()")
 
     def refresh_theme(self):
