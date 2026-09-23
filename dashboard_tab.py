@@ -412,18 +412,21 @@ else
  echo __TOP__
  kubectl top nodes --no-headers 2>/dev/null
 
+ # Pod placement is the critical dashboard value. Collect this compact
+ # snapshot BEFORE any detailed pod/workload queries so a later slow query
+ # cannot prevent the node pod counts from reaching the client.
+ echo __PODNODEMAP__
+ podmap_status=0
+ podmap_output=$(kubectl get pods --all-namespaces -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' --no-headers 2>/dev/null) || podmap_status=$?
+ printf '%s\\n' "$podmap_output"
+ echo __PODNODEMAP_STATUS__
+ printf '%s\\n' "$podmap_status"
+
  echo __NAMESPACES__
  kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null
 
  echo __PODS__
  kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}|{.metadata.name}|{.status.phase}|{.status.reason}|{.spec.nodeName}|{.status.podIP}|{.status.hostIP}|{.status.qosClass}|{.metadata.creationTimestamp}|{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}|{range .status.containerStatuses[*]}{.ready},{.restartCount},{.state.waiting.reason};{end}{"\\n"}{end}' 2>/dev/null
-
- # Lightweight authoritative pod-to-node map, independent of the detailed
- # pod status response.
- echo __PODNODEMAP__
- kubectl get pods --all-namespaces -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' --no-headers 2>/dev/null
- echo __PODNODEMAP_STATUS__
- echo $?
 
  echo __PODTOP__
  kubectl top pods --all-namespaces --no-headers 2>/dev/null
