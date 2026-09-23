@@ -59,9 +59,9 @@ _PODMAP_CMD = r"""
 podmap_status=0
 podmap_output=$(kubectl get pods --all-namespaces -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' --no-headers 2>/dev/null) || podmap_status=$?
 echo __PODNODEMAP__
-printf '%s\\n' "$podmap_output"
+printf '%s\n' "$podmap_output"
 echo __PODNODEMAP_STATUS__
-printf '%s\\n' "$podmap_status"
+printf '%s\n' "$podmap_status"
 """
 
 
