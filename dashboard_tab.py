@@ -37,6 +37,7 @@ from datetime import datetime
 from PyQt5.QtWidgets import (
   QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
   QFrame, QScrollArea, QTreeWidget, QTreeWidgetItem, QGraphicsDropShadowEffect, QSizePolicy,
+  QComboBox,
 )
 from PyQt5.QtCore import (
   Qt, QTimer, QThread, pyqtSignal, QVariantAnimation, QEasingCurve, QEvent,
@@ -900,6 +901,28 @@ class NodeDetailWindow(QWidget):
     self.summary_lbl = QLabel("Waiting for data…")
     root.addWidget(self.summary_lbl)
 
+    sort_row = QHBoxLayout()
+    sort_row.setSpacing(8)
+
+    sort_label = QLabel("Sort by")
+    sort_label.setStyleSheet(f"color: {_dashboard_text('muted')}; font-size: 12px;")
+    sort_row.addWidget(sort_label)
+
+    self.sort_combo = QComboBox()
+    self.sort_combo.addItems([
+      "Pod name", "Namespace", "Status", "CPU", "Memory",
+      "Restarts", "Ready", "Age", "Owner",
+    ])
+    self.sort_combo.setMinimumWidth(145)
+    self.sort_combo.setToolTip("Choose the pod column to sort by")
+    sort_row.addWidget(self.sort_combo)
+
+    self.sort_order_btn = QPushButton("↑ Ascending")
+    self.sort_order_btn.setToolTip("Switch between ascending and descending order")
+    sort_row.addWidget(self.sort_order_btn)
+    sort_row.addStretch(1)
+    root.addLayout(sort_row)
+
     self.pod_tree = QTreeWidget()
     self.pod_tree.setHeaderLabels([
       "Pod", "Namespace", "Status", "CPU", "Memory",
@@ -912,6 +935,11 @@ class NodeDetailWindow(QWidget):
     root.addWidget(self.pod_tree)
 
     self._pod_snapshot = {}
+    self._pod_usage = {}
+    self._sort_key = "Pod name"
+    self._sort_ascending = True
+    self.sort_combo.currentTextChanged.connect(self._on_sort_changed)
+    self.sort_order_btn.clicked.connect(self._toggle_sort_order)
     self._apply_styles()
 
   def _apply_styles(self):
@@ -929,39 +957,8 @@ class NodeDetailWindow(QWidget):
 
   def update_pods(self, pods: list, pod_usage: dict, parse_error: str = None):
     self._pod_snapshot = {(p["namespace"], p["name"]): p for p in pods}
-    self.pod_tree.clear()
-
-    for pod in sorted(pods, key=lambda p: (p["namespace"], p["name"])):
-      usage = pod_usage.get((pod["namespace"], pod["name"]))
-      item = QTreeWidgetItem([
-        pod["name"], pod["namespace"], pod["phase"],
-        usage["cpu"] if usage else "n/a",
-        usage["mem"] if usage else "n/a",
-        str(pod["restarts"]), pod["ready"],
-        pod.get("pod_ip") or "—",
-        pod.get("age") or _short_age(pod.get("created", "")),
-        pod.get("owner") or "—",
-      ])
-      item.setData(0, Qt.UserRole, (pod["namespace"], pod["name"]))
-      item.setForeground(2, QColor(_status_color(pod["phase"])))
-      if pod["restarts"] > 0:
-        item.setForeground(5, QColor(T["WARNING"] if pod["restarts"] < 5 else T["DANGER"]))
-      ready_str = pod["ready"]
-      if "/" in ready_str:
-        got, want = ready_str.split("/", 1)
-        if got.isdigit() and want.isdigit():
-          item.setForeground(6, QColor(
-            T["SUCCESS"] if got == want and int(want) > 0 else T["WARNING"]
-          ))
-      for col in (3, 4):
-        item.setForeground(col, QColor(_dashboard_text("primary") if usage else _dashboard_text("muted")))
-      tooltip = self._pod_tooltip(pod)
-      for col in range(10):
-        item.setToolTip(col, tooltip)
-      self.pod_tree.addTopLevelItem(item)
-
-    for col in range(10):
-      self.pod_tree.resizeColumnToContents(col)
+    self._pod_usage = pod_usage or {}
+    self._rebuild_pod_rows()
 
     if parse_error:
       # Distinguish "the cluster genuinely has 0 pods here" from "the last
