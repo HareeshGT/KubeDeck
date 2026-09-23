@@ -3075,6 +3075,77 @@ class DashboardTab(QWidget):
     self.status_msg.emit("Dashboard updated")
 
   # ── Node detail window ──────────────────────────────────────
+  def _refresh_node_detail_from_api(self, node_name: str, win):
+    """Fetch authoritative pod objects for one node.
+    
+    The dashboard-wide pod snapshot is intentionally compact and can degrade
+    to a node/name map. A node detail window needs richer fields, so fetch
+    only this node's pods as JSON; the response is small and avoids the
+    large-cluster dashboard query/parser entirely.
+    """
+    safe_node = shlex.quote(str(node_name))
+    command = self._contextual_command(
+      f"kubectl get pods --all-namespaces --field-selector "
+      f"spec.nodeName={safe_node} -o json 2>/dev/null"
+    )
+
+    worker = CommandWorker(self.ssh, command, timeout=20)
+
+    def on_done(out, target=win, target_name=node_name):
+      if self._node_windows.get(target_name) is not target:
+        return
+      try:
+        data = json.loads(out or "{}")
+        pods = []
+        for item in data.get("items", []):
+          meta = item.get("metadata") or {}
+          status = item.get("status") or {}
+          containers = status.get("containerStatuses") or []
+          ready_count = sum(1 for c in containers if c.get("ready") is True)
+          restart_count = sum(int(c.get("restartCount") or 0) for c in containers)
+          owners = meta.get("ownerReferences") or []
+          owner = ""
+          if owners:
+            owner_ref = owners[0]
+            owner = f"{owner_ref.get('kind', '')}/{owner_ref.get('name', '')}".strip("/")
+          created = str(meta.get("creationTimestamp") or "")
+          pods.append({
+            "namespace": str(meta.get("namespace") or ""),
+            "name": str(meta.get("name") or ""),
+            "phase": str(status.get("phase") or "Unknown"),
+            "restarts": restart_count,
+            "ready": f"{ready_count}/{len(containers)}" if containers else "-",
+            "reason": str(status.get("reason") or ""),
+            "message": str(status.get("message") or ""),
+            "pod_ip": str(status.get("podIP") or ""),
+            "host_ip": str(status.get("hostIP") or ""),
+            "qos": str(status.get("qosClass") or ""),
+            "created": created,
+            "owner": owner,
+            "waiting": "",
+          })
+        self._pods_by_node_cache[target_name] = pods
+        target.update_pods(pods, self._pod_usage_cache)
+      except Exception as exc:
+        target.update_pods(
+          self._pods_by_node_cache.get(target_name, []),
+          self._pod_usage_cache,
+          parse_error=f"Detailed pod query failed: {exc}",
+        )
+
+    def on_error(err, target=win, target_name=node_name):
+      if self._node_windows.get(target_name) is target:
+        target.update_pods(
+          self._pods_by_node_cache.get(target_name, []),
+          self._pod_usage_cache,
+          parse_error=f"Detailed pod query failed: {err}",
+        )
+
+    worker.done.connect(on_done)
+    worker.error.connect(on_error)
+    track_worker(self._workers, worker)
+    worker.start()
+
   def _on_node_double_clicked(self, node_name: str):
     pods = self._pods_by_node_cache.get(node_name, [])
 
@@ -3084,10 +3155,13 @@ class DashboardTab(QWidget):
       win.closed.connect(self._on_node_window_closed)
       self._node_windows[node_name] = win
 
-    win.update_pods(pods, self._pod_usage_cache, parse_error=self._pods_parse_error)
+    win.update_pods(pods, self._pod_usage_cache, parse_error="Loading detailed pod status…")
     win.show()
     win.raise_()
     win.activateWindow()
+
+    if self.ssh:
+      self._refresh_node_detail_from_api(node_name, win)
 
   def _on_node_window_closed(self, node_name: str):
     self._node_windows.pop(node_name, None)
