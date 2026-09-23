@@ -397,6 +397,10 @@ if ! command -v kubectl >/dev/null 2>&1; then
  echo __NODEDETAILS__
  echo __TOP__
  echo __PODS__
+ # Independent compact node mapping used as a reliable fallback for pod counts.
+ echo __PODNODEMAP__
+ kubectl get pods --all-namespaces -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' --no-headers 2>/dev/null
+
  echo __PODTOP__
  echo __WORKLOADS__
  echo __SERVICES_ENDPOINTS__
@@ -2661,6 +2665,32 @@ class DashboardTab(QWidget):
         self._pods_parse_error = (
           "Pod inventory was empty during this refresh; showing the "
           "previous successful pod snapshot."
+        )
+
+    # The compact rich inventory is preferred for pod details. Keep an
+    # independent custom-columns node map as a fallback: it is much smaller
+    # and uses kubectl's tabular formatter, so a large/complex pod status
+    # response cannot make every node appear to have zero pods.
+    if not pods_by_node:
+      fallback_rows = 0
+      for line in sec.get("PODNODEMAP", []):
+        parts = line.split()
+        if len(parts) < 3 or parts[0] == "NAMESPACE":
+          continue
+        ns, pname, node = parts[0], parts[1], parts[2]
+        if not pname:
+          continue
+        fallback_rows += 1
+        pods_by_node.setdefault(node or "(unscheduled)", []).append({
+          "namespace": ns, "name": pname, "phase": "Unknown",
+          "restarts": 0, "ready": "-", "reason": "", "message": "",
+          "pod_ip": "", "host_ip": "", "qos": "", "created": "",
+          "owner": "", "waiting": "",
+        })
+      if fallback_rows:
+        self._pods_parse_error = (
+          "Detailed pod inventory was unavailable; showing pod counts from "
+          "a compact Kubernetes node map."
         )
 
     # Per-pod CPU/memory usage from `kubectl top pods`, keyed by
