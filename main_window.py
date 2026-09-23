@@ -31,6 +31,7 @@ from sudo_fs import SudoFS
 from ftp_fs import FTPFS
 from workers import CommandWorker, ConnectWorker, FTPConnectionWorker, ConnectionHealthWorker, FileStreamReadWorker, DirectoryListWorker, track_worker, managed_exec_command, close_ssh_connection_pool
 from dialogs import ConnectDialog, FileTransferDialog, FileEditorDialog, FileExecDialog, SearchDialog, ConnectingDialog, MediaPlayerDialog, AIExplainDialog
+from large_file_viewer import LargeFileViewerDialog
 import ai_assist
 from sidebar import Sidebar
 from preview import PreviewPane
@@ -1932,6 +1933,21 @@ class EC2FileManager(QMainWindow):
       return
     self._cancel_preview_worker()
     remote = self._current_remote(meta)
+    # Files over FileEditorDialog's own load cap never get to the point
+    # of streaming into it — the editor's cost scales with how much of
+    # the file it ends up holding live in one QTextDocument, so there's
+    # no cap on that path that's actually "safe", only a smaller one.
+    # Route these to the read-only, mmap-backed pager instead, whose
+    # memory/CPU cost is bounded by one page, independent of file size.
+    if meta.get("size", 0) > FileEditorDialog.MAX_EDIT_BYTES:
+      LargeFileViewerDialog.open_remote(
+        self, self.sftp, remote,
+        host=self._conn_host, port=self._conn_port,
+        user=self._conn_user, pem=self._conn_pem,
+        password=self._conn_password,
+        sudo_user=self._sudo_user,
+      )
+      return
     FileEditorDialog.open_remote(
       self, self.sftp, self.ssh, remote,
       sudo_user=self._sudo_user,
