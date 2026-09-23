@@ -2670,11 +2670,11 @@ class FileEditorDialog(QDialog):
     if self._loading:
       self._cancel_live_load()
       try:
-      if hasattr(self.editor, "dispose"):
-        self.editor.dispose()
-    except Exception:
-      pass
-    event.accept()
+        if hasattr(self.editor, "dispose"):
+          self.editor.dispose()
+      except Exception:
+        pass
+      event.accept()
       return
     if self.editor.toPlainText() != self._original:
       r = QMessageBox.question(

@@ -152,6 +152,16 @@ class KubernetesTab(QWidget):
     if chosen:
       self.context_combo.setCurrentText(chosen)
       self._current_context = chosen
+      # setCurrentText() above is wrapped in blockSignals(), so
+      # currentTextChanged (and therefore _on_context_change /
+      # context_changed) never fires for this initial pick — only for a
+      # later, user-driven switch. Without this, anything listening for
+      # context_changed (e.g. DashboardTab.set_kube_context, wired up in
+      # main_window.py) never learns which cluster was actually selected
+      # on first connect, and silently falls back to querying whatever
+      # the SSH session's ambient kubectl current-context happens to be
+      # — which can be a different cluster than the one shown here.
+      self.context_changed.emit(chosen)
     self.context_combo.blockSignals(False)
 
     if not self._current_context:

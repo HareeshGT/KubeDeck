@@ -1058,6 +1058,17 @@ class EC2FileManager(QMainWindow):
     # ── Dashboard tab ──────────────────────────────────────
     self.dashboard_tab = DashboardTab()
     self.dashboard_tab.status_msg.connect(lambda m: self.status.showMessage(m))
+    # Keep the Dashboard's node/pod snapshot pinned to whatever cluster
+    # context is selected in the Kubernetes tab. Without this, DashboardTab
+    # never calls set_kube_context() at all, so its kubectl calls carry no
+    # --context flag and silently run against the SSH session's ambient
+    # current-context instead — which can be a *different* cluster than the
+    # one shown in the Kubernetes tab (e.g. across dev/test/prod EKS/AKS
+    # clusters sharing one kubeconfig). That produces exactly the kind of
+    # "node exists but its pods don't match" mismatch the Dashboard's node
+    # detail window would otherwise show with no indication anything was
+    # pointed at the wrong cluster.
+    self.k8s_tab.context_changed.connect(self.dashboard_tab.set_kube_context)
     add_icon_tab(self.main_tabs, self.dashboard_tab, " Dashboard")
 
     # Land on the Dashboard tab by default rather than File Manager.
