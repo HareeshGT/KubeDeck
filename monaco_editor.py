@@ -169,6 +169,20 @@ function setDecorations(ranges) {
 function clearDecorations() {
   if (editor) decorations = editor.deltaDecorations(decorations, []);
 }
+function getValue() { return editor ? editor.getValue() : ""; }
+function setLargeMode() {
+  if (!editor) return;
+  editor.updateOptions({
+    minimap: {enabled:false}, folding:false, wordWrap:"off",
+    stickyScroll:{enabled:false}, quickSuggestions:false,
+    suggestOnTriggerCharacters:false, parameterHints:{enabled:false},
+    bracketPairColorization:{enabled:false}, guides:{bracketPairs:false},
+    renderWhitespace:"none", smoothScrolling:false, cursorBlinking:"solid",
+    occurrencesHighlight:false, selectionHighlight:false, codeLens:false,
+    links:false, unicodeHighlight:{enabled:false}
+  });
+  monaco.editor.setModelLanguage(editor.getModel(), "plaintext");
+}
 function setReadOnly(v) {
   if (editor) editor.updateOptions({readOnly:!!v});
 }
@@ -206,7 +220,7 @@ class MonacoEditor(QWidget):
 
     MIN_PT, MAX_PT = 8, 28
 
-    def __init__(self, base_point_size=12, parent=None):
+    def __init__(self, base_point_size=12, parent=None, large_file=False):
         super().__init__(parent)
         self._pt = base_point_size
         self._base_pt = base_point_size
@@ -215,7 +229,8 @@ class MonacoEditor(QWidget):
         self._syncing = False
         self._filename = ""
         self._language = "plaintext"
-        self._shadow = QPlainTextEdit(self)
+        self._large_file = bool(large_file)
+        self._shadow = None if self._large_file else QPlainTextEdit(self)
         self._shadow.hide()
 
         layout = QVBoxLayout(self)
@@ -242,6 +257,8 @@ class MonacoEditor(QWidget):
         self._channel = channel
         layout.addWidget(self._view)
         self._view.loadFinished.connect(self._on_loaded)
+        if self._large_file:
+            self._bridge.editorReady.connect(self._enable_large_mode)
         self._view.setHtml(_html(), QUrl("https://kubedeck.local/"))
 
     @staticmethod
@@ -250,6 +267,10 @@ class MonacoEditor(QWidget):
 
     def _on_loaded(self, ok):
         self._loaded = bool(ok)
+
+    def _enable_large_mode(self):
+        if self._view and self._editor_ready:
+            self._view.page().runJavaScript("window.setLargeMode()")
 
     def _on_editor_ready(self):
         # This is the actual "safe to talk to Monaco" signal (see the
@@ -263,12 +284,18 @@ class MonacoEditor(QWidget):
     def _on_js_text(self, text):
         if self._syncing:
             return
+        if self._large_file:
+            self.textChanged.emit()
+            return
         self._shadow.blockSignals(True)
         self._shadow.setPlainText(text or "")
         self._shadow.blockSignals(False)
         self.textChanged.emit()
 
     def _on_js_cursor(self, line, column):
+        if self._large_file:
+            self.cursorPositionChanged.emit()
+            return
         block = self._shadow.document().findBlockByNumber(max(0, line - 1))
         if block.isValid():
             c = self._shadow.textCursor()
@@ -278,6 +305,11 @@ class MonacoEditor(QWidget):
 
     def _push_state(self):
         if not self._view or not self._editor_ready:
+            return
+        if self._large_file:
+            self._view.page().runJavaScript(
+                f"window.setLanguage({json.dumps(self._language)});window.setLargeMode();"
+            )
             return
         text = json.dumps(self._shadow.toPlainText())
         lang = json.dumps(self._language)
@@ -297,12 +329,29 @@ class MonacoEditor(QWidget):
         self._push_state()
 
     def setPlainText(self, text):
+        if self._large_file:
+            if self._view and self._editor_ready:
+                self._syncing = True
+                self._view.page().runJavaScript(
+                    f"window.setText({json.dumps(text or '')});window.setLargeMode();",
+                    lambda _=None: self._clear_sync(),
+                )
+            self.textChanged.emit()
+            return
         self._shadow.setPlainText(text or "")
         self._push_state()
         self.textChanged.emit()
 
     def append_text(self, text):
         if not text:
+            return
+        if self._large_file:
+            if self._view and self._editor_ready:
+                self._syncing = True
+                self._view.page().runJavaScript(
+                    f"window.appendText({json.dumps(text)})",
+                    lambda _=None: self._clear_sync(),
+                )
             return
         c = self._shadow.textCursor()
         c.movePosition(QTextCursor.End)
@@ -325,15 +374,28 @@ class MonacoEditor(QWidget):
         self.textChanged.emit()
 
     def toPlainText(self):
+        if self._large_file:
+            return ""
         return self._shadow.toPlainText()
 
     def document(self):
+        if self._large_file:
+            return None
         return self._shadow.document()
 
     def textCursor(self):
+        if self._large_file:
+            return QTextCursor()
         return self._shadow.textCursor()
 
     def setTextCursor(self, cursor):
+        if self._large_file:
+            if self._view and self._editor_ready:
+                self._view.page().runJavaScript(
+                    f"window.setCursor({cursor.position()});window.focusEditor();"
+                )
+            self.cursorPositionChanged.emit()
+            return
         self._shadow.setTextCursor(cursor)
         if self._view and self._editor_ready:
             self._view.page().runJavaScript(
@@ -342,6 +404,8 @@ class MonacoEditor(QWidget):
         self.cursorPositionChanged.emit()
 
     def replace_selection(self, text):
+        if self._large_file:
+            return
         cursor = self._shadow.textCursor()
         cursor.insertText(text or "")
         self._push_state()
