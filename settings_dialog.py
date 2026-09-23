@@ -181,6 +181,7 @@ class SettingsDialog(QDialog):
         self._webapp_username = str(settings.get("webapp_username", ""))
         self._webapp_enabled = bool(settings.get("webapp_enabled", False))
         self._webapp_legacy_password = str(settings.get("webapp_password", ""))
+        self._webapp_original_enabled = self._webapp_enabled
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 20, 20, 16)
@@ -428,7 +429,7 @@ class SettingsDialog(QDialog):
         self.webapp_enable_btn.setCheckable(True)
         self.webapp_enable_btn.setChecked(self._webapp_enabled)
         self.webapp_enable_btn.setMinimumHeight(38)
-        self.webapp_enable_btn.clicked.connect(self._update_webapp_toggle_button)
+        self.webapp_enable_btn.clicked.connect(self._on_webapp_toggle)
         v.addWidget(self.webapp_enable_btn)
 
         self.webapp_status_lbl = QLabel()
@@ -485,6 +486,23 @@ class SettingsDialog(QDialog):
         v.addWidget(self.webapp_url_label)
         v.addStretch()
         return w
+
+    def _on_webapp_toggle(self, checked):
+        """Apply the Web App state immediately when the toggle is clicked."""
+        self._update_webapp_toggle_button(checked)
+        try:
+            from webapp import app as webapp_app
+            main_window = self.parent()
+            if checked:
+                webapp_app.start_server(lambda: getattr(main_window, "ssh", None))
+                self.webapp_status_lbl.setText("Web App enabled and starting now.")
+            else:
+                webapp_app.stop_server()
+                self.webapp_status_lbl.setText("Web App disabled and stopped now.")
+        except Exception as exc:
+            self.webapp_status_lbl.setText(
+                f"Web App state changed, but server action failed: {exc}"
+            )
 
     def _update_webapp_toggle_button(self, checked):
         self.webapp_enable_btn.blockSignals(True)
@@ -552,16 +570,21 @@ class SettingsDialog(QDialog):
             })
         save_settings(**webapp_extra)
 
+        self._webapp_original_enabled = self.webapp_enable_btn.isChecked()
+        self.accept()
+
+    def reject(self):
+        # Cancel restores the server state that was active when Settings opened.
         try:
             from webapp import app as webapp_app
             main_window = self.parent()
-            if self.webapp_enable_btn.isChecked():
+            if self._webapp_original_enabled:
                 webapp_app.start_server(lambda: getattr(main_window, "ssh", None))
             else:
                 webapp_app.stop_server()
         except Exception:
             pass
-        self.accept()
+        super().reject()
 
     def hidden_k8s_tabs(self):
         return [t for t, chk in self._k8s_checks.items() if not chk.isChecked()]
