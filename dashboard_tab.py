@@ -56,7 +56,12 @@ REFRESH_MS = 3000 # live-dashboard cadence; never overlaps an in-flight refresh
 # dashboard snapshot. This query is tiny and fast, so node pod counts do not
 # depend on the completion/size of workloads, events, metrics, or pod details.
 _PODMAP_CMD = r"""
-kubectl get pods --all-namespaces -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' --no-headers 2>/dev/null
+podmap_status=0
+podmap_output=$(kubectl get pods --all-namespaces -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' --no-headers 2>/dev/null) || podmap_status=$?
+echo __PODNODEMAP__
+printf '%s\\n' "$podmap_output"
+echo __PODNODEMAP_STATUS__
+printf '%s\\n' "$podmap_status"
 """
 
 
@@ -2341,8 +2346,7 @@ class DashboardTab(QWidget):
 
     if k8s_out is not None:
       if self._podmap_snapshot is not None:
-        k8s_out += "\n__PODNODEMAP__\n" + self._podmap_snapshot
-        k8s_out += "\n__PODNODEMAP_STATUS__\n0\n"
+        k8s_out += "\n" + self._podmap_snapshot
       self._render_k8s_stats(k8s_out)
     else:
       self._render_k8s_error(k8s_error or "snapshot collection failed")
