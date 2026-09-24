@@ -1,6 +1,10 @@
 from .common import *
 
 
+_PAREN_OPEN_RE = re.compile(r"^\(\S*$")
+_PAREN_CLOSE_RE = re.compile(r"^\S*\)$")
+
+
 class KubernetesResourcesMixin:
   @staticmethod
   def _split_pod_line(line: str):
@@ -12,8 +16,8 @@ class KubernetesResourcesMixin:
     last_restart = ""
     i = 0
     while i < len(parts):
-      if (KubernetesTab._PAREN_OPEN_RE.match(parts[i]) and i + 1 < len(parts)
-          and KubernetesTab._PAREN_CLOSE_RE.match(parts[i + 1])):
+      if (_PAREN_OPEN_RE.match(parts[i]) and i + 1 < len(parts)
+          and _PAREN_CLOSE_RE.match(parts[i + 1])):
         # "(22d" + "ago)" -> "22d ago"
         last_restart = f"{parts[i][1:]} {parts[i + 1][:-1]}"
         i += 2

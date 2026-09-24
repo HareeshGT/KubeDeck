@@ -40,3 +40,7 @@ from utils import (
   load_tunnel_services, REMOTE_TUNNEL_CSV_PATH,
   monospace_font,
 )
+
+# Preserve the original monolith's shared namespace for all feature mixins,
+# including compatibility aliases such as ``_QVL``.
+__all__ = [name for name in globals() if not name.startswith('__')]

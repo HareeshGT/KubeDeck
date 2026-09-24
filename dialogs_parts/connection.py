@@ -1,13 +1,5 @@
 from .common import *
 
-
-def _rgba(color: str, alpha: float) -> str:
-  """Return a Qt/CSS-compatible color string with the requested alpha."""
-  c = QColor(color)
-  c.setAlphaF(alpha)
-  return c.name(QColor.HexArgb)
-
-
 class MarqueeLabel(QWidget):
   """A single-line label that behaves like a normal elided label, but
   scrolls its text like a ticker on hover if the full text doesn't fit
@@ -432,3 +424,4 @@ class ConnectingDialog(QDialog):
     # Prevent the user from dismissing it manually (e.g. Alt+F4);
     # the caller controls its lifecycle.
     event.ignore()
+

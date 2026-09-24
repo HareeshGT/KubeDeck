@@ -72,3 +72,9 @@ except Exception:
 # ─── OS-style file-transfer dialog ───────────────────────────
 
 __all__ = [name for name in globals() if not name.startswith("__")]
+
+# The split dialog modules intentionally use ``from .common import *`` so
+# they share the same compatibility namespace as the original monolith.
+# Include underscore-prefixed helpers/workers as well; Python's default
+# star-import rules would otherwise hide them.
+__all__ = [name for name in globals() if not name.startswith('__')]
