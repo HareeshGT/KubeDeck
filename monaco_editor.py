@@ -159,6 +159,15 @@ function setCursor(offset) {
   editor.setPosition(pos);
   editor.revealPositionInCenter(pos);
 }
+function ensureCursorVisible() {
+  if (!editor) return;
+  const position = editor.getPosition();
+  if (position) {
+    editor.revealPositionInCenter(position);
+    return;
+  }
+  editor.revealLineInCenter(1);
+}
 function setDecorations(ranges) {
   if (!editor) return;
   decorations = editor.deltaDecorations(decorations, ranges.map((r,i)=>({
@@ -279,11 +288,6 @@ class MonacoEditor(QWidget):
             self._view.page().runJavaScript("window.setLargeMode()")
 
     def _on_editor_ready(self):
-        # This is the actual "safe to talk to Monaco" signal (see the
-        # comment next to _bridge.onEditorReady() in the HTML) — flush
-        # whatever's currently in the shadow document now that JS calls
-        # will actually land, instead of the (possibly still-empty, or
-        # possibly stale) state that was pushed too early.
         self._editor_ready = True
         self._push_state()
 
@@ -325,7 +329,7 @@ class MonacoEditor(QWidget):
             f"window.setLanguage({lang});"
         )
         self._view.page().runJavaScript(script, lambda _=None: self._clear_sync())
-    
+
     def _clear_sync(self):
         self._syncing = False
 
@@ -362,15 +366,6 @@ class MonacoEditor(QWidget):
         c = self._shadow.textCursor()
         c.movePosition(QTextCursor.End)
         c.insertText(text)
-        # Send just the new chunk via window.appendText() rather than
-        # routing through _push_state(), which re-serializes and resends
-        # the *entire* accumulated document on every call. For a file
-        # streaming in as ~64KB chunks that turned every chunk into an
-        # O(total-size-so-far) JSON dump + a full Monaco setValue() (which
-        # also nukes any active search decorations) — dozens of these
-        # firing in quick succession is what destabilized the WebEngine
-        # renderer when Find was used on/right after a file that had just
-        # finished loading.
         if self._view and self._editor_ready:
             self._syncing = True
             self._view.page().runJavaScript(
@@ -380,7 +375,6 @@ class MonacoEditor(QWidget):
         self.textChanged.emit()
 
     def get_text(self, callback=None):
-        """Get the current Monaco document without maintaining a Qt shadow copy."""
         if not self._large_file:
             value = self._shadow.toPlainText()
             if callback:
@@ -424,6 +418,15 @@ class MonacoEditor(QWidget):
             )
         self.cursorPositionChanged.emit()
 
+    def ensureCursorVisible(self):
+        if self._view and self._editor_ready:
+            self._view.page().runJavaScript(
+                "window.ensureCursorVisible();"
+            )
+            return
+        if self._shadow is not None:
+            self._shadow.ensureCursorVisible()
+
     def replace_selection(self, text):
         if self._large_file:
             return
@@ -435,13 +438,13 @@ class MonacoEditor(QWidget):
     def undo(self):
         if self._view and self._editor_ready:
             self._view.page().runJavaScript("window.undo()")
-        else:
+        elif self._shadow is not None:
             self._shadow.undo()
 
     def redo(self):
         if self._view and self._editor_ready:
             self._view.page().runJavaScript("window.redo()")
-        else:
+        elif self._shadow is not None:
             self._shadow.redo()
 
     def setUndoRedoEnabled(self, enabled):
@@ -453,6 +456,8 @@ class MonacoEditor(QWidget):
             self._view.page().runJavaScript(f"window.setWrap({str(wrap).lower()})")
 
     def set_search_selections(self, selections):
+        if self._shadow is None:
+            return
         ranges = []
         for sel in selections:
             c = sel.cursor
@@ -510,5 +515,6 @@ class MonacoEditor(QWidget):
             pass
         self._view = None
         self._editor_ready = False
+
     def refresh_theme(self):
         pass
