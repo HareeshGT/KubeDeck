@@ -1,0 +1,16 @@
+[
+  "tests/test_refactor_platform.py::test_all_python_files_compile",
+  "tests/test_refactor_platform.py::test_dialog_methods_preserved",
+  "tests/test_refactor_platform.py::test_dialogs_facade_reexports_expected_classes",
+  "tests/test_refactor_platform.py::test_kubernetes_facade_has_public_class",
+  "tests/test_refactor_platform.py::test_kubernetes_methods_preserved",
+  "tests/test_refactor_platform.py::test_main_window_compiles",
+  "tests/test_refactor_platform.py::test_main_window_facade_has_expected_class",
+  "tests/test_refactor_platform.py::test_main_window_import",
+  "tests/test_refactor_platform.py::test_main_window_methods_preserved_when_original_available",
+  "tests/test_refactor_platform.py::test_no_generated_cache_is_required",
+  "tests/test_refactor_platform.py::test_pod_line_parser_behavior",
+  "tests/test_refactor_platform.py::test_refactor_package_imports_without_gui_imports",
+  "tests/test_refactor_platform.py::test_refactored_packages_import",
+  "tests/test_refactor_platform.py::test_resources_has_no_facade_dependency"
+]

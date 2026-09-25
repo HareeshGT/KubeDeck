@@ -1,0 +1,309 @@
+from PyQt5.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QTextBrowser,
+    QMessageBox,
+    QShortcut,
+    QProgressBar,
+    QComboBox,
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QKeySequence
+from PyQt5.QtWidgets import QGraphicsBlurEffect
+
+from ui_icons import set_icon, apply_text_icon, icon_button
+from themes import T, load_settings, save_settings
+from utils import monospace_font
+from .core import *
+from .core import _TTS_AVAILABLE
+
+
+class K8sAIOpsUIMixin:
+    def __init__(self, ssh=None, namespace_getter=None, context_getter=None, kube_context_getter=None, parent=None):
+        super().__init__(parent)
+        self.ssh = ssh
+        self._namespace_getter = namespace_getter
+        self._context_getter = context_getter
+        self._kube_context_getter = kube_context_getter
+        self._workers = []
+        self._ai_worker = None
+        self._operation_worker = None
+        self._scale_previous_worker = None
+        self._pending_scale_action = None
+        self._voice_worker = None
+        self._voice_recording = False
+        self._narrator = None
+        self._voice_feedback_enabled = _TTS_AVAILABLE and get_voice_feedback_enabled()
+        self._voice_id = get_voice_id() if _TTS_AVAILABLE else ''
+        self._busy = False
+        self._history = _load_history()
+        self._ai_access_allowed = False
+        self._ai_blur_effect = None
+        self._ai_lock_overlay = None
+        self._build_ui()
+
+    def set_ssh(self, ssh):
+        self.ssh = ssh
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._ai_content = QWidget(self)
+        outer.addWidget(self._ai_content)
+        root = QVBoxLayout(self._ai_content)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
+        title_row = QHBoxLayout()
+        title = QLabel(' AI Kubernetes Operations')
+        title.setStyleSheet(f"color: {T['TEXT_PRIMARY']}; font-size: 16px; font-weight: 700;")
+        title_row.addWidget(title)
+        title_row.addStretch()
+        self.history_lbl = QLabel()
+        self.history_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 11px;")
+        title_row.addWidget(self.history_lbl)
+        self.status_lbl = QLabel('Ready')
+        self.status_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 12px;")
+        title_row.addWidget(self.status_lbl)
+        root.addLayout(title_row)
+        description = QLabel('Describe a Kubernetes operation in plain English. Previous Ops Mind operations are remembered across app restarts.')
+        description.setWordWrap(True)
+        description.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 12px;")
+        root.addWidget(description)
+        examples = QLabel('Examples: scale deployment deployment-name to 5 replicas  •  scale up deployment-name by 2  •  scale down deployment-name by 1  •  scale it back  •  restart deployment deployment-name  •  repeat that')
+        examples.setWordWrap(True)
+        examples.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 11px;")
+        root.addWidget(examples)
+        self.voice_hint_lbl = QLabel('Voice: Google Web Speech (classic ASR, not an LLM) · Ctrl+Shift+Space to start/stop')
+        self.voice_hint_lbl.setWordWrap(True)
+        self.voice_hint_lbl.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 10px;")
+        root.addWidget(self.voice_hint_lbl)
+        self.request_input = QLineEdit()
+        self.request_input.setPlaceholderText('Ask AI to perform a Kubernetes operation…')
+        self.request_input.returnPressed.connect(self._submit)
+        root.addWidget(self.request_input)
+        btn_row = QHBoxLayout()
+        self.run_btn = icon_button(' Run with AI')
+        self.run_btn.setObjectName('primary')
+        self.run_btn.setFixedHeight(34)
+        self.run_btn.clicked.connect(self._submit)
+        btn_row.addWidget(self.run_btn)
+        self.voice_btn = icon_button(' Voice')
+        self.voice_btn.setFixedHeight(34)
+        self.voice_btn.setToolTip('Start/stop voice command. Hotkey: Ctrl+Shift+Space')
+        self.voice_btn.clicked.connect(self._toggle_voice_recording)
+        btn_row.addWidget(self.voice_btn)
+        self.mic_level_bar = QProgressBar()
+        self.mic_level_bar.setRange(0, 100)
+        self.mic_level_bar.setValue(0)
+        self.mic_level_bar.setFixedWidth(120)
+        self.mic_level_bar.setFixedHeight(12)
+        self.mic_level_bar.setTextVisible(False)
+        self.mic_level_bar.setToolTip('Live microphone input level')
+        self.mic_level_bar.setStyleSheet(f"\n      QProgressBar {{\n        background: {T['BG_ITEM']};\n        border: 1px solid {T['BORDER']};\n        border-radius: 6px;\n      }}\n\n      QProgressBar::chunk {{\n        background: {T['ACCENT']};\n        border-radius: 5px;\n      }}\n      ")
+        self.mic_level_label = QLabel('Mic')
+        self.mic_level_label.setStyleSheet(f"color: {T['TEXT_MUTED']}; font-size: 10px;")
+        btn_row.addWidget(self.mic_level_label)
+        btn_row.addWidget(self.mic_level_bar)
+        self.speaker_btn = QPushButton(' Speak' if self._voice_feedback_enabled else ' Speak')
+        self.speaker_btn.setFixedHeight(34)
+        self.speaker_btn.setCheckable(True)
+        self.speaker_btn.setChecked(self._voice_feedback_enabled)
+        self.speaker_btn.setEnabled(_TTS_AVAILABLE)
+        self.speaker_btn.setToolTip("Speak Ops Mind's step-by-step status aloud as it works" if _TTS_AVAILABLE else 'Voice narration needs the pyttsx3 package (pip install pyttsx3)')
+        self.speaker_btn.toggled.connect(self._toggle_voice_feedback)
+        btn_row.addWidget(self.speaker_btn)
+        self.voice_combo = QComboBox()
+        self.voice_combo.setFixedWidth(170)
+        self.voice_combo.setFixedHeight(34)
+        self.voice_combo.setEnabled(_TTS_AVAILABLE)
+        self.voice_combo.setToolTip("Which system voice reads Ops Mind's status narration aloud" if _TTS_AVAILABLE else 'Voice narration needs the pyttsx3 package (pip install pyttsx3)')
+        self._populate_voice_combo()
+        self.voice_combo.currentIndexChanged.connect(self._on_voice_combo_changed)
+        btn_row.addWidget(self.voice_combo)
+        self.voice_test_btn = icon_button('')
+        self.voice_test_btn.setFixedSize(34, 34)
+        self.voice_test_btn.setEnabled(_TTS_AVAILABLE)
+        self.voice_test_btn.setToolTip('Preview the selected voice')
+        self.voice_test_btn.clicked.connect(lambda: self._speak("This is how I'll sound when Ops Mind narrates status updates."))
+        btn_row.addWidget(self.voice_test_btn)
+        self.voice_shortcut = QShortcut(QKeySequence('Ctrl+Shift+Space'), self)
+        self.voice_shortcut.activated.connect(self._toggle_voice_recording)
+        clear_btn = QPushButton('Clear Output')
+        clear_btn.setFixedHeight(34)
+        clear_btn.clicked.connect(self._clear_output)
+        btn_row.addWidget(clear_btn)
+        self.clear_history_btn = QPushButton('Clear History')
+        self.clear_history_btn.setFixedHeight(34)
+        self.clear_history_btn.clicked.connect(self._clear_history)
+        btn_row.addWidget(self.clear_history_btn)
+        self.audit_btn = QPushButton('Audit Log')
+        self.audit_btn.setFixedHeight(34)
+        self.audit_btn.clicked.connect(self._show_audit_log)
+        btn_row.addWidget(self.audit_btn)
+        btn_row.addStretch()
+        root.addLayout(btn_row)
+        self.output = QTextBrowser()
+        self.output.setOpenExternalLinks(False)
+        self.output.setFont(monospace_font(11))
+        self.output.setStyleSheet(f"background: {T['BG_DARK']}; color: {T['TEXT_PRIMARY']}; border: 1px solid {T['BORDER']}; border-radius: 8px; padding: 12px;")
+        root.addWidget(self.output, 1)
+        self._update_history_label()
+        self._write_info('Ops Mind is ready.\n\nPrevious operations are remembered and used as context for follow-up requests.\nTry: scale deployment my-app to 3 replicas\n   scale up my-app by 2\n   scale down my-app by 1\n   scale it back\n   repeat that\n')
+        self._build_ai_access_overlay()
+        self.refresh_ai_access()
+
+    def _build_ai_access_overlay(self):
+        """Create the blurred/locked surface shown when no AI API key exists."""
+        self._ai_blur_effect = QGraphicsBlurEffect(self._ai_content)
+        self._ai_blur_effect.setBlurRadius(9)
+        self._ai_content.setGraphicsEffect(self._ai_blur_effect)
+        self._ai_lock_overlay = QWidget(self)
+        self._ai_lock_overlay.setObjectName('aiOpsLockOverlay')
+        self._ai_lock_overlay.setStyleSheet(f'QWidget#aiOpsLockOverlay {{ background: rgba(0, 0, 0, 150); }}')
+        overlay_layout = QVBoxLayout(self._ai_lock_overlay)
+        overlay_layout.setContentsMargins(30, 30, 30, 30)
+        card = QWidget(self._ai_lock_overlay)
+        card.setObjectName('aiOpsLockCard')
+        card.setMaximumWidth(520)
+        card.setStyleSheet(f"QWidget#aiOpsLockCard {{ background: {T['BG_PANEL']}; border: 1px solid {T['BORDER']}; border-radius: 16px; }}")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(30, 26, 30, 26)
+        card_layout.setSpacing(10)
+        icon = QLabel('')
+        icon.setAlignment(Qt.AlignCenter)
+        icon.setStyleSheet('font-size: 34px; background: transparent; border: none;')
+        card_layout.addWidget(icon)
+        title = QLabel('Ops Mind is locked')
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(f"color: {T['TEXT_PRIMARY']}; font-size: 18px; font-weight: 700; background: transparent; border: none;")
+        card_layout.addWidget(title)
+        self._ai_lock_message = QLabel()
+        self._ai_lock_message.setAlignment(Qt.AlignCenter)
+        self._ai_lock_message.setWordWrap(True)
+        self._ai_lock_message.setStyleSheet(f"color: {T['TEXT_DIM']}; font-size: 13px; background: transparent; border: none;")
+        card_layout.addWidget(self._ai_lock_message)
+        overlay_layout.addStretch(1)
+        overlay_layout.addWidget(card, 0, Qt.AlignCenter)
+        overlay_layout.addStretch(1)
+        self._ai_lock_overlay.hide()
+
+    def _selected_ai_provider_label(self):
+        provider = ai_assist.get_provider()
+        return ai_assist.PROVIDERS.get(provider, {}).get('label', provider)
+
+    def refresh_ai_access(self):
+        """Enable Ops Mind only when the selected provider has an API key."""
+        provider = ai_assist.get_provider()
+        api_key = ai_assist.get_api_key(provider)
+        allowed = bool((api_key or '').strip())
+        self._ai_access_allowed = allowed
+        if hasattr(self, '_ai_lock_overlay') and self._ai_lock_overlay is not None:
+            if allowed:
+                self._ai_lock_overlay.hide()
+                self._ai_content.setGraphicsEffect(None)
+                self.status_lbl.setText('Ready')
+            else:
+                label = self._selected_ai_provider_label()
+                self._ai_lock_message.setText(f'Add an API key for <b>{self._escape_html(label)}</b> in <b>Settings → AI</b> to access Kubernetes AI Operations.')
+                self._ai_content.setGraphicsEffect(self._ai_blur_effect)
+                self._ai_lock_overlay.raise_()
+                self._ai_lock_overlay.show()
+                self.status_lbl.setText('API key required')
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._ai_lock_overlay is not None:
+            self._ai_lock_overlay.setGeometry(self.rect())
+            self._ai_lock_overlay.raise_()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh_ai_access()
+
+    def _namespace(self) -> str:
+        if self._namespace_getter:
+            try:
+                value = self._namespace_getter()
+                return str(value or '').strip()
+            except Exception:
+                pass
+        return ''
+
+    def _context(self) -> str:
+        if self._context_getter:
+            try:
+                value = self._context_getter()
+                return str(value or '').strip()
+            except Exception:
+                pass
+        return ''
+
+    def _kube_context(self) -> str:
+        """The actually-selected kubectl context (cluster), used for the
+        `--context` flag. Distinct from `_context()`, which is a free-text
+        UI blurb fed to the AI prompt and must never reach the shell."""
+        if self._kube_context_getter:
+            try:
+                value = self._kube_context_getter()
+                return str(value or '').strip()
+            except Exception:
+                pass
+        return ''
+
+    def _update_history_label(self):
+        count = len(self._history)
+        self.history_lbl.setText(f"{count} saved operation{('s' if count != 1 else '')}")
+
+    def _write_info(self, text: str):
+        self.output.append(f"""<span style="color:{T['TEXT_DIM']}">{self._escape_html(text).replace(chr(10), '<br>')}</span>""")
+
+    def _write_success(self, text: str):
+        self.output.append(f"""<span style="color:{T['SUCCESS']}">{self._escape_html(text).replace(chr(10), '<br>')}</span>""")
+
+    def _write_error(self, text: str):
+        self.output.append(f"""<span style="color:{T['DANGER']}">{self._escape_html(text).replace(chr(10), '<br>')}</span>""")
+
+    @staticmethod
+    def _escape_html(text: str) -> str:
+        return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+    def _set_busy(self, busy: bool):
+        self._busy = busy
+        self.request_input.setEnabled(not busy and (not self._voice_recording))
+        self.run_btn.setEnabled(not busy and (not self._voice_recording))
+        self.voice_btn.setEnabled(not busy or self._voice_recording)
+        self.clear_history_btn.setEnabled(not busy and (not self._voice_recording))
+        if busy:
+            apply_text_icon(self.run_btn, ' Thinking…', size=15)
+            self.status_lbl.setText('AI is interpreting…')
+        else:
+            apply_text_icon(self.run_btn, ' Run with AI', size=15)
+            self.status_lbl.setText('Ready')
+
+    def _clear_output(self):
+        if self._busy:
+            return
+        self.output.clear()
+        self._write_info('Ops Mind is ready.')
+
+    def _clear_history(self):
+        if self._busy:
+            return
+        if not self._history:
+            self._update_history_label()
+            self._write_info('\nNo saved operation history to clear.')
+            return
+        answer = QMessageBox.question(self, 'Clear Ops Mind History', 'Delete the saved AI Kubernetes operation history?', QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        self._history = []
+        _save_history(self._history)
+        self._update_history_label()
+        self._write_info('\n Ops Mind history cleared.')
