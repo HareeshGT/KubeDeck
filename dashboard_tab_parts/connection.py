@@ -46,6 +46,9 @@ class DashboardConnectionMixin:
           self._timer.start(REFRESH_MS)
       else:
         self._timer.stop()
+        self._process_timer.stop()
+        self._process_generation += 1
+        self._process_busy = False
         self._show_disconnected()
   
   
@@ -159,10 +162,16 @@ class DashboardConnectionMixin:
         if self._active:
           self._refresh()
           self._timer.start(REFRESH_MS)
+          self._process_timer.start()
       else:
         self._timer.stop()
+        self._process_timer.stop()
+        self._process_generation += 1
+        self._process_busy = False
         self._busy = False
         self._host_snapshot = None
+        self.process_output.clear()
+        self.process_status.setText("Disconnected")
         self._k8s_snapshot = None
         self._show_disconnected()
         for win in list(self._node_windows.values()):
@@ -190,11 +199,15 @@ class DashboardConnectionMixin:
       if active and self.ssh:
         self._refresh()     # snap up-to-date immediately on return
         self._timer.start(REFRESH_MS)
+        self._process_timer.start()
       elif active and self.ftp:
         self._refresh_ftp()
         self._timer.start(REFRESH_MS)
       else:
         self._timer.stop()
+        self._process_timer.stop()
+        self._process_generation += 1
+        self._process_busy = False
         # Invalidate a cycle when leaving the tab so late worker signals
         # cannot publish data after the dashboard has been paused.
         self._snapshot_generation += 1

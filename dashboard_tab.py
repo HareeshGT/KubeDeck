@@ -1021,6 +1021,8 @@ class DashboardTab(DashboardConnectionMixin, DashboardUIMixin, DashboardRefreshM
         self._connection_port = None
         self._connection_user = None
         self._ftp_busy = False
+        self._process_busy = False
+        self._process_generation = 0
         self._ftp_worker = None
         self._ftp_snapshot = None
         self._ftp_current_path = '/'
@@ -1059,6 +1061,9 @@ class DashboardTab(DashboardConnectionMixin, DashboardUIMixin, DashboardRefreshM
         self.ftp = None
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
+        self._process_timer = QTimer(self)
+        self._process_timer.setInterval(1000)
+        self._process_timer.timeout.connect(self._refresh_processes)
         self._build_ui()
         self._show_disconnected()
     NODE_GRID_COLS = 3
