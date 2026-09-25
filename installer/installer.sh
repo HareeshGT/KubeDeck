@@ -676,6 +676,30 @@ rm -rf "dist/KubeDock"
 rm -f "KubeDock.spec"
 
 # --------------------------------------------------
+# --------------------------------------------------
+# Verify Refactored Python Packages
+# --------------------------------------------------
+
+echo
+echo "Verifying refactored Python packages..."
+
+REFACTORED_PACKAGES=(
+  dialogs_parts
+  kubernetes_tab_parts
+  dashboard_tab_parts
+  main_window_parts
+  workers_parts
+  k8s_ai_ops_parts
+)
+
+for package in "${REFACTORED_PACKAGES[@]}"; do
+  if [ ! -f "$package/__init__.py" ]; then
+    echo "ERROR: Missing refactored package: $package"
+    exit 1
+  fi
+  echo "[OK] $package"
+done
+
 # Build
 # --------------------------------------------------
 
@@ -706,6 +730,14 @@ CMD=(
 
   # Kubernetes Ops Mind
   --hidden-import=k8s_ai_ops
+
+  # Refactored KubeDock packages
+  --collect-submodules=dialogs_parts
+  --collect-submodules=kubernetes_tab_parts
+  --collect-submodules=dashboard_tab_parts
+  --collect-submodules=main_window_parts
+  --collect-submodules=workers_parts
+  --collect-submodules=k8s_ai_ops_parts
 
   # Voice input
   --hidden-import=speech_recognition
