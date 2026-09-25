@@ -170,7 +170,16 @@ class DashboardConnectionMixin:
         self._process_busy = False
         self._busy = False
         self._host_snapshot = None
-        self.process_output.clear()
+        # The live-process UI is rendered as structured metrics + a process tree.
+        # The old raw-top QText widget no longer exists.
+        process_tree = getattr(self, "process_tree", None)
+        if process_tree is not None:
+          process_tree.clear()
+        for widget in getattr(self, "process_metrics", {}).values():
+          widget.setText("—")
+        detail = getattr(self, "process_detail_lbl", None)
+        if detail is not None:
+          detail.setText("CPU — · Memory — · Load —")
         self.process_status.setText("Disconnected")
         self._k8s_snapshot = None
         self._show_disconnected()
